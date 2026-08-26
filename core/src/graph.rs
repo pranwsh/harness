@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -19,6 +20,8 @@ pub(crate) struct DepGraph {
     provider_of: HashMap<Key, String>,
     pending: Vec<Arc<dyn Plugin>>,
     pending_index: HashSet<String>,
+    declared_emits: HashMap<Key, Vec<(String, TypeId)>>,
+    declared_listens: HashMap<Key, Vec<(String, TypeId)>>,
 }
 
 impl DepGraph {
@@ -88,6 +91,18 @@ impl DepGraph {
         for key in &meta.provides {
             self.provider_of.insert(key.clone(), name.clone());
         }
+        for (key, ty) in &meta.emits {
+            self.declared_emits
+                .entry(key.clone())
+                .or_default()
+                .push((name.clone(), *ty));
+        }
+        for (key, ty) in &meta.listens {
+            self.declared_listens
+                .entry(key.clone())
+                .or_default()
+                .push((name.clone(), *ty));
+        }
         self.active.insert(name.clone(), Node { meta });
         self.order.push(name.clone());
         self.building.insert(name);
@@ -114,7 +129,38 @@ impl DepGraph {
             );
             self.provider_of.remove(key);
         }
+        for entries in self.declared_emits.values_mut() {
+            entries.retain(|(owner, _)| owner != name);
+        }
+        for entries in self.declared_listens.values_mut() {
+            entries.retain(|(owner, _)| owner != name);
+        }
+        self.declared_emits.retain(|_, e| !e.is_empty());
+        self.declared_listens.retain(|_, e| !e.is_empty());
         Some(node.meta)
+    }
+
+    pub(crate) fn conflicting_event_decl(&self, key: &Key, ty: TypeId) -> Option<String> {
+        let find = |map: &HashMap<Key, Vec<(String, TypeId)>>| {
+            map.get(key)?
+                .iter()
+                .find_map(|(owner, t)| (*t != ty).then_some(owner.clone()))
+        };
+        find(&self.declared_emits).or_else(|| find(&self.declared_listens))
+    }
+
+    pub(crate) fn emitters_of(&self, key: &Key) -> Vec<String> {
+        self.declared_emits
+            .get(key)
+            .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn listeners_of(&self, key: &Key) -> Vec<String> {
+        self.declared_listens
+            .get(key)
+            .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn teardown_order(&self, name: &str) -> Vec<String> {

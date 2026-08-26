@@ -22,6 +22,20 @@ pub enum Error {
     SelfDependency(String),
     #[error("plugin `{0}` panicked during build: {1}")]
     PluginPanicked(String, String),
+    #[error("plugin `{plugin}` declares conflicting event types for channel `{key}`")]
+    SelfEventConflict { plugin: String, key: Key },
+    #[error(
+        "plugin `{plugin}` declares channel `{key}` with a different event type than plugin `{other}`"
+    )]
+    EventDeclConflict {
+        plugin: String,
+        key: Key,
+        other: String,
+    },
+    #[error(
+        "plugin `{plugin}` declares channel `{key}` with a different event type than the registered channel"
+    )]
+    EventChannelMismatch { plugin: String, key: Key },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

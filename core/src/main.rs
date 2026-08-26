@@ -40,7 +40,9 @@ struct ClockPlugin;
 
 impl Plugin for ClockPlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta::new("clock").provides("app.clock")
+        PluginMeta::new("clock")
+            .provides("app.clock")
+            .emits::<Tick>("app.tick")
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
@@ -54,7 +56,7 @@ struct StatsPlugin;
 
 impl Plugin for StatsPlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta::new("stats")
+        PluginMeta::new("stats").listens::<Tick>("app.tick")
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {

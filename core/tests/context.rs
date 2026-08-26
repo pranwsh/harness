@@ -39,6 +39,35 @@ impl Plugin for Provider {
     }
 }
 
+struct GatedProvider {
+    meta: PluginMeta,
+    key: Key,
+}
+
+impl GatedProvider {
+    fn new(name: &str, provides: &str, gates: &[&str]) -> Self {
+        let mut meta = PluginMeta::new(name).provides(provides);
+        for gate in gates {
+            meta = meta.injects(*gate);
+        }
+        Self {
+            meta,
+            key: Key::new(provides),
+        }
+    }
+}
+
+impl Plugin for GatedProvider {
+    fn meta(&self) -> PluginMeta {
+        self.meta.clone()
+    }
+
+    fn build(&self, ctx: Context) -> harness_core::Result<()> {
+        ctx.provide_key(self.key.clone(), Arc::new(Num(1)));
+        Ok(())
+    }
+}
+
 struct Consumer {
     meta: PluginMeta,
     keys: Vec<Key>,
@@ -236,6 +265,20 @@ impl Plugin for ChanEmitter {
         if let Some(log) = &self.log {
             log.lock().unwrap().push(self.name.clone());
         }
+        Ok(())
+    }
+}
+
+struct MetaOnly {
+    meta: PluginMeta,
+}
+
+impl Plugin for MetaOnly {
+    fn meta(&self) -> PluginMeta {
+        self.meta.clone()
+    }
+
+    fn build(&self, _ctx: Context) -> harness_core::Result<()> {
         Ok(())
     }
 }
@@ -733,4 +776,207 @@ async fn events_handle_injectable_roundtrip() {
         fut.await;
     }
     assert_eq!(seen.lock().unwrap().clone(), vec![42, 7]);
+}
+
+#[tokio::test]
+async fn declared_emit_conflict_between_plugins() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("e1").emits::<Num>("ch"),
+    })
+    .unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("e2").emits::<String>("ch")
+        }),
+        Err(Error::EventDeclConflict { plugin, key, other })
+            if plugin == "e2" && key == Key::new("ch") && other == "e1"
+    ));
+    assert_eq!(ctx.plugin_names(), vec!["e1".to_owned()]);
+}
+
+#[tokio::test]
+async fn declared_listen_conflicts_across_kinds() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("l1").listens::<Num>("ch"),
+    })
+    .unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("l2").listens::<String>("ch")
+        }),
+        Err(Error::EventDeclConflict { .. })
+    ));
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("e1").emits::<String>("ch")
+        }),
+        Err(Error::EventDeclConflict { other, .. }) if other == "l1"
+    ));
+}
+
+#[tokio::test]
+async fn self_conflicting_declaration_rejected() {
+    let ctx = Context::root();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("weird").emits::<Num>("k").emits::<String>("k")
+        }),
+        Err(Error::SelfEventConflict { plugin, key })
+            if plugin == "weird" && key == Key::new("k")
+    ));
+    assert!(ctx.plugin_names().is_empty());
+}
+
+#[tokio::test]
+async fn declaration_checked_against_live_channel() {
+    let ctx = Context::root();
+    ctx.on_key::<Num, _, _>("live.ch", |_| async {}).unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("m").emits::<String>("live.ch")
+        }),
+        Err(Error::EventChannelMismatch { plugin, key })
+            if plugin == "m" && key == Key::new("live.ch")
+    ));
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("ok").emits::<Num>("live.ch")
+        }),
+        Ok(LoadOutcome::Activated)
+    ));
+}
+
+#[tokio::test]
+async fn same_type_declarations_coexist_with_introspection() {
+    let ctx = Context::root();
+    for name in ["e1", "e2"] {
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new(name).emits::<Num>("fan"),
+        })
+        .unwrap();
+    }
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("l1").listens::<Num>("fan"),
+    })
+    .unwrap();
+
+    assert_eq!(
+        ctx.emitters_of(&Key::new("fan")),
+        vec!["e1".to_owned(), "e2".to_owned()]
+    );
+    assert_eq!(ctx.listeners_of(&Key::new("fan")), vec!["l1".to_owned()]);
+    assert!(ctx.listeners_of(&Key::new("nobody")).is_empty());
+}
+
+#[tokio::test]
+async fn unload_purges_event_declarations() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("e1").emits::<Num>("gone"),
+    })
+    .unwrap();
+    assert_eq!(ctx.emitters_of(&Key::new("gone")), vec!["e1".to_owned()]);
+
+    ctx.unload("e1").unwrap();
+    assert!(ctx.emitters_of(&Key::new("gone")).is_empty());
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("e2").emits::<String>("gone")
+        }),
+        Ok(LoadOutcome::Activated)
+    ));
+}
+
+#[tokio::test]
+async fn pending_provide_conflict_at_activation() {
+    let ctx = Context::root();
+    assert!(matches!(
+        ctx.load(GatedProvider::new("late", "k.svc", &["gate"])),
+        Ok(LoadOutcome::Pending { .. })
+    ));
+
+    ctx.load(Provider::new("squatter", "k.svc", 7)).unwrap();
+    assert!(matches!(
+        ctx.load(Provider::new("gatemaker", "gate", 0)),
+        Err(Error::ServiceConflict { key, provider })
+            if key == Key::new("k.svc") && provider == "squatter"
+    ));
+
+    assert!(!ctx.plugin_names().contains(&"late".to_owned()));
+    assert!(ctx.pending_names().is_empty());
+    assert_eq!(
+        ctx.provider_of(&Key::new("k.svc")).as_deref(),
+        Some("squatter")
+    );
+    assert!(ctx.plugin_names().contains(&"gatemaker".to_owned()));
+}
+
+#[tokio::test]
+async fn pending_event_declaration_conflict_at_activation() {
+    let ctx = Context::root();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("late").emits::<Num>("ch").injects("gate")
+        }),
+        Ok(LoadOutcome::Pending { .. })
+    ));
+
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("e2").emits::<String>("ch"),
+    })
+    .unwrap();
+
+    assert!(matches!(
+        ctx.load(Provider::new("gm", "gate", 0)),
+        Err(Error::EventDeclConflict { plugin, other, .. })
+            if plugin == "late" && other == "e2"
+    ));
+    assert!(!ctx.plugin_names().contains(&"late".to_owned()));
+    assert!(ctx.pending_names().is_empty());
+}
+
+#[tokio::test]
+async fn pending_vs_system_service_conflict() {
+    let ctx = Context::root();
+    assert!(matches!(
+        ctx.load(GatedProvider::new("sys-late", "sys.k", &["gate"])),
+        Ok(LoadOutcome::Pending { .. })
+    ));
+
+    ctx.provide_key("sys.k", Arc::new(Num(5)));
+
+    assert!(matches!(
+        ctx.load(Provider::new("gm", "gate", 0)),
+        Err(Error::ServiceConflict { key, provider })
+            if key == Key::new("sys.k") && provider == "system"
+    ));
+    assert!(!ctx.plugin_names().contains(&"sys-late".to_owned()));
+    assert!(ctx.pending_names().is_empty());
+}
+
+#[tokio::test]
+async fn intra_batch_pending_conflict_first_wins() {
+    let ctx = Context::root();
+    assert!(matches!(
+        ctx.load(GatedProvider::new("a", "shared.k", &["gate"])),
+        Ok(LoadOutcome::Pending { .. })
+    ));
+    assert!(matches!(
+        ctx.load(GatedProvider::new("b", "shared.k", &["gate"])),
+        Ok(LoadOutcome::Pending { .. })
+    ));
+
+    assert!(matches!(
+        ctx.load(Provider::new("gm", "gate", 0)),
+        Err(Error::ServiceConflict { key, provider })
+            if key == Key::new("shared.k") && provider == "a"
+    ));
+
+    let names = ctx.plugin_names();
+    assert!(names.contains(&"a".to_owned()));
+    assert!(names.contains(&"gm".to_owned()));
+    assert!(!names.contains(&"b".to_owned()));
+    assert!(ctx.pending_names().is_empty());
 }

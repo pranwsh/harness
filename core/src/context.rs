@@ -1,5 +1,6 @@
 use std::{
     any::{Any, TypeId},
+    collections::HashMap,
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -188,32 +189,16 @@ impl Context {
 
     pub fn load_dyn(&self, plugin: Arc<dyn Plugin>) -> Result<LoadOutcome> {
         let meta = plugin.meta();
-        let name = meta.name().to_owned();
 
         // Lock order is always `graph` then `services`; never the reverse.
         {
             let mut graph = self.inner.lock_graph();
             let reg = self.inner.read_services();
-            if graph.contains(&name) {
-                return Err(Error::DuplicatePlugin(name));
-            }
-            if meta.provides.iter().any(|k| meta.injects.contains(k)) {
-                return Err(Error::SelfDependency(name));
-            }
-            for key in &meta.provides {
-                if let Some(provider) = graph.provider_of(key) {
-                    return Err(Error::ServiceConflict {
-                        key: key.clone(),
-                        provider: provider.to_owned(),
-                    });
-                }
-                if reg.contains(key) {
-                    return Err(Error::ServiceConflict {
-                        key: key.clone(),
-                        provider: "system".to_owned(),
-                    });
-                }
-            }
+
+            // Lock order extends to `events`, always acquired last.
+            let events = self.inner.read_events();
+            self.validate_meta(&graph, &reg, &events, &meta)?;
+
             let missing = graph.missing_deps(&meta.injects, |k| reg.contains(k));
             if !missing.is_empty() {
                 graph.push_pending(plugin);
@@ -225,6 +210,66 @@ impl Context {
         self.build_reserved(plugin)?;
         self.activate_pending()?;
         Ok(LoadOutcome::Activated)
+    }
+
+    fn validate_meta(
+        &self,
+        graph: &DepGraph,
+        services: &ServiceRegistry,
+        events: &EventRegistry,
+        meta: &PluginMeta,
+    ) -> Result<()> {
+        let name = meta.name().to_owned();
+        if graph.contains(meta.name()) {
+            return Err(Error::DuplicatePlugin(name));
+        }
+        if meta.provides.iter().any(|k| meta.injects.contains(k)) {
+            return Err(Error::SelfDependency(name));
+        }
+        for key in &meta.provides {
+            if let Some(provider) = graph.provider_of(key) {
+                return Err(Error::ServiceConflict {
+                    key: key.clone(),
+                    provider: provider.to_owned(),
+                });
+            }
+            if services.contains(key) {
+                return Err(Error::ServiceConflict {
+                    key: key.clone(),
+                    provider: "system".to_owned(),
+                });
+            }
+        }
+        let mut declared: HashMap<&Key, TypeId> = HashMap::new();
+        for (key, ty) in meta.emits.iter().chain(&meta.listens) {
+            match declared.get(key) {
+                Some(prev) if *prev != *ty => {
+                    return Err(Error::SelfEventConflict {
+                        plugin: name.clone(),
+                        key: key.clone(),
+                    });
+                }
+                _ => {
+                    declared.insert(key, *ty);
+                }
+            }
+            if let Some(other) = graph.conflicting_event_decl(key, *ty) {
+                return Err(Error::EventDeclConflict {
+                    plugin: name.clone(),
+                    key: key.clone(),
+                    other,
+                });
+            }
+            if let Some(channel) = events.channel(key)
+                && channel.ty != *ty
+            {
+                return Err(Error::EventChannelMismatch {
+                    plugin: name.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn unload(&self, name: &str) -> Result<Vec<String>> {
@@ -281,6 +326,14 @@ impl Context {
         self.inner.lock_graph().provider_of(key).map(str::to_owned)
     }
 
+    pub fn emitters_of(&self, key: &Key) -> Vec<String> {
+        self.inner.lock_graph().emitters_of(key)
+    }
+
+    pub fn listeners_of(&self, key: &Key) -> Vec<String> {
+        self.inner.lock_graph().listeners_of(key)
+    }
+
     fn build_reserved(&self, plugin: Arc<dyn Plugin>) -> Result<()> {
         let name = plugin.meta().name().to_owned();
         let owner = Owner::Plugin(name.clone());
@@ -318,9 +371,30 @@ impl Context {
             }
             let mut first_err = None;
             for plugin in ready {
-                self.inner.lock_graph().reserve(plugin.meta());
-                if let Err(err) = self.build_reserved(plugin) {
-                    first_err.get_or_insert(err);
+                let outcome = {
+                    let mut graph = self.inner.lock_graph();
+                    let reg = self.inner.read_services();
+
+                    // Lock order extends to `events`, always acquired last.
+                    let events = self.inner.read_events();
+                    let meta = plugin.meta();
+                    match self.validate_meta(&graph, &reg, &events, &meta) {
+                        Ok(()) => {
+                            graph.reserve(meta);
+                            None
+                        }
+                        Err(err) => Some(err),
+                    }
+                };
+                match outcome {
+                    None => {
+                        if let Err(err) = self.build_reserved(plugin) {
+                            first_err.get_or_insert(err);
+                        }
+                    }
+                    Some(err) => {
+                        first_err.get_or_insert(err);
+                    }
                 }
             }
             if let Some(err) = first_err {
