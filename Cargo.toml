@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+
+[workspace.dependencies]
+arc-swap = "1"
+futures = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

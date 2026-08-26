@@ -1,0 +1,21 @@
+[package]
+name = "harness-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["rt-tokio"]
+rt-tokio = ["dep:tokio"]
+
+[[bin]]
+name = "harness-core"
+path = "src/main.rs"
+required-features = ["rt-tokio"]
+
+[dependencies]
+futures.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
