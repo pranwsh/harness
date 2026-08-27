@@ -7,11 +7,6 @@ edition = "2024"
 default = ["rt-tokio"]
 rt-tokio = ["dep:tokio"]
 
-[[bin]]
-name = "harness-core"
-path = "src/main.rs"
-required-features = ["rt-tokio"]
-
 [dependencies]
 futures.workspace = true
 thiserror.workspace = true
