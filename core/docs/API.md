@@ -379,7 +379,3 @@ sync-only operation without a runtime, and multi-listener fan-out.
   subsequent listeners on that emit.
 - Assuming detached handlers die with their plugin: unloading removes *future* deliveries
   but not handlers already spawned.
-
-**Planned layout note:** the repo's `plugins/` tree reserves `keystrokes`, `llm_request`,
-`registry`, and `tui` as upcoming first-party plugins; `registry` will exercise nested
-loading (`ctx.load` inside `build`).
