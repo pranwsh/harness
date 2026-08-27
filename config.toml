@@ -1,3 +1,4 @@
 base_url = "https://opencode.ai/zen/v1"
-model = "laguna-s-2.1-free"
+model = "mimo-v2.5-free"
 api_key = "public"
+user_agent = "opencode/1.18.18"
