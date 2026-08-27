@@ -1,0 +1,12 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-config = { path = "../plugins/config" }
+harness-core = { path = "../core" }
+harness-llm = { path = "../plugins/llm_request" }
+harness-loop = { path = "../plugins/core_loop" }
+harness-tui = { path = "../plugins/tui" }
+tokio.workspace = true
