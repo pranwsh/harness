@@ -1,0 +1,8 @@
+[package]
+name = "harness-loop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-core = { path = "../../core" }
+harness-llm = { path = "../llm_request" }

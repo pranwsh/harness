@@ -1,0 +1,10 @@
+[package]
+name = "harness-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-core = { path = "../../core" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

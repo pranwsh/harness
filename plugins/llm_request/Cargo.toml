@@ -1,0 +1,15 @@
+[package]
+name = "harness-llm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-config = { path = "../config" }
+harness-core = { path = "../../core" }
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
