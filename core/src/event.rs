@@ -19,9 +19,14 @@ pub type HandlerFuture = BoxFuture<'static, ()>;
 
 pub type Handler = dyn Fn(BoxedEvent) -> HandlerFuture + Send + Sync;
 
+pub type WaterfallFuture = BoxFuture<'static, BoxedEvent>;
+
+pub type WaterfallHandler = dyn Fn(BoxedEvent) -> WaterfallFuture + Send + Sync;
+
 pub(crate) enum ListenerKind {
     Sync(Arc<dyn Fn(BoxedEvent) + Send + Sync>),
     Async(Arc<Handler>),
+    Waterfall(Arc<WaterfallHandler>),
 }
 
 pub(crate) struct ListenerEntry {
@@ -119,5 +124,21 @@ impl<E: Event> Events<E> {
     #[cfg(feature = "rt-tokio")]
     pub fn emit_detached(&self, event: E) -> Result<(), Error> {
         self.ctx.emit_key_detached(self.key.clone(), event)
+    }
+
+    pub fn on_waterfall<F, Fut>(&self, handler: F) -> Result<(), Error>
+    where
+        F: Fn(Arc<E>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = E> + Send + 'static,
+    {
+        self.ctx
+            .on_waterfall_key::<E, F, Fut>(self.key.clone(), handler)
+    }
+
+    pub async fn waterfall(&self, event: E) -> Result<E, Error>
+    where
+        E: Clone,
+    {
+        self.ctx.waterfall_key(self.key.clone(), event).await
     }
 }

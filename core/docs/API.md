@@ -8,7 +8,7 @@ runtime.
 
 - **Crate:** `harness-core` (`core/Cargo.toml`)
 - **Modules:** `error`, `event`, `key`, `plugin` are public; `context`, `graph`, `service` are internal
-- **Re-exports:** `Context`, `LoadOutcome`, `Error`, `Result`, `Key`, `Plugin`, `PluginMeta`, `Event`, `Events`, `BoxedEvent`, `Handler`, `HandlerFuture`
+- **Re-exports:** `Context`, `LoadOutcome`, `Error`, `Result`, `Key`, `Plugin`, `PluginMeta`, `Event`, `Events`, `BoxedEvent`, `Handler`, `HandlerFuture`, `WaterfallHandler`
 
 ```toml
 [dependencies]
@@ -34,7 +34,7 @@ Everything else works without any async runtime; sync-only usage is supported an
             │  events:   Key -> Channel { ty, listeners }│
             │  graph:    active + pending + build state  │
             └────────────────────────────────────────────┘
-               ▲ provide/inject      ▲ listen/emit
+               ▲ provide/inject      ▲ listen/emit/waterfall
         ┌──────┴──────┐         ┌─────┴──────┐
         │   Plugin A  │         │  Plugin B  │
         └─────────────┘         └────────────┘
@@ -178,6 +178,7 @@ PluginMeta::new("name")
     .injects("svc.b")               // service keys required before activation
     .emits::<MyEvent>("ch.tick")    // channels emitted (with payload type)
     .listens::<MyEvent>("ch.tick")  // channels listened to (same type rule)
+    .waterfalls::<MyEvent>("ch.cfg") // channels with waterfall (transform) handlers
 ```
 
 | Method                          | Notes                                                            |
@@ -185,8 +186,8 @@ PluginMeta::new("name")
 | `new(name)`                     | Names must be unique among active + pending plugins              |
 | `provides(key)`                 | Conflicts with another provider → `Error::ServiceConflict`; a plugin may not provide a key it also injects (`SelfDependency`) |
 | `injects(key)`                  | Missing at load time → plugin parks (`LoadOutcome::Pending`)     |
-| `emits::<E>(key)` / `listens::<E>(key)` | Same channel must agree on one payload type everywhere; conflicts → `SelfEventConflict` (own meta), `EventDeclConflict` (other plugins), `EventChannelMismatch` (live channel) |
-| `name()`, `emits_of()`, `listens_of()` | Accessors                                                 |
+| `emits::<E>(key)` / `listens::<E>(key)` / `waterfalls::<E>(key)` | Same channel must agree on one payload type everywhere; conflicts → `SelfEventConflict` (own meta), `EventDeclConflict` (other plugins), `EventChannelMismatch` (live channel) |
+| `name()`, `emits_of()`, `listens_of()`, `waterfalls_of()` | Accessors                                                 |
 
 ## `struct Key`
 
@@ -209,8 +210,10 @@ Typed channel handle obtained from `ctx.events::<E>(key)` (or stored as a servic
 | `on(handler) -> Result<()>`  | Register an **async** listener `Fn(Arc<E>) -> impl Future<Output=()> + Send`   |
 | `emit(event) -> Result<Vec<HandlerFuture>>` | Emit; returns un-awaited futures of async listeners              |
 | `emit_detached(event) -> Result<()>` | *(rt-tokio)* `tokio::spawn`s each returned future — fire-and-forget    |
+| `on_waterfall(handler) -> Result<()>` | Register a **waterfall** handler `Fn(Arc<E>) -> impl Future<Output=E> + Send` |
+| `waterfall(event) -> Result<E>` | *(async)* Chain waterfall handlers sequentially; returns final transformed event |
 
-For raw access see `Context::on_key` / `on_sync_key` / `emit_key`.
+For raw access see `Context::on_key` / `on_sync_key` / `emit_key` / `on_waterfall_key` / `waterfall_key`.
 
 ### Emit semantics
 
@@ -228,6 +231,35 @@ Documented at `Context::emit_key` (`src/context.rs`):
 - Emitting on a channel with zero listeners — including one never created — is a silent
   no-op returning `Ok(vec![])`.
 - Wrong payload type for the channel → `Error::PayloadTypeMismatch`.
+
+### Waterfall semantics
+
+A **waterfall** chains listeners sequentially, where each listener receives the event and
+can **modify it** before passing it to the next. This is in contrast to `emit`, which fans
+out the same event to all listeners independently.
+
+```rust
+let bus = ctx.events::<Config>("app.config");
+bus.on_waterfall(|cfg| async move { Config { debug: true, ..(*cfg) } }).unwrap();
+bus.on_waterfall(|cfg| async move { Config { max_retries: 5, ..(*cfg) } }).unwrap();
+let final_cfg = bus.waterfall(Config::default()).await?;
+// final_cfg.debug == true, final_cfg.max_retries == 5
+```
+
+**Key properties:**
+
+- **Sequential execution:** handlers run in registration order, each awaiting the next.
+- **Transform:** each handler receives `Arc<E>` and returns `E` (the modified event).
+- **Return value:** `waterfall` returns the final transformed event after all handlers run.
+- **Independent of emit:** waterfall handlers on a channel are *not* triggered by `emit`,
+  and regular listeners are *not* triggered by `waterfall`. The two dispatch modes coexist
+  on the same channel but remain cleanly separated.
+- **No handlers:** if no waterfall listeners are registered, the original event is returned
+  unchanged.
+- **Type safety:** the event type must match the channel's registered type; mismatch →
+  `Error::PayloadTypeMismatch`.
+- **Clone required:** `E` must implement `Clone` because the final `Arc<E>` may need to be
+  unwrapped.
 
 ## `struct Context`
 
@@ -249,7 +281,8 @@ methods take `&self` and are safe to call from any thread.
 | ------ | ----------- |
 | `on_key<E, F, Fut>(key, handler)` | Async listener; handler receives `Arc<E>` |
 | `on_sync_key<E, F>(key, handler)` | Sync listener; handler receives `&E`, runs inline on emit |
-| `events::<E>(key) -> Events<E>` | Typed reusable handle (`on` / `emit` / `emit_detached`) |
+| `on_waterfall_key<E, F, Fut>(key, handler)` | Waterfall handler; receives `Arc<E>`, returns transformed `E` |
+| `events::<E>(key) -> Events<E>` | Typed reusable handle (`on` / `emit` / `emit_detached` / `on_waterfall` / `waterfall`) |
 
 Listeners registered through a plugin's context are owned by that plugin and removed when
 it unloads.
@@ -260,6 +293,7 @@ it unloads.
 | ------ | ----------- |
 | `emit_key<E>(key, event) -> Result<Vec<HandlerFuture>>` | See [Emit semantics](#emit-semantics) |
 | `emit_key_detached<E>(key, event) -> Result<()>` | *(rt-tokio)* spawn each async handler |
+| `waterfall_key<E>(key, event) -> Result<E>` | *(async)* See [Waterfall semantics](#waterfall-semantics) |
 
 ### Lifecycle
 
@@ -301,7 +335,7 @@ it unloads.
 | `plugin_names()` | Active plugins in load order |
 | `pending_names()` | Parked plugins awaiting dependencies |
 | `provider_of(&key)` | Name of the plugin providing a service key |
-| `emitters_of(&key)` / `listeners_of(&key)` | Plugins declaring emit/listen on a channel |
+| `emitters_of(&key)` / `listeners_of(&key)` / `waterfallers_of(&key)` | Plugins declaring emit/listen/waterfall on a channel |
 
 ## `enum LoadOutcome`
 
@@ -363,7 +397,7 @@ sync-only operation without a runtime, and multi-listener fan-out.
 - Prefer async listeners (`on_key` / `Events::on`) for anything I/O-bound.
 - Use `emit_detached` only when you truly want fire-and-forget; prefer collecting and
   awaiting/joining futures when completion matters.
-- Declare `emits`/`listens` honestly in `meta()` — it buys you load-time conflict
+- Declare `emits`/`listens`/`waterfalls` honestly in `meta()` — it buys you load-time conflict
   detection and accurate introspection.
 
 **Avoid (current sharp edges):**

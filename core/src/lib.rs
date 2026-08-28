@@ -8,6 +8,6 @@ mod service;
 
 pub use context::{Context, LoadOutcome};
 pub use error::{Error, Result};
-pub use event::{BoxedEvent, Event, Events, Handler, HandlerFuture};
+pub use event::{BoxedEvent, Event, Events, Handler, HandlerFuture, WaterfallHandler};
 pub use key::Key;
 pub use plugin::{Plugin, PluginMeta};

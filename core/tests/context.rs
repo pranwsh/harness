@@ -980,3 +980,131 @@ async fn intra_batch_pending_conflict_first_wins() {
     assert!(!names.contains(&"b".to_owned()));
     assert!(ctx.pending_names().is_empty());
 }
+
+#[derive(Debug, Clone, PartialEq)]
+struct WfNum(u32);
+
+#[tokio::test]
+async fn waterfall_single_handler() {
+    let ctx = Context::root();
+    ctx.on_waterfall_key::<WfNum, _, _>("wf.ch", |n| async move { WfNum(n.0 * 2) })
+        .unwrap();
+    let result = ctx.waterfall_key("wf.ch", WfNum(5)).await.unwrap();
+    assert_eq!(result, WfNum(10));
+}
+
+#[tokio::test]
+async fn waterfall_chain() {
+    let ctx = Context::root();
+    ctx.on_waterfall_key::<WfNum, _, _>("wf.chain", |n| async move { WfNum(n.0 + 1) })
+        .unwrap();
+    ctx.on_waterfall_key::<WfNum, _, _>("wf.chain", |n| async move { WfNum(n.0 * 10) })
+        .unwrap();
+    let result = ctx.waterfall_key("wf.chain", WfNum(3)).await.unwrap();
+    assert_eq!(result, WfNum(40));
+}
+
+#[tokio::test]
+async fn waterfall_no_handlers_returns_original() {
+    let ctx = Context::root();
+    let result = ctx.waterfall_key("wf.empty", WfNum(7)).await.unwrap();
+    assert_eq!(result, WfNum(7));
+}
+
+#[tokio::test]
+async fn waterfall_unknown_channel_returns_original() {
+    let ctx = Context::root();
+    let result = ctx.waterfall_key("wf.ghost", WfNum(99)).await.unwrap();
+    assert_eq!(result, WfNum(99));
+}
+
+#[tokio::test]
+async fn waterfall_type_mismatch_errors() {
+    let ctx = Context::root();
+    ctx.on_waterfall_key::<WfNum, _, _>("wf.ty", |n| async move { WfNum(n.0) })
+        .unwrap();
+    assert!(matches!(
+        ctx.waterfall_key("wf.ty", String::from("wrong")).await,
+        Err(Error::PayloadTypeMismatch { key }) if key == Key::new("wf.ty")
+    ));
+}
+
+#[tokio::test]
+async fn waterfall_and_emit_are_independent() {
+    let ctx = Context::root();
+    let seen_emit = Arc::new(Mutex::new(Vec::new()));
+    let seen_emit_clone = seen_emit.clone();
+
+    ctx.on_sync_key::<WfNum, _>("wf.indep", move |n| {
+        seen_emit_clone.lock().unwrap().push(n.0);
+    })
+    .unwrap();
+    ctx.on_waterfall_key::<WfNum, _, _>("wf.indep", |n| async move { WfNum(n.0 + 100) })
+        .unwrap();
+
+    ctx.emit_key("wf.indep", WfNum(1)).unwrap();
+    assert_eq!(*seen_emit.lock().unwrap(), vec![1]);
+
+    let result = ctx.waterfall_key("wf.indep", WfNum(1)).await.unwrap();
+    assert_eq!(result, WfNum(101));
+    assert_eq!(*seen_emit.lock().unwrap(), vec![1]);
+}
+
+#[tokio::test]
+async fn waterfall_via_events_handle() {
+    let ctx = Context::root();
+    let bus = ctx.events::<WfNum>("wf.handle");
+    bus.on_waterfall(|n| async move { WfNum(n.0 + 5) }).unwrap();
+    let result = bus.waterfall(WfNum(10)).await.unwrap();
+    assert_eq!(result, WfNum(15));
+}
+
+#[tokio::test]
+async fn waterfall_declaration_conflict_with_emit() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("w1").waterfalls::<WfNum>("wf.decl"),
+    })
+    .unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("e1").emits::<String>("wf.decl")
+        }),
+        Err(Error::EventDeclConflict { plugin, key, other })
+            if plugin == "e1" && key == Key::new("wf.decl") && other == "w1"
+    ));
+}
+
+#[tokio::test]
+async fn waterfall_declaration_conflict_with_waterfall() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("w1").waterfalls::<WfNum>("wf.dc"),
+    })
+    .unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("w2").waterfalls::<String>("wf.dc")
+        }),
+        Err(Error::EventDeclConflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn same_type_waterfall_declarations_coexist() {
+    let ctx = Context::root();
+    ctx.load(MetaOnly {
+        meta: PluginMeta::new("w1").waterfalls::<WfNum>("wf.ok"),
+    })
+    .unwrap();
+    assert!(matches!(
+        ctx.load(MetaOnly {
+            meta: PluginMeta::new("w2").waterfalls::<WfNum>("wf.ok")
+        }),
+        Ok(LoadOutcome::Activated)
+    ));
+    assert_eq!(
+        ctx.waterfallers_of(&Key::new("wf.ok")),
+        vec!["w1".to_owned(), "w2".to_owned()]
+    );
+}

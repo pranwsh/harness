@@ -9,6 +9,7 @@ pub struct PluginMeta {
     pub(crate) injects: Vec<Key>,
     pub(crate) emits: Vec<(Key, TypeId)>,
     pub(crate) listens: Vec<(Key, TypeId)>,
+    pub(crate) waterfalls: Vec<(Key, TypeId)>,
 }
 
 impl PluginMeta {
@@ -19,6 +20,7 @@ impl PluginMeta {
             injects: Vec::new(),
             emits: Vec::new(),
             listens: Vec::new(),
+            waterfalls: Vec::new(),
         }
     }
 
@@ -42,6 +44,11 @@ impl PluginMeta {
         self
     }
 
+    pub fn waterfalls<E: Event>(mut self, key: impl Into<Key>) -> Self {
+        self.waterfalls.push((key.into(), TypeId::of::<E>()));
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -52,6 +59,10 @@ impl PluginMeta {
 
     pub fn listens_of(&self) -> &[(Key, TypeId)] {
         &self.listens
+    }
+
+    pub fn waterfalls_of(&self) -> &[(Key, TypeId)] {
+        &self.waterfalls
     }
 }
 

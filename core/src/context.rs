@@ -10,7 +10,7 @@ use crate::{
     error::{Error, Result},
     event::{
         BoxedEvent, Event, EventRegistry, Events, Handler, HandlerFuture, ListenerEntry,
-        ListenerKind, downcast_event,
+        ListenerKind, WaterfallHandler, downcast_event,
     },
     graph::DepGraph,
     key::Key,
@@ -166,6 +166,7 @@ impl Context {
             match &entry.kind {
                 ListenerKind::Sync(f) => f(ev.clone()),
                 ListenerKind::Async(h) => pending.push(h(ev.clone())),
+                ListenerKind::Waterfall(_) => {}
             }
         }
         Ok(pending)
@@ -177,6 +178,66 @@ impl Context {
             tokio::spawn(fut);
         }
         Ok(())
+    }
+
+    pub fn on_waterfall_key<E, F, Fut>(&self, key: impl Into<Key>, handler: F) -> Result<()>
+    where
+        E: Event,
+        F: Fn(Arc<E>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = E> + Send + 'static,
+    {
+        let raw: Arc<WaterfallHandler> = Arc::new(move |ev| {
+            let e = downcast_event::<E>(ev);
+            let fut = handler(e);
+            Box::pin(async move {
+                let result = fut.await;
+                Arc::new(result) as BoxedEvent
+            })
+        });
+        self.add_raw_listener::<E>(key, ListenerKind::Waterfall(raw))
+    }
+
+    pub async fn waterfall_key<E: Event + Clone>(
+        &self,
+        key: impl Into<Key>,
+        event: E,
+    ) -> Result<E> {
+        let key = key.into();
+        let listeners: Vec<Arc<ListenerEntry>> = {
+            let reg = self.inner.read_events();
+            let Some(channel) = reg.channel(&key) else {
+                return Ok(event);
+            };
+            if channel.ty != TypeId::of::<E>() {
+                return Err(Error::PayloadTypeMismatch { key });
+            }
+            if channel.listeners.is_empty() {
+                return Ok(event);
+            }
+            channel
+                .listeners
+                .iter()
+                .filter(|e| matches!(e.kind, ListenerKind::Waterfall(_)))
+                .cloned()
+                .collect()
+        };
+
+        if listeners.is_empty() {
+            return Ok(event);
+        }
+
+        let mut current: BoxedEvent = Arc::new(event);
+        for entry in &listeners {
+            if let ListenerKind::Waterfall(f) = &entry.kind {
+                current = f(current).await;
+            }
+        }
+
+        let any: Arc<dyn Any + Send + Sync> = current;
+        let arc_e = any
+            .downcast::<E>()
+            .map_err(|_| Error::PayloadTypeMismatch { key })?;
+        Ok(Arc::try_unwrap(arc_e).unwrap_or_else(|arc| (*arc).clone()))
     }
 
     pub fn events<E: Event>(&self, key: impl Into<Key>) -> Events<E> {
@@ -241,7 +302,12 @@ impl Context {
             }
         }
         let mut declared: HashMap<&Key, TypeId> = HashMap::new();
-        for (key, ty) in meta.emits.iter().chain(&meta.listens) {
+        for (key, ty) in meta
+            .emits
+            .iter()
+            .chain(&meta.listens)
+            .chain(&meta.waterfalls)
+        {
             match declared.get(key) {
                 Some(prev) if *prev != *ty => {
                     return Err(Error::SelfEventConflict {
@@ -332,6 +398,10 @@ impl Context {
 
     pub fn listeners_of(&self, key: &Key) -> Vec<String> {
         self.inner.lock_graph().listeners_of(key)
+    }
+
+    pub fn waterfallers_of(&self, key: &Key) -> Vec<String> {
+        self.inner.lock_graph().waterfallers_of(key)
     }
 
     fn build_reserved(&self, plugin: Arc<dyn Plugin>) -> Result<()> {

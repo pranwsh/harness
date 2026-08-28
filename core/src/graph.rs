@@ -22,6 +22,7 @@ pub(crate) struct DepGraph {
     pending_index: HashSet<String>,
     declared_emits: HashMap<Key, Vec<(String, TypeId)>>,
     declared_listens: HashMap<Key, Vec<(String, TypeId)>>,
+    declared_waterfalls: HashMap<Key, Vec<(String, TypeId)>>,
 }
 
 impl DepGraph {
@@ -103,6 +104,12 @@ impl DepGraph {
                 .or_default()
                 .push((name.clone(), *ty));
         }
+        for (key, ty) in &meta.waterfalls {
+            self.declared_waterfalls
+                .entry(key.clone())
+                .or_default()
+                .push((name.clone(), *ty));
+        }
         self.active.insert(name.clone(), Node { meta });
         self.order.push(name.clone());
         self.building.insert(name);
@@ -135,8 +142,12 @@ impl DepGraph {
         for entries in self.declared_listens.values_mut() {
             entries.retain(|(owner, _)| owner != name);
         }
+        for entries in self.declared_waterfalls.values_mut() {
+            entries.retain(|(owner, _)| owner != name);
+        }
         self.declared_emits.retain(|_, e| !e.is_empty());
         self.declared_listens.retain(|_, e| !e.is_empty());
+        self.declared_waterfalls.retain(|_, e| !e.is_empty());
         Some(node.meta)
     }
 
@@ -146,7 +157,9 @@ impl DepGraph {
                 .iter()
                 .find_map(|(owner, t)| (*t != ty).then_some(owner.clone()))
         };
-        find(&self.declared_emits).or_else(|| find(&self.declared_listens))
+        find(&self.declared_emits)
+            .or_else(|| find(&self.declared_listens))
+            .or_else(|| find(&self.declared_waterfalls))
     }
 
     pub(crate) fn emitters_of(&self, key: &Key) -> Vec<String> {
@@ -158,6 +171,13 @@ impl DepGraph {
 
     pub(crate) fn listeners_of(&self, key: &Key) -> Vec<String> {
         self.declared_listens
+            .get(key)
+            .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn waterfallers_of(&self, key: &Key) -> Vec<String> {
+        self.declared_waterfalls
             .get(key)
             .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
             .unwrap_or_default()
