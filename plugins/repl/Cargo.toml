@@ -1,0 +1,9 @@
+[package]
+name = "harness-repl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+tokio.workspace = true

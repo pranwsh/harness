@@ -1,0 +1,9 @@
+[package]
+name = "harness-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+arc-swap.workspace = true
