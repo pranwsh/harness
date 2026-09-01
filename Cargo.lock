@@ -345,6 +345,7 @@ dependencies = [
  "futures",
  "harness-contracts",
  "harness-core",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
