@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
+harness-agent-loop = { path = "../agent-loop" }
+harness-session = { path = "../session" }
 tokio.workspace = true

@@ -325,8 +325,10 @@ dependencies = [
 name = "harness-repl"
 version = "0.1.0"
 dependencies = [
+ "harness-agent-loop",
  "harness-contracts",
  "harness-core",
+ "harness-session",
  "tokio",
 ]
 
