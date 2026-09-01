@@ -59,7 +59,6 @@ impl harness_core::Plugin for AgentDefaultModelPlugin {
 mod tests {
     use super::*;
     use harness_contracts::KEY_AGENTS;
-    use harness_core::Plugin;
 
     fn load_all(ctx: &Context) {
         ctx.load(

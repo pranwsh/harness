@@ -1,4 +1,11 @@
+[llm]
 base_url = "https://opencode.ai/zen/v1"
 model = "mimo-v2.5-free"
 api_key = "public"
 user_agent = "opencode/1.18.18"
+
+[agent]
+max_iterations = 8
+
+[session]
+backend = "memory"

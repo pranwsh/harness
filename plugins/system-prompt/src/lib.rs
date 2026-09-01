@@ -124,7 +124,6 @@ pub fn system_prompt_of(ctx: &Context) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::Plugin;
 
     #[test]
     fn assembles_system_then_history_in_order() {

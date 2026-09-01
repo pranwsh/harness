@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+harness-core = { path = "../core" }
+harness-config = { path = "../plugins/config" }
+harness-model = { path = "../plugins/model" }
+harness-agent = { path = "../plugins/agent" }
+harness-session = { path = "../plugins/session" }
+harness-tools = { path = "../plugins/tools" }
+harness-system-prompt = { path = "../plugins/system-prompt" }
+harness-agent-default-model = { path = "../plugins/agent-default-model" }
+harness-agent-loop = { path = "../plugins/agent-loop" }
+harness-repl = { path = "../plugins/repl" }
+tokio.workspace = true

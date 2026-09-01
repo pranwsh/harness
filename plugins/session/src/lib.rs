@@ -139,7 +139,6 @@ impl harness_core::Plugin for SessionPlugin {
 mod tests {
     use super::*;
     use harness_contracts::{Role, ToolCall, ToolError};
-    use harness_core::Plugin;
 
     fn tool_event(session: &str, turn: u64, call_id: &str, result: Result<String, ToolError>) -> ToolExecuted {
         ToolExecuted {

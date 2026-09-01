@@ -243,6 +243,19 @@ dependencies = [
 [[package]]
 name = "harness"
 version = "0.1.0"
+dependencies = [
+ "harness-agent",
+ "harness-agent-default-model",
+ "harness-agent-loop",
+ "harness-config",
+ "harness-core",
+ "harness-model",
+ "harness-repl",
+ "harness-session",
+ "harness-system-prompt",
+ "harness-tools",
+ "tokio",
+]
 
 [[package]]
 name = "harness-agent"
