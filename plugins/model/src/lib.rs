@@ -7,21 +7,26 @@ use thiserror::Error;
 
 use harness_config::AppConfig;
 
+/// Boxed completion future returned by [`ModelClient`].
+pub type CompletionFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<Message, ModelError>> + Send + 'a>>;
+
 /// Client abstraction over a chat-completion backend.
 ///
-/// Implementations are expected to be cheap to clone behind an `Arc` and
-/// safe to call concurrently.
+/// Dyn-compatible: implementations are registered as `Arc<dyn ModelClient>`
+/// services and may be swapped (HTTP client, fake for tests) without
+/// touching the loop.
 pub trait ModelClient: Send + Sync + 'static {
     /// Runs one non-streaming completion.
     ///
     /// `tools` advertises callable tools; the returned message may carry
     /// `tool_calls` the caller is expected to execute and feed back.
-    fn complete(
-        &self,
-        model: &str,
-        messages: &[Message],
-        tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<Message, ModelError>> + Send;
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+    ) -> CompletionFuture<'a>;
 }
 
 #[derive(Debug, Error)]
@@ -149,53 +154,71 @@ struct RespFunction {
 }
 
 impl ModelClient for HttpModelClient {
-    async fn complete(
-        &self,
-        model: &str,
-        messages: &[Message],
-        tools: &[ToolSpec],
-    ) -> Result<Message, ModelError> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = CompletionRequest {
-            model,
-            messages: messages.iter().map(WireMessage::from_message).collect(),
-            tools: tools
-                .iter()
-                .map(|t| WireTool {
-                    r#type: "function",
-                    function: t,
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+    ) -> CompletionFuture<'a> {
+        Box::pin(async move {
+            let url = format!("{}/chat/completions", self.base_url);
+            let body = CompletionRequest {
+                model,
+                messages: messages.iter().map(WireMessage::from_message).collect(),
+                tools: tools
+                    .iter()
+                    .map(|t| WireTool {
+                        r#type: "function",
+                        function: t,
+                    })
+                    .collect(),
+            };
+            let resp: CompletionResponse = self
+                .client
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let choice =
+                resp.choices.into_iter().next().ok_or(ModelError::EmptyChoices)?;
+            let msg = choice.message;
+            let tool_calls: Vec<ToolCall> = msg
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| ToolCall {
+                    id: c.id,
+                    name: c.function.name,
+                    arguments: c.function.arguments,
                 })
-                .collect(),
-        };
-        let resp: CompletionResponse = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+                .collect();
 
-        let choice = resp.choices.into_iter().next().ok_or(ModelError::EmptyChoices)?;
-        let msg = choice.message;
-        let tool_calls: Vec<ToolCall> = msg
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| ToolCall {
-                id: c.id,
-                name: c.function.name,
-                arguments: c.function.arguments,
-            })
-            .collect();
+            let content = msg.content.unwrap_or_default();
+            if content.is_empty() && tool_calls.is_empty() {
+                return Err(ModelError::EmptyContent);
+            }
+            Ok(Message::assistant_with_calls(content, tool_calls))
+        })
+    }
+}
 
-        let content = msg.content.unwrap_or_default();
-        if content.is_empty() && tool_calls.is_empty() {
-            return Err(ModelError::EmptyContent);
-        }
-        Ok(Message::assistant_with_calls(content, tool_calls))
+/// Sized handle around a dyn client so it can live in the service registry
+/// (`inject_key` requires `Sized`).
+pub struct ModelClientHandle(pub Arc<dyn ModelClient>);
+
+impl ModelClient for ModelClientHandle {
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+    ) -> CompletionFuture<'a> {
+        self.0.complete(model, messages, tools)
     }
 }
 
@@ -203,16 +226,14 @@ pub struct ModelPlugin;
 
 impl Plugin for ModelPlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta::new("model")
-            .provides(KEY_MODEL_CLIENT)
-            .injects(KEY_CONFIG)
+        PluginMeta::new("model").provides(KEY_MODEL_CLIENT).injects(KEY_CONFIG)
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
         let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
         let client = HttpModelClient::new(&config)
             .map_err(|e| harness_core::Error::PluginPanicked("model".to_owned(), e.to_string()))?;
-        ctx.provide_key(KEY_MODEL_CLIENT, Arc::new(client));
+        ctx.provide_key(KEY_MODEL_CLIENT, Arc::new(ModelClientHandle(Arc::new(client))));
         Ok(())
     }
 }

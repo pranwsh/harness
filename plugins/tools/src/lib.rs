@@ -11,9 +11,8 @@ use harness_core::{Context, Result};
 use serde_json::json;
 
 /// A tool implementation: raw arguments JSON in, string result out.
-pub type ToolHandler = Arc<
-    dyn Fn(&str) -> BoxFuture<Result<String, ToolError>> + Send + Sync,
->;
+pub type ToolHandler =
+    Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
 
 type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
 
@@ -40,7 +39,7 @@ impl Tools {
     pub fn register(
         &self,
         spec: ToolSpec,
-        handler: impl Fn(&str) -> BoxFuture<Result<String, ToolError>> + Send + Sync + 'static,
+        handler: impl Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync + 'static,
     ) -> Result<()> {
         {
             let mut tools = self.lock();
@@ -102,7 +101,7 @@ impl Tools {
                     message: "unknown tool".to_owned(),
                 })
         }?;
-        handler(&call.arguments).await
+        handler(call.arguments.clone()).await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (ToolSpec, ToolHandler)>> {
@@ -118,8 +117,8 @@ fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
 }
 
 /// Builtin `read_file(path)` tool.
-fn read_file_handler(args: &str) -> BoxFuture<Result<String, ToolError>> {
-    let path = match parse_path(args) {
+fn read_file_handler(args: String) -> BoxFuture<Result<String, ToolError>> {
+    let path = match parse_path(&args) {
         Ok(path) => path,
         Err(err) => return Box::pin(async move { Err(err) }),
     };
@@ -209,8 +208,8 @@ mod tests {
         }
     }
 
-    fn echo_handler(args: &str) -> BoxFuture<Result<String, ToolError>> {
-        let text = serde_json::from_str::<serde_json::Value>(args)
+    fn echo_handler(args: String) -> BoxFuture<Result<String, ToolError>> {
+        let text = serde_json::from_str::<serde_json::Value>(&args)
             .ok()
             .and_then(|v| v.get("text").cloned())
             .map(|v| v.as_str().unwrap_or_default().to_owned());

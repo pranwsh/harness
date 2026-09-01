@@ -266,9 +266,16 @@ dependencies = [
 name = "harness-agent-loop"
 version = "0.1.0"
 dependencies = [
- "futures",
+ "harness-agent",
+ "harness-agent-default-model",
+ "harness-config",
  "harness-contracts",
  "harness-core",
+ "harness-model",
+ "harness-session",
+ "harness-system-prompt",
+ "harness-tools",
+ "serde_json",
  "tokio",
 ]
 

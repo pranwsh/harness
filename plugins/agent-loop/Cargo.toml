@@ -6,7 +6,14 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
+harness-agent = { path = "../agent" }
+harness-session = { path = "../session" }
+harness-tools = { path = "../tools" }
+harness-system-prompt = { path = "../system-prompt" }
+harness-agent-default-model = { path = "../agent-default-model" }
+harness-config = { path = "../config" }
+harness-model = { path = "../model" }
 tokio.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
+serde_json.workspace = true
