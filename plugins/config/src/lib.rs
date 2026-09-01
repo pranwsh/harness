@@ -87,10 +87,10 @@ impl AppConfig {
             path: path.to_owned(),
             source,
         })?;
-        Self::from_str(&raw, path)
+        Self::from_toml(&raw, path)
     }
 
-    pub fn from_str(raw: &str, path: &str) -> Result<Self, ConfigError> {
+    pub fn from_toml(raw: &str, path: &str) -> Result<Self, ConfigError> {
         if raw.trim().is_empty() {
             return Err(ConfigError::Empty {
                 path: path.to_owned(),
@@ -116,6 +116,13 @@ impl ConfigPlugin {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         Ok(ConfigPlugin {
             config: Arc::new(AppConfig::from_file(path)?),
+        })
+    }
+
+    /// Builds the plugin from raw TOML (tests and embedded configs).
+    pub fn from_toml(raw: &str) -> Result<Self, ConfigError> {
+        Ok(ConfigPlugin {
+            config: Arc::new(AppConfig::from_toml(raw, "<embedded>")?),
         })
     }
 }
@@ -148,7 +155,7 @@ max_iterations = 3
 
     #[test]
     fn parses_full_config() {
-        let cfg = AppConfig::from_str(RAW, "test").unwrap();
+        let cfg = AppConfig::from_toml(RAW, "test").unwrap();
         assert_eq!(cfg.llm.model, "test-model");
         assert_eq!(cfg.agent.max_iterations, 3);
         assert_eq!(cfg.session.backend, "memory");
@@ -163,7 +170,7 @@ model = "m"
 api_key = "k"
 user_agent = "a"
 "#;
-        let cfg = AppConfig::from_str(raw, "test").unwrap();
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
         assert_eq!(cfg.agent.max_iterations, 8);
         assert_eq!(cfg.session.backend, "memory");
     }
@@ -171,7 +178,7 @@ user_agent = "a"
     #[test]
     fn rejects_empty_file() {
         assert!(matches!(
-            AppConfig::from_str("   \n", "test"),
+            AppConfig::from_toml("   \n", "test"),
             Err(ConfigError::Empty { .. })
         ));
     }
@@ -179,7 +186,7 @@ user_agent = "a"
     #[test]
     fn rejects_missing_llm_section() {
         assert!(matches!(
-            AppConfig::from_str("[agent]\nmax_iterations = 2\n", "test"),
+            AppConfig::from_toml("[agent]\nmax_iterations = 2\n", "test"),
             Err(ConfigError::Parse { .. })
         ));
     }

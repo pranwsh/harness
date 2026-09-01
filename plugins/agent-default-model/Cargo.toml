@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
+harness-config = { path = "../config" }
