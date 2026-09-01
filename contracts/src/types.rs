@@ -152,6 +152,12 @@ pub struct ToolError {
     pub message: String,
 }
 
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tool `{}` failed: {}", self.tool, self.message)
+    }
+}
+
 // ---- event payloads ---------------------------------------------------------
 
 /// `CH_AGENT_CREATED`
