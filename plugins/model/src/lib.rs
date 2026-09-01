@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use harness_contracts::{KEY_CONFIG, KEY_MODEL_CLIENT, Message, ToolSpec};
+use harness_contracts::{KEY_CONFIG, KEY_MODEL_CLIENT, Message, Role, ToolCall, ToolSpec};
 use harness_core::{Context, Plugin, PluginMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -54,16 +54,18 @@ impl HttpModelClient {
     }
 }
 
-fn is_empty_slice<T>(s: &[T]) -> bool {
-    s.is_empty()
-}
-
 #[derive(Serialize)]
 struct CompletionRequest<'a> {
     model: &'a str,
-    messages: &'a [Message],
-    #[serde(skip_serializing_if = "is_empty_slice")]
-    tools: &'a [ToolSpec],
+    messages: Vec<WireMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireTool<'a> {
+    r#type: &'a str,
+    function: &'a ToolSpec,
 }
 
 // Wire format: tool calls use the provider's nested shape.
@@ -113,12 +115,10 @@ impl<'a> WireMessage<'a> {
                     },
                 })
                 .collect(),
-            tool_call_id: None,
+            tool_call_id: msg.call_id.as_deref(),
         }
     }
 }
-
-use harness_contracts::Role;
 
 #[derive(Deserialize)]
 struct CompletionResponse {
@@ -158,8 +158,14 @@ impl ModelClient for HttpModelClient {
         let url = format!("{}/chat/completions", self.base_url);
         let body = CompletionRequest {
             model,
-            messages,
-            tools,
+            messages: messages.iter().map(WireMessage::from_message).collect(),
+            tools: tools
+                .iter()
+                .map(|t| WireTool {
+                    r#type: "function",
+                    function: t,
+                })
+                .collect(),
         };
         let resp: CompletionResponse = self
             .client
@@ -174,11 +180,11 @@ impl ModelClient for HttpModelClient {
 
         let choice = resp.choices.into_iter().next().ok_or(ModelError::EmptyChoices)?;
         let msg = choice.message;
-        let tool_calls: Vec<harness_contracts::ToolCall> = msg
+        let tool_calls: Vec<ToolCall> = msg
             .tool_calls
             .unwrap_or_default()
             .into_iter()
-            .map(|c| harness_contracts::ToolCall {
+            .map(|c| ToolCall {
                 id: c.id,
                 name: c.function.name,
                 arguments: c.function.arguments,
@@ -246,8 +252,8 @@ mod tests {
         let msg = Message::user("hi");
         let req = CompletionRequest {
             model: "m",
-            messages: std::slice::from_ref(&msg),
-            tools: &[],
+            messages: vec![WireMessage::from_message(&msg)],
+            tools: Vec::new(),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("tools").is_none());

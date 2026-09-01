@@ -36,6 +36,9 @@ pub struct Message {
     /// Tool calls the assistant requested, present on assistant messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Referenced call id, present only on tool-result messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 impl Message {
@@ -44,6 +47,7 @@ impl Message {
             role: Role::System,
             content: content.into(),
             tool_calls: Vec::new(),
+            call_id: None,
         }
     }
 
@@ -52,6 +56,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             tool_calls: Vec::new(),
+            call_id: None,
         }
     }
 
@@ -60,6 +65,7 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             tool_calls: Vec::new(),
+            call_id: None,
         }
     }
 
@@ -68,6 +74,17 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             tool_calls,
+            call_id: None,
+        }
+    }
+
+    /// Tool-result message (`role: tool`) referencing a call id.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Message {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            call_id: Some(call_id.into()),
         }
     }
 }
@@ -112,7 +129,7 @@ impl Entry {
             role: msg.role,
             content: msg.content.clone(),
             tool_calls: msg.tool_calls.clone(),
-            call_id: None,
+            call_id: msg.call_id.clone(),
         }
     }
 
