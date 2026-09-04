@@ -197,15 +197,13 @@ impl TurnTask {
 
             // 1. Assemble prompt from current history.
             let history = self.sessions.history(&self.session_id);
-            let messages =
-                self.prompt
-                    .assemble(
-                        &self.agent_id,
-                        &self.session_id,
-                        iterations,
-                        &system_prompt,
-                        &history,
-                    );
+            let messages = self.prompt.assemble(
+                &self.agent_id,
+                &self.session_id,
+                iterations,
+                &system_prompt,
+                &history,
+            );
 
             // 2. Pick model, call it.
             let model = self.selector.select(&self.agent_id);
@@ -216,12 +214,12 @@ impl TurnTask {
                 .map_err(|e| e.to_string())?;
 
             // 3. Record the assistant message.
-            self.sessions.append(
-                &self.session_id,
-                self.turn_no,
-                Entry::from_message(&reply),
-            );
-            let _ = self.tx.send(TurnEvent::Assistant(reply.content.clone())).await;
+            self.sessions
+                .append(&self.session_id, self.turn_no, Entry::from_message(&reply));
+            let _ = self
+                .tx
+                .send(TurnEvent::Assistant(reply.content.clone()))
+                .await;
 
             // 4. No tool calls → done. Otherwise execute each call; the
             //    session plugin's sync listener has already appended the
@@ -235,10 +233,7 @@ impl TurnTask {
                     .tools
                     .execute(&self.agent_id, &self.session_id, self.turn_no, call.clone())
                     .await;
-                let _ = self
-                    .tx
-                    .send(TurnEvent::ToolResult(call, result))
-                    .await;
+                let _ = self.tx.send(TurnEvent::ToolResult(call, result)).await;
             }
         }
     }
