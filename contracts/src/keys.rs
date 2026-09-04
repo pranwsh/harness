@@ -21,8 +21,8 @@ pub const KEY_PROMPT: &str = "prompt.assembler";
 pub const KEY_MODEL_SELECTOR: &str = "model.selector";
 /// `Arc<AgentLoop>` — provided by the agent-loop plugin.
 pub const KEY_AGENT_LOOP: &str = "agent_loop.run";
-/// `Arc<Repl>` — provided by the repl plugin.
-pub const KEY_REPL: &str = "ui.repl";
+/// `Arc<Tui>` — provided by the tui plugin.
+pub const KEY_TUI: &str = "ui.tui";
 
 // ---- channels ---------------------------------------------------------------
 
