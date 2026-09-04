@@ -67,14 +67,12 @@ fn setup(replies: Vec<Message>, max_iterations: u32) -> Context {
     let config = format!(
         "[llm]\nbase_url=\"u\"\nmodel=\"fake\"\napi_key=\"k\"\nuser_agent=\"a\"\n\n[agent]\nmax_iterations = {max_iterations}\n"
     );
-    ctx.load(
-        harness_config::ConfigPlugin::from_toml(&config).unwrap(),
-    )
-    .unwrap();
+    ctx.load(harness_config::ConfigPlugin::from_toml(&config).unwrap())
+        .unwrap();
     ctx.load(harness_model::ModelPlugin).unwrap();
     ctx.load(harness_agent::AgentPlugin).unwrap();
     ctx.load(harness_session::SessionPlugin).unwrap();
-    ctx.load(harness_tools::ToolsPlugin::new()).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
     ctx.load(harness_system_prompt::SystemPromptPlugin::default())
         .unwrap();
     ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
@@ -167,10 +165,7 @@ async fn second_model_call_sees_tool_result_in_history() {
 
 #[tokio::test]
 async fn no_tool_calls_completes_in_one_iteration() {
-    let ctx = setup(
-        vec![Message::assistant("immediate answer")],
-        8,
-    );
+    let ctx = setup(vec![Message::assistant("immediate answer")], 8);
 
     let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
     let events = drain(loop_svc.run("a1", "s3", "ping")).await;
@@ -184,10 +179,7 @@ async fn no_tool_calls_completes_in_one_iteration() {
 async fn hits_max_iterations_cap() {
     // Model always requests a tool → never terminates on its own.
     let ctx = setup(
-        vec![
-            Message::assistant_with_calls("again", vec![fake_tool_call("t1")]);
-            16
-        ],
+        vec![Message::assistant_with_calls("again", vec![fake_tool_call("t1")]); 16],
         3,
     );
 
@@ -209,21 +201,27 @@ async fn tool_errors_are_fed_back_and_logged() {
     ctx.load(harness_model::ModelPlugin).unwrap();
     ctx.load(harness_agent::AgentPlugin).unwrap();
     ctx.load(harness_session::SessionPlugin).unwrap();
-    ctx.load(harness_tools::ToolsPlugin::new()).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
     ctx.load(harness_system_prompt::SystemPromptPlugin::default())
         .unwrap();
     ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
         .unwrap();
 
     let replies = vec![
-        Message::assistant_with_calls("try it", vec![ToolCall {
-            id: "t1".into(),
-            name: "failing_tool".into(),
-            arguments: "{}".into(),
-        }]),
+        Message::assistant_with_calls(
+            "try it",
+            vec![ToolCall {
+                id: "t1".into(),
+                name: "failing_tool".into(),
+                arguments: "{}".into(),
+            }],
+        ),
         Message::assistant("recovered"),
     ];
-    ctx.provide_key(KEY_MODEL_CLIENT, Arc::new(ModelClientHandle(FakeModel::new(replies))));
+    ctx.provide_key(
+        KEY_MODEL_CLIENT,
+        Arc::new(ModelClientHandle(FakeModel::new(replies))),
+    );
 
     let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
     tools
@@ -257,6 +255,13 @@ async fn tool_errors_are_fed_back_and_logged() {
 
     // Agent ends idle after a successful turn.
     let agents: Arc<harness_agent::AgentRegistry> = ctx.inject_key(KEY_AGENTS).unwrap();
-    assert_eq!(agents.state_of("a1"), Some(harness_contracts::AgentState::Idle));
-    let _ = (KEY_CONFIG, KEY_PROMPT, Entry::from_message(&Message::user("x")));
+    assert_eq!(
+        agents.state_of("a1"),
+        Some(harness_contracts::AgentState::Idle)
+    );
+    let _ = (
+        KEY_CONFIG,
+        KEY_PROMPT,
+        Entry::from_message(&Message::user("x")),
+    );
 }
