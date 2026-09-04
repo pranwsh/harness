@@ -8,8 +8,8 @@ use std::{
 
 use arc_swap::ArcSwap;
 use harness_contracts::{
-    AgentCreated, AgentId, AgentState, AgentStateChanged, CH_AGENT_CREATED,
-    CH_AGENT_STATE_CHANGED, KEY_AGENTS,
+    AgentCreated, AgentId, AgentState, AgentStateChanged, CH_AGENT_CREATED, CH_AGENT_STATE_CHANGED,
+    KEY_AGENTS,
 };
 use harness_core::{Context, Result};
 
@@ -63,10 +63,12 @@ impl AgentRegistry {
             next.insert(fresh.id.clone(), fresh.state);
             next
         });
-        let _ = self
-            .emit
-            .ctx
-            .emit_key_detached(CH_AGENT_CREATED, AgentCreated { agent_id: fresh.id.clone() });
+        let _ = self.emit.ctx.emit_key_detached(
+            CH_AGENT_CREATED,
+            AgentCreated {
+                agent_id: fresh.id.clone(),
+            },
+        );
         fresh
     }
 
@@ -121,8 +123,6 @@ impl harness_core::Plugin for AgentPlugin {
         Ok(())
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
