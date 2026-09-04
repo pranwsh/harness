@@ -140,7 +140,12 @@ mod tests {
     use super::*;
     use harness_contracts::{Role, ToolCall, ToolError};
 
-    fn tool_event(session: &str, turn: u64, call_id: &str, result: Result<String, ToolError>) -> ToolExecuted {
+    fn tool_event(
+        session: &str,
+        turn: u64,
+        call_id: &str,
+        result: Result<String, ToolError>,
+    ) -> ToolExecuted {
         ToolExecuted {
             agent_id: "a".into(),
             session_id: session.into(),
