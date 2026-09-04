@@ -5,7 +5,7 @@ api_key = "public"
 user_agent = "opencode/1.18.18"
 
 [agent]
-max_iterations = 8
+max_iterations = 128
 
 [session]
 backend = "memory"
