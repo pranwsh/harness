@@ -10,8 +10,10 @@ harness-model = { path = "../plugins/model" }
 harness-agent = { path = "../plugins/agent" }
 harness-session = { path = "../plugins/session" }
 harness-tools = { path = "../plugins/tools" }
+harness-read-file = { path = "../plugins/read-file" }
 harness-system-prompt = { path = "../plugins/system-prompt" }
 harness-agent-default-model = { path = "../plugins/agent-default-model" }
 harness-agent-loop = { path = "../plugins/agent-loop" }
-harness-repl = { path = "../plugins/repl" }
+harness-tui = { path = "../plugins/tui" }
+harness-contracts = { path = "../contracts" }
 tokio.workspace = true
