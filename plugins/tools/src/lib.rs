@@ -8,11 +8,9 @@ use harness_contracts::{
     ToolRegistered, ToolSpec,
 };
 use harness_core::{Context, Result};
-use serde_json::json;
 
 /// A tool implementation: raw arguments JSON in, string result out.
-pub type ToolHandler =
-    Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
+pub type ToolHandler = Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
 
 type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
 
@@ -109,69 +107,7 @@ impl Tools {
     }
 }
 
-fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
-    ToolError {
-        tool: tool.to_owned(),
-        message: message.into(),
-    }
-}
-
-/// Builtin `read_file(path)` tool.
-fn read_file_handler(args: String) -> BoxFuture<Result<String, ToolError>> {
-    let path = match parse_path(&args) {
-        Ok(path) => path,
-        Err(err) => return Box::pin(async move { Err(err) }),
-    };
-    Box::pin(async move {
-        tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| tool_err("read_file", format!("cannot read {path}: {e}")))
-    })
-}
-
-fn parse_path(args: &str) -> std::result::Result<String, ToolError> {
-    #[derive(serde::Deserialize)]
-    struct Args {
-        path: String,
-    }
-    let args: Args = serde_json::from_str(args)
-        .map_err(|e| tool_err("read_file", format!("invalid arguments: {e}")))?;
-    if args.path.trim().is_empty() {
-        return Err(tool_err("read_file", "path must not be empty"));
-    }
-    Ok(args.path)
-}
-
-pub fn read_file_spec() -> ToolSpec {
-    ToolSpec {
-        name: "read_file".to_owned(),
-        description: "Read a UTF-8 text file from disk and return its contents.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Absolute or cwd-relative file path" }
-            },
-            "required": ["path"]
-        }),
-    }
-}
-
-pub struct ToolsPlugin {
-    /// Extra tools registered at build time (builtins are always added).
-    builtins: Vec<(ToolSpec, ToolHandler)>,
-}
-
-impl ToolsPlugin {
-    pub fn new() -> Self {
-        ToolsPlugin { builtins: Vec::new() }
-    }
-}
-
-impl Default for ToolsPlugin {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub struct ToolsPlugin;
 
 impl harness_core::Plugin for ToolsPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
@@ -183,22 +119,22 @@ impl harness_core::Plugin for ToolsPlugin {
 
     fn build(&self, ctx: Context) -> Result<()> {
         let tools = Arc::new(Tools::new(ctx.clone()));
-        ctx.provide_key(KEY_TOOLS, tools.clone());
-
-        let mut builtins: Vec<(ToolSpec, ToolHandler)> = self.builtins.clone();
-        builtins.push((read_file_spec(), Arc::new(read_file_handler)));
-        for (spec, handler) in builtins {
-            tools.register(spec, move |args| handler(args))?;
-        }
+        ctx.provide_key(KEY_TOOLS, tools);
         Ok(())
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contracts::Role;
+    use serde_json::json;
+
+    fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
+        ToolError {
+            tool: tool.to_owned(),
+            message: message.into(),
+        }
+    }
 
     fn echo_spec() -> ToolSpec {
         ToolSpec {
@@ -222,11 +158,9 @@ mod tests {
     #[tokio::test]
     async fn execute_runs_handler_and_emits() {
         let ctx = Context::root();
-        ctx.load(ToolsPlugin::new()).unwrap();
+        ctx.load(ToolsPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
-        tools
-            .register(echo_spec(), echo_handler)
-            .unwrap();
+        tools.register(echo_spec(), echo_handler).unwrap();
 
         let executed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         ctx.on_sync_key::<ToolExecuted, _>(CH_TOOL_EXECUTED, {
@@ -245,13 +179,13 @@ mod tests {
         let out = tools.execute("a", "s", 1, call).await.unwrap();
         assert_eq!(out, "hi");
         assert_eq!(executed.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(tools.specs().len(), 2); // echo + read_file builtin
+        assert_eq!(tools.specs().len(), 1);
     }
 
     #[tokio::test]
     async fn unknown_tool_fails_with_error_event() {
         let ctx = Context::root();
-        ctx.load(ToolsPlugin::new()).unwrap();
+        ctx.load(ToolsPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
 
         let call = ToolCall {
@@ -267,27 +201,9 @@ mod tests {
     #[tokio::test]
     async fn duplicate_registration_is_rejected() {
         let ctx = Context::root();
-        ctx.load(ToolsPlugin::new()).unwrap();
+        ctx.load(ToolsPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
-        tools
-            .register(echo_spec(), echo_handler)
-            .unwrap();
+        tools.register(echo_spec(), echo_handler).unwrap();
         assert!(tools.register(echo_spec(), echo_handler).is_err());
-    }
-
-    #[tokio::test]
-    async fn read_file_builtin_reads_disk() {
-        let ctx = Context::root();
-        ctx.load(ToolsPlugin::new()).unwrap();
-        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
-
-        let call = ToolCall {
-            id: "c3".into(),
-            name: "read_file".into(),
-            arguments: r#"{"path":"Cargo.toml"}"#.into(),
-        };
-        let out = tools.execute("a", "s", 1, call).await.unwrap();
-        assert!(out.contains("harness-tools"));
-        let _ = Role::System;
     }
 }
