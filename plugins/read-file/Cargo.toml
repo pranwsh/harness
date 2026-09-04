@@ -1,0 +1,13 @@
+[package]
+name = "harness-read-file"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+harness-tools = { path = "../tools" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
