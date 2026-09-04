@@ -1,0 +1,14 @@
+[package]
+name = "harness-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+harness-agent-loop = { path = "../agent-loop" }
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
