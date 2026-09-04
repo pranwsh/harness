@@ -184,8 +184,11 @@ impl ModelClient for HttpModelClient {
                 .json()
                 .await?;
 
-            let choice =
-                resp.choices.into_iter().next().ok_or(ModelError::EmptyChoices)?;
+            let choice = resp
+                .choices
+                .into_iter()
+                .next()
+                .ok_or(ModelError::EmptyChoices)?;
             let msg = choice.message;
             let tool_calls: Vec<ToolCall> = msg
                 .tool_calls
@@ -226,14 +229,19 @@ pub struct ModelPlugin;
 
 impl Plugin for ModelPlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta::new("model").provides(KEY_MODEL_CLIENT).injects(KEY_CONFIG)
+        PluginMeta::new("model")
+            .provides(KEY_MODEL_CLIENT)
+            .injects(KEY_CONFIG)
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
         let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
         let client = HttpModelClient::new(&config)
             .map_err(|e| harness_core::Error::PluginPanicked("model".to_owned(), e.to_string()))?;
-        ctx.provide_key(KEY_MODEL_CLIENT, Arc::new(ModelClientHandle(Arc::new(client))));
+        ctx.provide_key(
+            KEY_MODEL_CLIENT,
+            Arc::new(ModelClientHandle(Arc::new(client))),
+        );
         Ok(())
     }
 }
