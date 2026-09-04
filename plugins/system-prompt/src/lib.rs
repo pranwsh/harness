@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use harness_contracts::{
-    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, Message, PromptAssembled, Role,
-};
+use harness_contracts::{CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, Message, PromptAssembled, Role};
 use harness_core::{Context, Result};
 
 /// Builds the message array sent to the model from session history.
@@ -100,16 +98,10 @@ impl harness_core::Plugin for SystemPromptPlugin {
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        ctx.provide_key(
-            KEY_PROMPT,
-            Arc::new(PromptAssembler::new(ctx.clone())),
-        );
+        ctx.provide_key(KEY_PROMPT, Arc::new(PromptAssembler::new(ctx.clone())));
         // The prompt text itself is carried by this plugin instance; the
         // loop queries it via `system_prompt()`.
-        ctx.provide_key(
-            "prompt.text",
-            Arc::new(self.prompt.clone()),
-        );
+        ctx.provide_key("prompt.text", Arc::new(self.prompt.clone()));
         Ok(())
     }
 }
