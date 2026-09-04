@@ -1,6 +1,7 @@
 use std::{process::ExitCode, sync::Arc};
 
 use harness_config::{ConfigPlugin, config_path};
+use harness_contracts::KEY_TUI;
 use harness_core::{Context, LoadOutcome, Result};
 use tokio::sync::mpsc;
 
@@ -47,7 +48,8 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "model", harness_model::ModelPlugin);
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
-    load!(ctx, "tools", harness_tools::ToolsPlugin::new());
+    load!(ctx, "tools", harness_tools::ToolsPlugin);
+    load!(ctx, "read-file", harness_read_file::ReadFilePlugin);
     load!(
         ctx,
         "system-prompt",
@@ -61,12 +63,11 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "agent-loop", harness_agent_loop::AgentLoopPlugin);
 
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
-    load!(ctx, "repl", harness_repl::ReplPlugin::new(done_tx));
+    load!(ctx, "tui", harness_tui::TuiPlugin::new(done_tx));
 
-    let repl: Arc<harness_repl::Repl> = ctx.inject_key("ui.repl")?;
+    let tui: Arc<harness_tui::Tui> = ctx.inject_key(KEY_TUI)?;
 
-    println!("ready — type a message, /history or /quit");
-    repl.run().await;
+    tui.run().await;
     let _ = done_rx.recv().await;
 
     Ok(ExitCode::SUCCESS)
