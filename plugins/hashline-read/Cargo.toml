@@ -1,0 +1,20 @@
+[package]
+name = "harness-hashline-read"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+harness-tools = { path = "../tools" }
+harness-hash-base = { path = "../hash-base" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+memmap2 = "0.9"
+memchr = "2"
+fs2 = "0.4"
+
+[dev-dependencies]
+tokio.workspace = true

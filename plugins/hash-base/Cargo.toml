@@ -1,0 +1,13 @@
+[package]
+name = "harness-hash-base"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+memmap2 = "0.9"
+memchr = "2"
+fs2 = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror.workspace = true

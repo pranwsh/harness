@@ -11,6 +11,9 @@ harness-agent = { path = "../plugins/agent" }
 harness-session = { path = "../plugins/session" }
 harness-tools = { path = "../plugins/tools" }
 harness-read-file = { path = "../plugins/read-file" }
+harness-hash-base = { path = "../plugins/hash-base" }
+harness-hashline-read = { path = "../plugins/hashline-read" }
+harness-hashline-edit = { path = "../plugins/hashline-edit" }
 harness-system-prompt = { path = "../plugins/system-prompt" }
 harness-agent-default-model = { path = "../plugins/agent-default-model" }
 harness-agent-loop = { path = "../plugins/agent-loop" }

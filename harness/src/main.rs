@@ -50,6 +50,17 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "session", harness_session::SessionPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);
     load!(ctx, "read-file", harness_read_file::ReadFilePlugin);
+    load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
+    load!(
+        ctx,
+        "hashline-read",
+        harness_hashline_read::HashlineReadPlugin
+    );
+    load!(
+        ctx,
+        "hashline-edit",
+        harness_hashline_edit::HashlineEditPlugin
+    );
     load!(
         ctx,
         "system-prompt",
