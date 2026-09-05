@@ -13,6 +13,9 @@ members = [
     "plugins/system-prompt",
     "plugins/agent-default-model",
     "plugins/agent-loop",
+    "plugins/tui-state",
+    "plugins/tui-markdown",
+    "plugins/tui-input",
     "plugins/tui",
 ]
 

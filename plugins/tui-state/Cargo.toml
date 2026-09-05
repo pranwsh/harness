@@ -1,0 +1,9 @@
+[package]
+name = "harness-tui-state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+ratatui.workspace = true
+unicode-width.workspace = true

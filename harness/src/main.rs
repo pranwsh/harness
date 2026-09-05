@@ -63,6 +63,8 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "agent-loop", harness_agent_loop::AgentLoopPlugin);
 
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+    load!(ctx, "tui-input", harness_tui_input::InputPlugin);
+    load!(ctx, "tui-markdown", harness_tui_markdown::MarkdownPlugin);
     load!(ctx, "tui", harness_tui::TuiPlugin::new(done_tx));
 
     let tui: Arc<harness_tui::Tui> = ctx.inject_key(KEY_TUI)?;

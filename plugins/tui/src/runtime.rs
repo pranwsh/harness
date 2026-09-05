@@ -13,20 +13,31 @@ use crossterm::{
 use tokio::sync::mpsc;
 
 use harness_agent_loop::{AgentLoop, TurnEvent};
+use harness_tui_input::Input;
+use harness_tui_state::{
+    app::{App, AppMsg},
+    render::RendererHandle,
+};
 
-use crate::app::{App, AppMsg};
-use crate::{input, view};
+use crate::view;
 
 /// How often to redraw even without input, so the busy hint and
 /// late-arriving stream events are always fresh.
 const RENDER_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Runs the TUI until the app quits. Restores the terminal on exit,
-/// including on panic (hooks below).
-pub async fn run(agent_loop: Arc<AgentLoop>, agent_id: String, session_id: String) {
+/// including on panic (hooks below). Services come from DI so alternative
+/// renderers or input sources plug in without touching this loop.
+pub async fn run(
+    agent_loop: Arc<AgentLoop>,
+    agent_id: String,
+    session_id: String,
+    renderer: Arc<RendererHandle>,
+    input: Arc<Input>,
+) {
     let terminal = ratatui::init();
     enable_terminal_features();
-    let result = EventLoop::new(agent_loop, agent_id, session_id)
+    let result = EventLoop::new(agent_loop, agent_id, session_id, renderer, input)
         .run(terminal)
         .await;
     disable_terminal_features();
@@ -65,21 +76,29 @@ struct EventLoop {
     agent_id: String,
     session_id: String,
     app: App,
+    renderer: Arc<RendererHandle>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
 }
 
 impl EventLoop {
-    fn new(agent_loop: Arc<AgentLoop>, agent_id: String, session_id: String) -> Self {
+    fn new(
+        agent_loop: Arc<AgentLoop>,
+        agent_id: String,
+        session_id: String,
+        renderer: Arc<RendererHandle>,
+        input: Arc<Input>,
+    ) -> Self {
         // Bound generous enough to absorb bursts of stream events; the
         // input task bails out if the loop ever stops draining.
         let (tx, rx) = mpsc::channel(256);
-        input::spawn(tx.clone());
+        input.spawn(tx.clone());
         EventLoop {
             agent_loop,
             agent_id,
             session_id,
             app: App::new(),
+            renderer,
             tx,
             rx,
         }
@@ -91,7 +110,7 @@ impl EventLoop {
     ) -> std::result::Result<(), String> {
         loop {
             terminal
-                .draw(|f| view::draw(f, &mut self.app))
+                .draw(|f| view::draw(f, &mut self.app, self.renderer.as_renderer()))
                 .map_err(|e| e.to_string())?;
 
             let msg = tokio::select! {

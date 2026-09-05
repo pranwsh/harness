@@ -1,37 +1,36 @@
 //! TUI front-end: a ratatui-based chat interface over the agent loop.
 //!
+//! Thin shell crate: terminal I/O and DI wiring only. Pure state lives in
+//! [`harness_tui_state`], markdown rendering in [`harness_tui_markdown`].
+//!
 //! Layout of concerns:
-//! - [`app`]: pure UI state (transcript, editor, scroll, quit).
-//! - [`editor`]: multi-line input buffer with visual cursor motion.
-//! - [`wrap`]: display-width-aware wrapping shared by editor and view.
-//! - [`markdown`]: mdfrier-based markdown rendering for assistant messages.
-//! - [`view`]: ratatui rendering, a pure function of `App`.
 //! - [`input`]: crossterm key/mouse reading task.
+//! - [`view`]: ratatui rendering, a pure function of `App` plus a renderer.
 //! - [`runtime`]: terminal lifecycle and the main event loop.
 //! - [`Tui`]/[`TuiPlugin`]: DI facade and plugin wiring.
 
 use std::sync::Arc;
 
-use harness_contracts::{KEY_AGENT_LOOP, KEY_TUI};
+use harness_contracts::{KEY_AGENT_LOOP, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_TUI};
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
 
 use harness_agent_loop::AgentLoop;
+use harness_tui_input::Input;
+use harness_tui_state::render::RendererHandle;
 
-pub mod app;
-pub mod editor;
-pub mod input;
-pub mod markdown;
 pub mod runtime;
 pub mod view;
-pub mod wrap;
 
 /// Chat front-end bound to one agent and session. Running it takes over
-/// the terminal until the user quits via `/quit` or Ctrl+C.
+/// the terminal until the user quits via `/quit` or Ctrl+C. Rendering and
+/// input come from injected DI services so engines stay swappable.
 pub struct Tui {
     agent_loop: Arc<AgentLoop>,
     agent_id: String,
     session_id: String,
+    renderer: Arc<RendererHandle>,
+    input: Arc<Input>,
     done: mpsc::Sender<()>,
 }
 
@@ -40,12 +39,16 @@ impl Tui {
         agent_loop: Arc<AgentLoop>,
         agent_id: impl Into<String>,
         session_id: impl Into<String>,
+        renderer: Arc<RendererHandle>,
+        input: Arc<Input>,
         done: mpsc::Sender<()>,
     ) -> Self {
         Tui {
             agent_loop,
             agent_id: agent_id.into(),
             session_id: session_id.into(),
+            renderer,
+            input,
             done,
         }
     }
@@ -57,6 +60,8 @@ impl Tui {
             self.agent_loop.clone(),
             self.agent_id.clone(),
             self.session_id.clone(),
+            self.renderer.clone(),
+            self.input.clone(),
         )
         .await;
         let _ = self.done.send(()).await;
@@ -78,16 +83,22 @@ impl harness_core::Plugin for TuiPlugin {
         harness_core::PluginMeta::new("tui")
             .provides(KEY_TUI)
             .injects(KEY_AGENT_LOOP)
+            .injects(KEY_MARKDOWN_RENDERER)
+            .injects(KEY_INPUT)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         let agent_loop: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP)?;
+        let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER)?;
+        let input: Arc<Input> = ctx.inject_key(KEY_INPUT)?;
         ctx.provide_key(
             KEY_TUI,
             Arc::new(Tui::new(
                 agent_loop,
                 "agent-1",
                 "session-1",
+                renderer,
+                input,
                 self.done.clone(),
             )),
         );

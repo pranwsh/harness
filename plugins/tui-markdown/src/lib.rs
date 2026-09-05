@@ -1,19 +1,26 @@
-//! Markdown rendering for assistant messages via mdfrier.
+//! Markdown [`MessageRenderer`](harness_tui_state::render::MessageRenderer)
+//! for assistant messages, via mdfrier with syntect code highlighting.
 //!
-//! Assistant chat items are markdown; everything else stays plain text.
 //! mdfrier already wraps to the given width, so callers must not re-wrap
-//! its output. On any parser failure we fall back to plain `wrap_text`
-//! so a broken message never blanks the transcript.
+//! its output. On any parser failure we fall back to plain wrapping so a
+//! broken message never blanks the transcript.
 //!
-//! Code is rendered with real syntax highlighting (syntect) and no
-//! background fill: fenced blocks are highlighted per their fence
-//! language, inline code renders as plain assistant text.
+//! Code is rendered with real syntax highlighting and no background fill:
+//! fenced blocks are highlighted per their fence language, inline code
+//! renders as plain assistant text.
+//!
+//! NOTE: this crate depends on mdfrier, which is GPL-3.0-or-later. Keep the
+//! markdown engine behind the renderer trait so downstream crates never
+//! absorb that dependency transitively.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
+use harness_contracts::KEY_MARKDOWN_RENDERER;
+use harness_core::{Context, Result};
+use harness_tui_state::render::{MessageRenderer, RendererHandle};
 use ratatui::{
     style::{Color as RatColor, Modifier as RatModifier, Style},
     text::{Line, Span as RatSpan},
@@ -235,7 +242,7 @@ fn wrap_code_line(segments: &[(Style, String)], width: usize) -> Vec<Line<'stati
         runs.push((off, end, *style));
         off = end;
     }
-    crate::wrap::wrap_spans(&plain, width.max(1))
+    harness_tui_state::wrap::wrap_spans(&plain, width.max(1))
         .into_iter()
         .map(|(a, b)| {
             let spans: Vec<RatSpan> = runs
@@ -292,6 +299,50 @@ fn flush_code(
         let hl = hl.as_mut().expect("highlighter initialised above");
         let segments = highlight_segments(hl, &assets.syntaxes, code);
         out.extend(wrap_code_line(&segments, width));
+    }
+}
+
+/// Default [`MessageRenderer`] for assistant messages: mdfrier markdown
+/// with syntect code highlighting and no background fill.
+pub struct MdfrierRenderer {
+    base: Style,
+}
+
+impl MdfrierRenderer {
+    pub fn new(base: Style) -> Self {
+        MdfrierRenderer { base }
+    }
+}
+
+impl Default for MdfrierRenderer {
+    fn default() -> Self {
+        MdfrierRenderer::new(harness_tui_state::render::ASSISTANT_BASE)
+    }
+}
+
+impl MessageRenderer for MdfrierRenderer {
+    fn render_assistant(&self, text: &str, width: u16) -> Vec<Line<'static>> {
+        render_assistant(text, width, self.base)
+    }
+}
+
+/// Plugin providing the shared markdown renderer as
+/// `Arc<RendererHandle>` under [`KEY_MARKDOWN_RENDERER`].
+/// A different plugin can provide the same key to swap engines without
+/// touching the TUI shell.
+pub struct MarkdownPlugin;
+
+impl harness_core::Plugin for MarkdownPlugin {
+    fn meta(&self) -> harness_core::PluginMeta {
+        harness_core::PluginMeta::new("markdown").provides(KEY_MARKDOWN_RENDERER)
+    }
+
+    fn build(&self, ctx: Context) -> Result<()> {
+        ctx.provide_key(
+            KEY_MARKDOWN_RENDERER,
+            Arc::new(RendererHandle(Arc::new(MdfrierRenderer::default()))),
+        );
+        Ok(())
     }
 }
 
@@ -391,7 +442,7 @@ fn render_assistant_uncached(text: &str, width: u16, base: Style) -> Vec<Line<'s
 }
 
 fn fallback(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
-    crate::wrap::wrap_text(text, width.max(1))
+    harness_tui_state::wrap::wrap_text(text, width.max(1))
         .into_iter()
         .map(|s| Line::styled(s, base))
         .collect()
@@ -561,5 +612,19 @@ mod tests {
         // Both still served correctly on repeat.
         assert_eq!(render_assistant(&text, 20, base()), narrow);
         assert_eq!(render_assistant(&text, 80, base()), wide);
+    }
+
+    #[test]
+    fn plugin_provides_renderer_through_di() {
+        let ctx = Context::root();
+        ctx.load(MarkdownPlugin).unwrap();
+        let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER).unwrap();
+        let lines = renderer.render_assistant("**bold**", 80);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "bold", "DI renderer strips markers: {text:?}");
     }
 }

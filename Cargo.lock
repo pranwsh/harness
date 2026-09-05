@@ -703,6 +703,8 @@ dependencies = [
  "harness-system-prompt",
  "harness-tools",
  "harness-tui",
+ "harness-tui-input",
+ "harness-tui-markdown",
  "tokio",
 ]
 
@@ -828,14 +830,47 @@ name = "harness-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "futures",
  "harness-agent-loop",
  "harness-contracts",
  "harness-core",
+ "harness-tui-input",
+ "harness-tui-markdown",
+ "harness-tui-state",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
+name = "harness-tui-input"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures",
+ "harness-contracts",
+ "harness-core",
+ "harness-tui-state",
+ "tokio",
+]
+
+[[package]]
+name = "harness-tui-markdown"
+version = "0.1.0"
+dependencies = [
+ "harness-contracts",
+ "harness-core",
+ "harness-tui-state",
  "mdfrier",
  "ratatui",
  "syntect",
- "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "harness-tui-state"
+version = "0.1.0"
+dependencies = [
+ "harness-contracts",
+ "ratatui",
  "unicode-width",
 ]
 

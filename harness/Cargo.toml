@@ -14,6 +14,8 @@ harness-read-file = { path = "../plugins/read-file" }
 harness-system-prompt = { path = "../plugins/system-prompt" }
 harness-agent-default-model = { path = "../plugins/agent-default-model" }
 harness-agent-loop = { path = "../plugins/agent-loop" }
+harness-tui-markdown = { path = "../plugins/tui-markdown" }
+harness-tui-input = { path = "../plugins/tui-input" }
 harness-tui = { path = "../plugins/tui" }
 harness-contracts = { path = "../contracts" }
 tokio.workspace = true

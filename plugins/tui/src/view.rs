@@ -9,9 +9,11 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::app::{App, ChatItem, INPUT_VISIBLE_ROWS, ItemKind, max_chat_scroll};
-use crate::markdown::render_assistant;
-use crate::wrap::{display_width, wrap_spans, wrap_text};
+use harness_tui_state::{
+    app::{App, ChatItem, INPUT_VISIBLE_ROWS, ItemKind, max_chat_scroll},
+    render::{ASSISTANT_BASE, MessageRenderer},
+    wrap::{display_width, wrap_spans, wrap_text},
+};
 
 /// Margin, in columns, on each side of assistant/tool/notice output.
 const SIDE_MARGIN: u16 = 4;
@@ -19,15 +21,17 @@ const SIDE_MARGIN: u16 = 4;
 /// Draws the whole UI: chat pane (fills remaining space) above the
 /// input box, which grows from 1 up to `INPUT_VISIBLE_ROWS` text rows
 /// as the input wraps. Takes `&mut App` to record the measured input
-/// width, which key handling needs for visual cursor motion.
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// width, which key handling needs for visual cursor motion. Assistant
+/// messages render through `renderer`, keeping this module free of any
+/// markdown engine dependency.
+pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer) {
     let area = f.area();
     app.set_input_width(area.width.saturating_sub(2).max(1) as usize);
     let input_height = app.input_rows().min(INPUT_VISIBLE_ROWS) as u16 + 2;
     let [chat_area, input_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_height)]).areas(area);
 
-    draw_chat(f, app, chat_area);
+    draw_chat(f, app, chat_area, renderer);
     draw_input(f, app, input_area);
 }
 
@@ -42,14 +46,14 @@ struct MsgLayout {
     height: usize,
 }
 
-fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_chat(f: &mut Frame, app: &mut App, area: Rect, renderer: &dyn MessageRenderer) {
     if area.width < 2 || area.height == 0 {
         return;
     }
     let layouts: Vec<MsgLayout> = app
         .items()
         .iter()
-        .map(|item| layout_item(item, area.width))
+        .map(|item| layout_item(item, area.width, renderer))
         .collect();
     let total: usize = layouts.iter().map(|l| l.height).sum();
     let viewport = area.height as usize;
@@ -165,7 +169,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 /// Box borders are synthesized as text rows (not a `Block` widget) so
 /// that partial boxes at the scroll edge clip row-by-row like any
 /// other content; the glyphs match `Block::bordered()`.
-fn layout_item(item: &ChatItem, area_width: u16) -> MsgLayout {
+fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer) -> MsgLayout {
     let style = item_style(item.kind);
     if item.kind == ItemKind::User {
         // The box's right edge sits on the 4-column right margin, and
@@ -212,12 +216,12 @@ fn layout_item(item: &ChatItem, area_width: u16) -> MsgLayout {
 
     let x = SIDE_MARGIN.min(area_width);
     // Both margins come out of the text column so long lines wrap
-    // before reaching the right edge. Assistant messages are markdown
-    // rendered via mdfrier (which wraps itself); everything else is
+    // before reaching the right edge. Assistant messages render through
+    // the injected engine (which wraps itself); everything else is
     // plain wrapped text.
     let width = area_width.saturating_sub(x + SIDE_MARGIN).max(1);
     let lines = if item.kind == ItemKind::Assistant {
-        render_assistant(&item.text, width, style)
+        renderer.render_assistant(&item.text, width)
     } else {
         wrap_text(&item.text, width as usize)
             .into_iter()
@@ -236,7 +240,7 @@ fn layout_item(item: &ChatItem, area_width: u16) -> MsgLayout {
 fn item_style(kind: ItemKind) -> Style {
     match kind {
         ItemKind::User => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ItemKind::Assistant => Style::new().fg(Color::Cyan),
+        ItemKind::Assistant => ASSISTANT_BASE,
         ItemKind::ToolStarted | ItemKind::ToolOk | ItemKind::Notice => {
             Style::new().fg(Color::DarkGray)
         }
@@ -248,7 +252,11 @@ fn item_style(kind: ItemKind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{AppMsg, KeyEvent};
+    use harness_tui_markdown::MdfrierRenderer;
+    use harness_tui_state::{
+        app::{AppMsg, KeyEvent},
+        render::PlainRenderer,
+    };
 
     fn user_item(text: &str) -> ChatItem {
         ChatItem {
@@ -262,6 +270,16 @@ mod tests {
             text: text.to_owned(),
             kind: ItemKind::Assistant,
         }
+    }
+
+    /// Renderer with no markdown interpretation, for layout tests that
+    /// must not depend on any engine.
+    fn plain() -> PlainRenderer {
+        PlainRenderer::new(Style::new())
+    }
+
+    fn markdown() -> MdfrierRenderer {
+        MdfrierRenderer::default()
     }
 
     #[test]
@@ -292,7 +310,7 @@ mod tests {
 
     #[test]
     fn user_box_shrinks_to_content_and_hugs_right_margin() {
-        let lay = layout_item(&user_item("hi"), 30);
+        let lay = layout_item(&user_item("hi"), 30, &plain());
         // 4-wide box (borders + "hi") ending 4 columns from the edge,
         // with top border, text, and bottom border rows.
         assert_eq!((lay.x, lay.width, lay.height), (22, 4, 3));
@@ -301,7 +319,7 @@ mod tests {
 
     #[test]
     fn user_box_wraps_long_messages() {
-        let lay = layout_item(&user_item(&"ab ".repeat(20)), 30);
+        let lay = layout_item(&user_item(&"ab ".repeat(20)), 30, &plain());
         // Box shares the assistant text column: 4-column margins.
         assert_eq!(lay.x, 4);
         assert_eq!(lay.x + lay.width, 26);
@@ -310,7 +328,7 @@ mod tests {
 
     #[test]
     fn assistant_text_has_side_margins() {
-        let lay = layout_item(&assistant_item("hello"), 30);
+        let lay = layout_item(&assistant_item("hello"), 30, &markdown());
         // 4-column margins on both sides of the text column.
         assert_eq!((lay.x, lay.width, lay.height), (4, 22, 1));
     }
@@ -323,12 +341,19 @@ mod tests {
 
     /// Renders `draw` on a fixed-size test backend and returns every
     /// visible row (trailing space trimmed).
-    fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    fn render(
+        app: &mut App,
+        renderer: &dyn MessageRenderer,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
         use ratatui::{Terminal, backend::TestBackend};
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
-        terminal.draw(|f| draw(f, app)).expect("test draw");
+        terminal
+            .draw(|f| draw(f, app, renderer))
+            .expect("test draw");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -343,8 +368,13 @@ mod tests {
 
     /// Renders `draw` and returns the chat-area rows only. Valid while
     /// the input box is a single text row tall (empty or short input).
-    fn render_chat(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        render(app, width, height)[..(height - 3) as usize].to_vec()
+    fn render_chat(
+        app: &mut App,
+        renderer: &dyn MessageRenderer,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        render(app, renderer, width, height)[..(height - 3) as usize].to_vec()
     }
 
     fn submit(app: &mut App, text: &str) {
@@ -359,7 +389,7 @@ mod tests {
     fn user_message_renders_as_right_aligned_box() {
         let mut app = App::new();
         submit(&mut app, "hi");
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         // 3-row box bottom-anchored in the 9-row chat area, ending 4
         // columns from the right edge. Corner glyphs vary by ratatui
         // version, so only assert the stable parts: horizontals,
@@ -378,7 +408,7 @@ mod tests {
     fn assistant_message_has_four_column_margins() {
         let mut app = App::new();
         app.update(AppMsg::Assistant("hello".into()));
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &markdown(), 30, 12);
         assert_eq!(rows[8], "    hello", "rows: {rows:?}");
     }
 
@@ -386,7 +416,7 @@ mod tests {
     fn assistant_message_renders_markdown() {
         let mut app = App::new();
         app.update(AppMsg::Assistant("**bold** and *italic*".into()));
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &markdown(), 30, 12);
         assert_eq!(rows[8], "    bold and italic", "rows: {rows:?}");
     }
 
@@ -394,8 +424,18 @@ mod tests {
     fn assistant_heading_strips_marker() {
         let mut app = App::new();
         app.update(AppMsg::Assistant("# Title".into()));
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &markdown(), 30, 12);
         assert_eq!(rows[8], "    Title", "rows: {rows:?}");
+    }
+
+    #[test]
+    fn assistant_renders_through_any_engine() {
+        // The seam: a plain engine keeps markers, proving the view does
+        // not hard-depend on markdown behavior.
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("**bold**".into()));
+        let rows = render_chat(&mut app, &plain(), 30, 12);
+        assert_eq!(rows[8], "    **bold**", "rows: {rows:?}");
     }
 
     #[test]
@@ -410,7 +450,7 @@ mod tests {
         for _ in 0..10 {
             app.update(AppMsg::Key(KeyEvent::PageUp));
         }
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert_eq!(app.scroll_rows(), 22, "debt clamped to limit");
         assert_eq!(rows[0], "", "one breathing row at top");
         let top: Vec<char> = rows[1].chars().collect();
@@ -421,7 +461,7 @@ mod tests {
 
         // Scrolling further changes nothing on screen or in state.
         app.update(AppMsg::Key(KeyEvent::PageUp));
-        let again = render_chat(&mut app, 30, 12);
+        let again = render_chat(&mut app, &plain(), 30, 12);
         assert_eq!(again, rows);
         assert_eq!(app.scroll_rows(), 22);
     }
@@ -435,7 +475,7 @@ mod tests {
         // Ten 3-row boxes = 30 content rows; the 9-row viewport shows
         // the last three boxes, bottom-anchored. Item `mi` owns rows
         // `3i..=3i+2`; the m9 text row sits on viewport row 7.
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert!(rows[7].ends_with("│m9│"), "tail: {rows:?}");
         assert!(rows[4].ends_with("│m8│"));
 
@@ -443,14 +483,14 @@ mod tests {
         // down exactly one viewport row.
         app.update(AppMsg::ScrollUp);
         assert!(!app.follows());
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert!(rows[8].ends_with("│m9│"), "shifted one row: {rows:?}");
         assert!(rows[5].ends_with("│m8│"));
 
         // A second notch drops the m9 text out; its top border stays
         // on the last row and the m6 text row appears first.
         app.update(AppMsg::ScrollUp);
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert!(
             !rows.iter().any(|r| r.contains("│m9│")),
             "m9 text hidden: {rows:?}"
@@ -463,14 +503,14 @@ mod tests {
         // Paging up 10 rows lands mid-transcript; paging back down
         // twice restores the live tail.
         app.update(AppMsg::Key(KeyEvent::PageUp));
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert!(rows[7].ends_with("│m5│"), "paged up: {rows:?}");
         assert!(!rows.iter().any(|r| r.contains("m9")));
         app.update(AppMsg::Key(KeyEvent::PageDown));
         assert!(!app.follows());
         app.update(AppMsg::Key(KeyEvent::PageDown));
         assert!(app.follows());
-        let rows = render_chat(&mut app, 30, 12);
+        let rows = render_chat(&mut app, &plain(), 30, 12);
         assert!(rows[7].ends_with("│m9│"));
     }
 
@@ -492,7 +532,7 @@ mod tests {
         let mut app = App::new();
         // 28 inner columns at width 30: "ab " * 14 wraps to two rows.
         type_text(&mut app, &"ab ".repeat(14));
-        let rows = render(&mut app, 30, 12);
+        let rows = render(&mut app, &plain(), 30, 12);
         assert_eq!(app.input_rows(), 2);
         let input = input_box(&rows, &app);
         // Top border + 2 text rows + bottom border.
@@ -507,7 +547,7 @@ mod tests {
         let mut app = App::new();
         // 40 two-letter words wrap to five rows at 28 columns.
         type_text(&mut app, &"ab ".repeat(40));
-        let rows = render(&mut app, 30, 14);
+        let rows = render(&mut app, &plain(), 30, 14);
         assert_eq!(app.input_rows(), 5);
         let input = input_box(&rows, &app);
         // Top border + 3 text rows + bottom border; the cursor sits on
@@ -524,7 +564,7 @@ mod tests {
         app.update(AppMsg::Key(KeyEvent::Up));
         app.update(AppMsg::Key(KeyEvent::Up));
         assert_eq!(app.input_scroll(), 0);
-        let rows = render(&mut app, 30, 14);
+        let rows = render(&mut app, &plain(), 30, 14);
         let input = input_box(&rows, &app);
         assert_eq!(input.len(), 5, "still capped: {input:?}");
         assert!(
@@ -539,7 +579,7 @@ mod tests {
         type_text(&mut app, "ab");
         app.update(AppMsg::Key(KeyEvent::Newline));
         type_text(&mut app, "cd");
-        let rows = render(&mut app, 30, 12);
+        let rows = render(&mut app, &plain(), 30, 12);
         assert_eq!(app.input_rows(), 2);
         let input = input_box(&rows, &app);
         assert_eq!(input.len(), 4, "input box: {input:?}");

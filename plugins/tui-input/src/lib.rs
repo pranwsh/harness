@@ -1,33 +1,61 @@
-//! Terminal input: a task that reads crossterm key/mouse events and
+//! Terminal input service: reads crossterm key/mouse events and
 //! translates them into `AppMsg` values on the app channel. Clicks,
 //! drags, and anything unmapped are ignored; only scrolling matters.
+//!
+//! Provided as `Arc<Input>` under [`KEY_INPUT`](harness_contracts::KEY_INPUT)
+//! so the TUI shell — or a headless driver in tests — can swap the event
+//! source without touching the runtime.
+
+use std::sync::Arc;
 
 use crossterm::event::{
     Event as TermEvent, EventStream, KeyCode, KeyEvent as TermKeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
 use futures::StreamExt;
+use harness_contracts::KEY_INPUT;
+use harness_core::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::app::{AppMsg, KeyEvent};
+use harness_tui_state::app::{AppMsg, KeyEvent};
 
-/// Spawns the reader task. It exits when the channel closes (the runtime
-/// drops its receiver side on quit), taking the event stream with it.
-pub fn spawn(tx: mpsc::Sender<AppMsg>) {
-    tokio::spawn(async move {
-        let mut events = EventStream::new();
-        while let Some(event) = events.next().await {
-            let Ok(event) = event else {
-                continue;
-            };
-            let Some(msg) = translate(event) else {
-                continue;
-            };
-            if tx.send(msg).await.is_err() {
-                break;
+/// Terminal event source. Spawns the reader task for a given app channel.
+pub struct Input;
+
+impl Input {
+    /// Spawns the reader task. It exits when the channel closes (the runtime
+    /// drops its receiver side on quit), taking the event stream with it.
+    pub fn spawn(&self, tx: mpsc::Sender<AppMsg>) {
+        tokio::spawn(async move {
+            let mut events = EventStream::new();
+            while let Some(event) = events.next().await {
+                let Ok(event) = event else {
+                    continue;
+                };
+                let Some(msg) = translate(event) else {
+                    continue;
+                };
+                if tx.send(msg).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
+}
+
+/// Plugin providing the shared terminal input as `Arc<Input>` under
+/// [`KEY_INPUT`](harness_contracts::KEY_INPUT).
+pub struct InputPlugin;
+
+impl harness_core::Plugin for InputPlugin {
+    fn meta(&self) -> harness_core::PluginMeta {
+        harness_core::PluginMeta::new("input").provides(KEY_INPUT)
+    }
+
+    fn build(&self, ctx: Context) -> Result<()> {
+        ctx.provide_key(KEY_INPUT, Arc::new(Input));
+        Ok(())
+    }
 }
 
 /// Maps one terminal event to an app message. Pure and unit-tested.
@@ -81,6 +109,16 @@ fn map_key(key: TermKeyEvent) -> Option<KeyEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_provides_input_through_di() {
+        let ctx = Context::root();
+        ctx.load(InputPlugin).unwrap();
+        let input: Arc<Input> = ctx.inject_key(KEY_INPUT).unwrap();
+        // Spawning would read the real terminal; just prove the service
+        // resolves. Key translation below covers behavior.
+        let _ = input;
+    }
 
     fn press(code: KeyCode) -> TermKeyEvent {
         TermKeyEvent::new(code, KeyModifiers::NONE)

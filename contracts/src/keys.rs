@@ -23,6 +23,12 @@ pub const KEY_MODEL_SELECTOR: &str = "model.selector";
 pub const KEY_AGENT_LOOP: &str = "agent_loop.run";
 /// `Arc<Tui>` — provided by the tui plugin.
 pub const KEY_TUI: &str = "ui.tui";
+/// `Arc<RendererHandle>` — provided by the tui-markdown plugin,
+/// injected by the tui plugin to render assistant messages.
+pub const KEY_MARKDOWN_RENDERER: &str = "markdown.renderer";
+/// `Arc<Input>` — provided by the tui-input plugin, injected by the tui
+/// plugin to read terminal key/mouse events.
+pub const KEY_INPUT: &str = "ui.input";
 
 // ---- channels ---------------------------------------------------------------
 

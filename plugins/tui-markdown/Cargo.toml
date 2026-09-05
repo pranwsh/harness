@@ -1,17 +1,15 @@
 [package]
-name = "harness-tui"
+name = "harness-tui-markdown"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-agent-loop = { path = "../agent-loop" }
 harness-tui-state = { path = "../tui-state" }
-harness-tui-input = { path = "../tui-input" }
-crossterm.workspace = true
+mdfrier.workspace = true
 ratatui.workspace = true
-tokio.workspace = true
+syntect.workspace = true
 
 [dev-dependencies]
-harness-tui-markdown = { path = "../tui-markdown" }
+unicode-width.workspace = true
