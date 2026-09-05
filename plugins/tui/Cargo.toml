@@ -9,6 +9,8 @@ harness-core = { path = "../../core" }
 harness-agent-loop = { path = "../agent-loop" }
 crossterm.workspace = true
 futures.workspace = true
+mdfrier.workspace = true
 ratatui.workspace = true
+syntect.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
