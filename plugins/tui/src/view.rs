@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ChatItem, INPUT_VISIBLE_ROWS, ItemKind, max_chat_scroll};
+use crate::markdown::render_assistant;
 use crate::wrap::{display_width, wrap_spans, wrap_text};
 
 /// Margin, in columns, on each side of assistant/tool/notice output.
@@ -211,12 +212,18 @@ fn layout_item(item: &ChatItem, area_width: u16) -> MsgLayout {
 
     let x = SIDE_MARGIN.min(area_width);
     // Both margins come out of the text column so long lines wrap
-    // before reaching the right edge.
-    let width = area_width.saturating_sub(x + SIDE_MARGIN);
-    let lines = wrap_text(&item.text, width.max(1) as usize)
-        .into_iter()
-        .map(|s| Line::styled(s, style))
-        .collect::<Vec<_>>();
+    // before reaching the right edge. Assistant messages are markdown
+    // rendered via mdfrier (which wraps itself); everything else is
+    // plain wrapped text.
+    let width = area_width.saturating_sub(x + SIDE_MARGIN).max(1);
+    let lines = if item.kind == ItemKind::Assistant {
+        render_assistant(&item.text, width, style)
+    } else {
+        wrap_text(&item.text, width as usize)
+            .into_iter()
+            .map(|s| Line::styled(s, style))
+            .collect::<Vec<_>>()
+    };
     let height = lines.len().max(1);
     MsgLayout {
         x,
@@ -373,6 +380,22 @@ mod tests {
         app.update(AppMsg::Assistant("hello".into()));
         let rows = render_chat(&mut app, 30, 12);
         assert_eq!(rows[8], "    hello", "rows: {rows:?}");
+    }
+
+    #[test]
+    fn assistant_message_renders_markdown() {
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("**bold** and *italic*".into()));
+        let rows = render_chat(&mut app, 30, 12);
+        assert_eq!(rows[8], "    bold and italic", "rows: {rows:?}");
+    }
+
+    #[test]
+    fn assistant_heading_strips_marker() {
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("# Title".into()));
+        let rows = render_chat(&mut app, 30, 12);
+        assert_eq!(rows[8], "    Title", "rows: {rows:?}");
     }
 
     #[test]
