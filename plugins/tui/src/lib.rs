@@ -4,6 +4,7 @@
 //! - [`app`]: pure UI state (transcript, editor, scroll, quit).
 //! - [`editor`]: multi-line input buffer with visual cursor motion.
 //! - [`wrap`]: display-width-aware wrapping shared by editor and view.
+//! - [`markdown`]: mdfrier-based markdown rendering for assistant messages.
 //! - [`view`]: ratatui rendering, a pure function of `App`.
 //! - [`input`]: crossterm key/mouse reading task.
 //! - [`runtime`]: terminal lifecycle and the main event loop.
@@ -20,6 +21,7 @@ use harness_agent_loop::AgentLoop;
 pub mod app;
 pub mod editor;
 pub mod input;
+pub mod markdown;
 pub mod runtime;
 pub mod view;
 pub mod wrap;
