@@ -719,6 +719,7 @@ dependencies = [
  "harness-model",
  "harness-read-file",
  "harness-session",
+ "harness-shell",
  "harness-system-prompt",
  "harness-tools",
  "harness-tui",
@@ -871,6 +872,20 @@ version = "0.1.0"
 dependencies = [
  "harness-contracts",
  "harness-core",
+]
+
+[[package]]
+name = "harness-shell"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "harness-config",
+ "harness-contracts",
+ "harness-core",
+ "harness-tools",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
