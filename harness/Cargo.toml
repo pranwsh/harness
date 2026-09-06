@@ -17,6 +17,7 @@ harness-hashline-edit = { path = "../plugins/hashline-edit" }
 harness-system-prompt = { path = "../plugins/system-prompt" }
 harness-agent-default-model = { path = "../plugins/agent-default-model" }
 harness-agent-loop = { path = "../plugins/agent-loop" }
+harness-shell = { path = "../plugins/shell" }
 harness-tui-markdown = { path = "../plugins/tui-markdown" }
 harness-tui-input = { path = "../plugins/tui-input" }
 harness-tui = { path = "../plugins/tui" }
