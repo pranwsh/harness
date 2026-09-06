@@ -61,6 +61,15 @@ async fn run() -> Result<ExitCode> {
         "hashline-edit",
         harness_hashline_edit::HashlineEditPlugin
     );
+    {
+        // Shell reads `[shell]` from the loaded AppConfig; fall back to
+        // strict defaults if config is unavailable (tests/embedding).
+        let plugin = ctx
+            .try_inject_key::<harness_config::AppConfig>(harness_contracts::KEY_CONFIG)
+            .map(|cfg| harness_shell::ShellPlugin::from_app_config(&cfg))
+            .unwrap_or_default();
+        load!(ctx, "shell", plugin);
+    }
     load!(
         ctx,
         "system-prompt",
