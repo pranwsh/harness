@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
 
 use harness_tui_state::{
@@ -17,6 +17,10 @@ use harness_tui_state::{
 
 /// Margin, in columns, on each side of assistant/tool/notice output.
 const SIDE_MARGIN: u16 = 4;
+
+/// Single source for box corners: user messages (synthesized text rows)
+/// and the input box (`Block`) both use rounded corners from here.
+const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 
 /// Draws the whole UI: chat pane (fills remaining space) above the
 /// input box, which grows from 1 up to `INPUT_VISIBLE_ROWS` text rows
@@ -120,6 +124,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(BOX_BORDER_TYPE)
         .border_style(Style::new().fg(Color::Blue))
         .title(title)
         .title_style(
@@ -168,7 +173,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 ///
 /// Box borders are synthesized as text rows (not a `Block` widget) so
 /// that partial boxes at the scroll edge clip row-by-row like any
-/// other content; the glyphs match `Block::bordered()`.
+/// other content; the glyphs come from [`BOX_BORDER_TYPE`], matching
+/// the input box.
 fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer) -> MsgLayout {
     let style = item_style(item.kind);
     if item.kind == ItemKind::User {
@@ -184,26 +190,37 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
         let box_width = (content_width + 2)
             .min(area_width as usize)
             .min(avail.max(2));
-        let border = Style::new().fg(Color::Green);
+        // Chrome follows the User fg but never takes content modifiers
+        // (BOLD box glyphs look heavy / brighten on many terminals).
+        let border = Style::new()
+            .patch(style)
+            .remove_modifier(style.add_modifier);
+        let set = BOX_BORDER_TYPE.to_border_set();
         let mut lines = Vec::with_capacity(strs.len() + 2);
         lines.push(Line::from(vec![
-            Span::styled("┌", border),
-            Span::styled("─".repeat(box_width.saturating_sub(2)), border),
-            Span::styled("┐", border),
+            Span::styled(set.top_left, border),
+            Span::styled(
+                set.horizontal_top.repeat(box_width.saturating_sub(2)),
+                border,
+            ),
+            Span::styled(set.top_right, border),
         ]));
         for row in strs {
             let pad = content_width.saturating_sub(display_width(&row));
             lines.push(Line::from(vec![
-                Span::styled("│", border),
+                Span::styled(set.vertical_left, border),
                 Span::styled(row, style),
                 Span::styled(" ".repeat(pad), style),
-                Span::styled("│", border),
+                Span::styled(set.vertical_right, border),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("└", border),
-            Span::styled("─".repeat(box_width.saturating_sub(2)), border),
-            Span::styled("┘", border),
+            Span::styled(set.bottom_left, border),
+            Span::styled(
+                set.horizontal_bottom.repeat(box_width.saturating_sub(2)),
+                border,
+            ),
+            Span::styled(set.bottom_right, border),
         ]));
         let height = lines.len();
         return MsgLayout {
