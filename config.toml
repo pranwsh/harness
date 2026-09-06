@@ -5,7 +5,26 @@ api_key = "public"
 user_agent = "opencode/1.18.18"
 
 [agent]
+# agent configuration
 max_iterations = 128
 
 [session]
 backend = "memory"
+
+# Headless shell tools (shell_exec / shell_start / shell_poll / shell_stop).
+# Strict by default: small allowlist, shells + TTY commands + `> < | ; && ||`
+# blocked. Denylist always wins. Best-effort safety net, not a sandbox:
+# run untrusted work in a container.
+[shell]
+allowlist = ["ls", "cat", "echo", "pwd", "head", "tail", "wc", "git", "rg", "grep", "cargo", "rustc", "python3"]
+denylist = ["rm", "rmdir", "mkfs", "mkswap", "dd", "fdisk", "parted", "shutdown", "poweroff", "reboot", "halt", "init", "kill", "killall", "pkill", "chown", "chmod", "passwd", "su", "sudo", "doas", "ssh", "scp"]
+allow_shell = false
+default_timeout_ms = 30000
+max_timeout_ms = 120000
+max_output_bytes = 65536
+max_jobs = 32
+max_job_time_ms = 600000
+allowed_workdirs = ["."]
+
+[shell.env]
+mode = "inherit_filtered"
