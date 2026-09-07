@@ -33,6 +33,11 @@ pub trait ModelClient: Send + Sync + 'static {
 pub enum ModelError {
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("provider error {status}: {body}")]
+    Provider {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     #[error("provider returned no choices")]
     EmptyChoices,
     #[error("provider returned no message content")]
@@ -173,16 +178,23 @@ impl ModelClient for HttpModelClient {
                     })
                     .collect(),
             };
-            let resp: CompletionResponse = self
+            let resp = self
                 .client
                 .post(url)
                 .bearer_auth(&self.api_key)
                 .json(&body)
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                // Provider error bodies carry the actual reason (unknown
+                // model, bad field, auth gating, …); keep a prefix so the
+                // message stays one line in the TUI.
+                let raw = resp.text().await.unwrap_or_default();
+                let body: String = raw.chars().take(300).collect();
+                return Err(ModelError::Provider { status, body });
+            }
+            let resp: CompletionResponse = resp.json().await?;
 
             let choice = resp
                 .choices
@@ -286,5 +298,16 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn provider_error_reports_status_and_body() {
+        let err = ModelError::Provider {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"type":"MissingSessionID"}}"#.to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "status: {msg:?}");
+        assert!(msg.contains("MissingSessionID"), "body: {msg:?}");
     }
 }
