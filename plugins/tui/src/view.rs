@@ -269,7 +269,7 @@ fn item_style(kind: ItemKind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_tui_markdown::MdfrierRenderer;
+    use harness_tui_markdown::MarkdownRenderer;
     use harness_tui_state::{
         app::{AppMsg, KeyEvent},
         render::PlainRenderer,
@@ -295,8 +295,8 @@ mod tests {
         PlainRenderer::new(Style::new())
     }
 
-    fn markdown() -> MdfrierRenderer {
-        MdfrierRenderer::default()
+    fn markdown() -> MarkdownRenderer {
+        MarkdownRenderer::default()
     }
 
     #[test]
