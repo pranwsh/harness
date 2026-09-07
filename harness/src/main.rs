@@ -49,7 +49,6 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);
-    load!(ctx, "read-file", harness_read_file::ReadFilePlugin);
     load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
     load!(
         ctx,
@@ -62,13 +61,9 @@ async fn run() -> Result<ExitCode> {
         harness_hashline_edit::HashlineEditPlugin
     );
     {
-        // Shell reads `[shell]` from the loaded AppConfig; fall back to
-        // strict defaults if config is unavailable (tests/embedding).
-        let plugin = ctx
-            .try_inject_key::<harness_config::AppConfig>(harness_contracts::KEY_CONFIG)
-            .map(|cfg| harness_shell::ShellPlugin::from_app_config(&cfg))
-            .unwrap_or_default();
-        load!(ctx, "shell", plugin);
+        // Shell injects `config.app` + `tools.executor` via DI and parks
+        // until both are ready; no ctor wiring needed.
+        load!(ctx, "shell", harness_shell::ShellPlugin);
     }
     load!(
         ctx,
