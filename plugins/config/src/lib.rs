@@ -65,64 +65,11 @@ fn default_session_backend() -> String {
     "memory".to_owned()
 }
 
-/// Common glob patterns for sensitive environment variables.
-///
-/// Used as the default `denied_patterns` for shell env filtering.
-/// Matching is ASCII case-insensitive, `*` = any run of chars.
-pub const LLM_API_KEY_ENV_PATTERNS: &[&str] = &[
-    "*API_KEY*",
-    "*APIKEY*",
-    "*TOKEN*",
-    "*SECRET*",
-    "*PASSWORD*",
-    "*CREDENTIALS*",
-    "OPENAI_*",
-    "ANTHROPIC_*",
-    "COHERE_*",
-    "GOOGLE_*",
-    "AZURE_*",
-    "AWS_*",
-    "LLM_*",
-    "HF_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-];
-
-/// How a shell subprocess receives its environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellEnvMode {
-    /// Inherit the agent process env minus `denied_patterns` matches.
-    #[default]
-    InheritFiltered,
-    /// Start from an empty env (`env_clear`); only per-call `env` applies.
-    Clean,
-}
-
-/// `[shell]` section: allow/deny policy, limits, workdirs, env filtering.
-///
-/// Strict by default: small `allowlist`, shells blocked, operators denied.
-/// `denylist` always wins over `allowlist`.
+/// `[shell]` section: resource bounds only. No policy guardrails live here:
+/// policy (allowlist/denylist/workdir/env filtering) is enforced by a future
+/// guardrail plugin via the `tool.approval` waterfall, not by the shell.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ShellConfig {
-    /// Exact executable basenames the agent may run. Empty = deny all.
-    #[serde(default = "default_shell_allowlist")]
-    pub allowlist: Vec<String>,
-    /// Forbidden executables; checked before the allowlist (deny wins).
-    #[serde(default = "default_shell_denylist")]
-    pub denylist: Vec<String>,
-    /// TTY/interactive commands blocked to avoid hangs.
-    #[serde(default = "default_shell_interactive_deny")]
-    pub interactive_deny: Vec<String>,
-    /// Substrings rejected outside quotes (e.g. `>`, `|`, `$(`).
-    #[serde(default = "default_shell_blocked_operators")]
-    pub blocked_operators: Vec<String>,
-    /// Known shell binaries for `-c` recursion handling.
-    #[serde(default = "default_shell_binaries")]
-    pub shell_binaries: Vec<String>,
-    /// If false (default), any `shell_binaries` invocation is denied.
-    #[serde(default)]
-    pub allow_shell: bool,
     /// Sync default when the call omits `timeout_ms`.
     #[serde(default = "default_shell_timeout_ms")]
     pub default_timeout_ms: u64,
@@ -144,23 +91,11 @@ pub struct ShellConfig {
     /// Ring-buffer cap per stream per background job.
     #[serde(default = "default_shell_max_job_output_bytes")]
     pub max_job_output_bytes: usize,
-    /// Dirs jobs may run in (`"."` = cwd). Empty = cwd only.
-    #[serde(default = "default_shell_allowed_workdirs")]
-    pub allowed_workdirs: Vec<String>,
-    /// Environment handling.
-    #[serde(default)]
-    pub env: ShellEnvConfig,
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
         ShellConfig {
-            allowlist: default_shell_allowlist(),
-            denylist: default_shell_denylist(),
-            interactive_deny: default_shell_interactive_deny(),
-            blocked_operators: default_shell_blocked_operators(),
-            shell_binaries: default_shell_binaries(),
-            allow_shell: false,
             default_timeout_ms: default_shell_timeout_ms(),
             max_timeout_ms: default_shell_max_timeout_ms(),
             max_output_bytes: default_shell_max_output_bytes(),
@@ -168,108 +103,8 @@ impl Default for ShellConfig {
             max_jobs: default_shell_max_jobs(),
             max_job_time_ms: default_shell_max_job_time_ms(),
             max_job_output_bytes: default_shell_max_job_output_bytes(),
-            allowed_workdirs: default_shell_allowed_workdirs(),
-            env: ShellEnvConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ShellEnvConfig {
-    #[serde(default)]
-    pub mode: ShellEnvMode,
-    #[serde(default = "default_shell_denied_env_patterns")]
-    pub denied_patterns: Vec<String>,
-}
-
-impl Default for ShellEnvConfig {
-    fn default() -> Self {
-        ShellEnvConfig {
-            mode: ShellEnvMode::InheritFiltered,
-            denied_patterns: default_shell_denied_env_patterns(),
-        }
-    }
-}
-
-fn default_shell_allowlist() -> Vec<String> {
-    [
-        "ls", "cat", "echo", "pwd", "head", "tail", "wc", "git", "rg", "grep", "cargo", "rustc",
-        "python3",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-fn default_shell_denylist() -> Vec<String> {
-    [
-        "rm", "rmdir", "mkfs", "mkswap", "dd", "fdisk", "parted", "shutdown", "poweroff", "reboot",
-        "halt", "init", "kill", "killall", "pkill", "chown", "chmod", "passwd", "su", "sudo",
-        "doas", "ssh", "scp",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-fn default_shell_interactive_deny() -> Vec<String> {
-    [
-        "sudo",
-        "su",
-        "doas",
-        "ssh",
-        "scp",
-        "sftp",
-        "passwd",
-        "vi",
-        "vim",
-        "nvim",
-        "nano",
-        "emacs",
-        "less",
-        "more",
-        "top",
-        "htop",
-        "tmux",
-        "screen",
-        "ftp",
-        "telnet",
-        "powershell",
-        "pwsh",
-        "cmd",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-fn default_shell_blocked_operators() -> Vec<String> {
-    // Redirection / piping / substitution only. `;`, `&&`, `||` are inert in
-    // argv-exec (no shell interprets them) and blocking them would break
-    // legitimate `python3 -c "a; b"` scripts; add them via config to be stricter.
-    [">", "<", "|", "`", "$("]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn default_shell_binaries() -> Vec<String> {
-    [
-        "sh",
-        "bash",
-        "dash",
-        "zsh",
-        "fish",
-        "ksh",
-        "csh",
-        "tcsh",
-        "powershell",
-        "pwsh",
-        "cmd",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
 }
 
 fn default_shell_timeout_ms() -> u64 {
@@ -298,17 +133,6 @@ fn default_shell_max_job_time_ms() -> u64 {
 
 fn default_shell_max_job_output_bytes() -> usize {
     262_144
-}
-
-fn default_shell_allowed_workdirs() -> Vec<String> {
-    vec![".".to_owned()]
-}
-
-fn default_shell_denied_env_patterns() -> Vec<String> {
-    LLM_API_KEY_ENV_PATTERNS
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -440,7 +264,7 @@ user_agent = "a"
     }
 
     #[test]
-    fn shell_defaults_are_strict() {
+    fn shell_defaults_are_bounds_only() {
         let raw = r#"
 [llm]
 base_url = "u"
@@ -449,23 +273,34 @@ api_key = "k"
 user_agent = "a"
 "#;
         let cfg = AppConfig::from_toml(raw, "test").unwrap();
-        assert!(!cfg.shell.allow_shell);
-        assert!(cfg.shell.allowlist.contains(&"git".to_owned()));
-        assert!(!cfg.shell.allowlist.iter().any(|s| s == "rm"));
-        assert!(cfg.shell.denylist.contains(&"rm".to_owned()));
-        assert!(cfg.shell.blocked_operators.contains(&"|".to_owned()));
         assert_eq!(cfg.shell.default_timeout_ms, 30_000);
+        assert_eq!(cfg.shell.max_timeout_ms, 120_000);
         assert_eq!(cfg.shell.max_jobs, 32);
-        assert!(
-            cfg.shell
-                .env
-                .denied_patterns
-                .contains(&"*API_KEY*".to_owned())
-        );
+        assert_eq!(cfg.shell.max_job_time_ms, 600_000);
     }
 
     #[test]
     fn shell_section_overrides() {
+        let raw = r#"
+[llm]
+base_url = "u"
+model = "m"
+api_key = "k"
+user_agent = "a"
+
+[shell]
+default_timeout_ms = 5000
+max_jobs = 4
+"#;
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
+        assert_eq!(cfg.shell.default_timeout_ms, 5000);
+        assert_eq!(cfg.shell.max_jobs, 4);
+    }
+
+    #[test]
+    fn shell_ignores_legacy_policy_keys() {
+        // Pre-guardrail-removal configs with policy keys must still parse;
+        // unknown fields are ignored, bounds apply.
         let raw = r#"
 [llm]
 base_url = "u"
@@ -484,11 +319,7 @@ mode = "clean"
 denied_patterns = ["CUSTOM_*"]
 "#;
         let cfg = AppConfig::from_toml(raw, "test").unwrap();
-        assert_eq!(cfg.shell.allowlist, vec!["git".to_owned(), "ls".to_owned()]);
-        assert!(cfg.shell.allow_shell);
         assert_eq!(cfg.shell.default_timeout_ms, 5000);
         assert_eq!(cfg.shell.max_jobs, 4);
-        assert_eq!(cfg.shell.env.mode, ShellEnvMode::Clean);
-        assert_eq!(cfg.shell.env.denied_patterns, vec!["CUSTOM_*".to_owned()]);
     }
 }
