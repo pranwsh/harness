@@ -4,8 +4,8 @@ use std::{
 };
 
 use harness_contracts::{
-    CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOLS, ToolCall, ToolError, ToolExecuted,
-    ToolRegistered, ToolSpec,
+    CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOLS, ToolApproval, ToolCall,
+    ToolError, ToolExecuted, ToolRegistered, ToolSpec,
 };
 use harness_core::{Context, Result};
 
@@ -16,10 +16,12 @@ type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
 
 /// Registry and executor of tools.
 ///
-/// `execute` runs the handler, emits `tool.executed` (Ok or Err in-band), and
-/// returns the result to the caller. Async handler futures are joined so the
-/// emission — including the session plugin's sync listener — completes before
-/// `execute` returns: the loop never observes a stale log.
+/// `execute` runs the `tool.approval` waterfall first so a future guardrail
+/// plugin can rewrite or veto the call, then runs the handler, emits
+/// `tool.executed` (Ok or Err in-band), and returns the result to the caller.
+/// Async handler futures are joined so the emission — including the session
+/// plugin's sync listener — completes before `execute` returns: the loop
+/// never observes a stale log.
 pub struct Tools {
     ctx: Context,
     tools: Mutex<HashMap<String, (ToolSpec, ToolHandler)>>,
@@ -68,14 +70,59 @@ impl Tools {
         turn: u64,
         call: ToolCall,
     ) -> Result<String, ToolError> {
-        let result = self.run(&call).await;
+        // Pre-execution hook for a future guardrail plugin. Waterfall handlers
+        // may rewrite `call` or set `denied`; no handlers = allow as-is.
+        // Fail-closed on waterfall infra errors so a broken gate can't be
+        // bypassed silently.
+        let approval = ToolApproval::allow(agent_id, session_id, turn, call.clone());
+        let approved = match self.ctx.waterfall_key(CH_TOOL_APPROVAL, approval).await {
+            Ok(a) => a,
+            Err(e) => {
+                let err = ToolError {
+                    tool: call.name.clone(),
+                    message: format!("approval hook failed: {e}"),
+                };
+                self.emit_executed(agent_id, session_id, turn, call, Err(err.clone()))
+                    .await;
+                return Err(err);
+            }
+        };
+        if let Some(reason) = approved.denied {
+            let reason = reason.trim().to_owned();
+            let err = ToolError {
+                tool: approved.call.name.clone(),
+                message: if reason.is_empty() {
+                    "denied by policy".to_owned()
+                } else {
+                    format!("denied by policy: {reason}")
+                },
+            };
+            self.emit_executed(agent_id, session_id, turn, approved.call, Err(err.clone()))
+                .await;
+            return Err(err);
+        }
+        let effective = approved.call;
+        let result = self.run(&effective).await;
 
+        self.emit_executed(agent_id, session_id, turn, effective, result.clone())
+            .await;
+        result
+    }
+
+    async fn emit_executed(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        turn: u64,
+        call: ToolCall,
+        result: Result<String, ToolError>,
+    ) {
         let event = ToolExecuted {
             agent_id: agent_id.to_owned(),
             session_id: session_id.to_owned(),
             turn,
-            call: call.clone(),
-            result: result.clone(),
+            call,
+            result,
         };
         // Sync listeners (session append) run inline; async ones are joined
         // so the emitted history is consistent before we return.
@@ -85,7 +132,6 @@ impl Tools {
                 fut.await;
             }
         }
-        result
     }
 
     async fn run(&self, call: &ToolCall) -> Result<String, ToolError> {
@@ -115,6 +161,7 @@ impl harness_core::Plugin for ToolsPlugin {
             .provides(KEY_TOOLS)
             .emits::<ToolRegistered>(CH_TOOL_REGISTERED)
             .emits::<ToolExecuted>(CH_TOOL_EXECUTED)
+            .waterfalls::<ToolApproval>(CH_TOOL_APPROVAL)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
@@ -205,5 +252,50 @@ mod tests {
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
         tools.register(echo_spec(), echo_handler).unwrap();
         assert!(tools.register(echo_spec(), echo_handler).is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_waterfall_can_deny() {
+        let ctx = Context::root();
+        ctx.load(ToolsPlugin).unwrap();
+        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+        tools.register(echo_spec(), echo_handler).unwrap();
+        ctx.on_waterfall_key::<ToolApproval, _, _>(CH_TOOL_APPROVAL, |a| async move {
+            let mut next = (*a).clone();
+            next.denied = Some("nope".to_owned());
+            next
+        })
+        .unwrap();
+
+        let call = ToolCall {
+            id: "c3".into(),
+            name: "echo".into(),
+            arguments: r#"{"text":"hi"}"#.into(),
+        };
+        let err = tools.execute("a", "s", 1, call).await.unwrap_err();
+        assert_eq!(err.tool, "echo");
+        assert!(err.message.contains("nope"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn approval_waterfall_can_rewrite_call() {
+        let ctx = Context::root();
+        ctx.load(ToolsPlugin).unwrap();
+        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+        tools.register(echo_spec(), echo_handler).unwrap();
+        ctx.on_waterfall_key::<ToolApproval, _, _>(CH_TOOL_APPROVAL, |a| async move {
+            let mut next = (*a).clone();
+            next.call.arguments = r#"{"text":"rewritten"}"#.to_owned();
+            next
+        })
+        .unwrap();
+
+        let call = ToolCall {
+            id: "c4".into(),
+            name: "echo".into(),
+            arguments: r#"{"text":"original"}"#.into(),
+        };
+        let out = tools.execute("a", "s", 1, call).await.unwrap();
+        assert_eq!(out, "rewritten");
     }
 }
