@@ -9,7 +9,6 @@ members = [
     "plugins/agent",
     "plugins/session",
     "plugins/tools",
-    "plugins/read-file",
     "plugins/hash-base",
     "plugins/hashline-read",
     "plugins/hashline-edit",
@@ -27,7 +26,7 @@ members = [
 arc-swap = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"
-mdfrier = { version = "3", features = ["ratatui"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
