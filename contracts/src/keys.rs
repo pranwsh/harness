@@ -17,6 +17,9 @@ pub const KEY_SESSIONS: &str = "sessions.log";
 pub const KEY_TOOLS: &str = "tools.executor";
 /// `Arc<PromptAssembler>` — provided by the system-prompt plugin.
 pub const KEY_PROMPT: &str = "prompt.assembler";
+/// `Arc<String>` — prompt text, provided by the system-prompt plugin,
+/// injected by the agent-loop plugin.
+pub const KEY_PROMPT_TEXT: &str = "prompt.text";
 /// `Arc<ModelSelector>` — provided by the agent-default-model plugin.
 pub const KEY_MODEL_SELECTOR: &str = "model.selector";
 /// `Arc<AgentLoop>` — provided by the agent-loop plugin.
@@ -32,6 +35,9 @@ pub const KEY_INPUT: &str = "ui.input";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
 pub const KEY_HASH_STORE: &str = "hash.store";
+/// `Arc<ShellService>` — provided by the shell plugin. Kept alive for the
+/// plugin lifetime so background jobs are aborted on unload via `JobManager::drop`.
+pub const KEY_SHELL_SERVICE: &str = "shell.service";
 
 // ---- channels ---------------------------------------------------------------
 
@@ -51,6 +57,9 @@ pub const CH_SESSION_TURN_CLOSED: &str = "session.turn_closed";
 pub const CH_TOOL_REGISTERED: &str = "tool.registered";
 /// `ToolExecuted` — a tool call finished (result carries Ok/Err).
 pub const CH_TOOL_EXECUTED: &str = "tool.executed";
+/// `ToolApproval` — waterfall gate before a tool runs. Handlers may rewrite
+/// `call` or set `denied` to veto. No handlers = allow as-is.
+pub const CH_TOOL_APPROVAL: &str = "tool.approval";
 
 /// `PromptAssembled` — a system prompt was assembled (debug/telemetry).
 pub const CH_PROMPT_ASSEMBLED: &str = "prompt.assembled";
