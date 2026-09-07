@@ -10,7 +10,6 @@ harness-model = { path = "../plugins/model" }
 harness-agent = { path = "../plugins/agent" }
 harness-session = { path = "../plugins/session" }
 harness-tools = { path = "../plugins/tools" }
-harness-read-file = { path = "../plugins/read-file" }
 harness-hash-base = { path = "../plugins/hash-base" }
 harness-hashline-read = { path = "../plugins/hashline-read" }
 harness-hashline-edit = { path = "../plugins/hashline-edit" }
