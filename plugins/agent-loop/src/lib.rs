@@ -3,8 +3,8 @@ use std::sync::Arc;
 use harness_contracts::{
     AgentState, CH_TURN_COMPLETED, CH_TURN_FAILED, CH_TURN_ITERATION, CH_TURN_STARTED, Entry,
     KEY_AGENT_LOOP, KEY_AGENTS, KEY_CONFIG, KEY_MODEL_CLIENT, KEY_MODEL_SELECTOR, KEY_PROMPT,
-    KEY_SESSIONS, KEY_TOOLS, Message, SessionId, ToolCall, TurnCompleted, TurnFailed,
-    TurnIteration, TurnStarted,
+    KEY_PROMPT_TEXT, KEY_SESSIONS, KEY_TOOLS, Message, SessionId, ToolCall, TurnCompleted,
+    TurnFailed, TurnIteration, TurnStarted,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
@@ -13,7 +13,7 @@ use harness_agent::AgentRegistry;
 use harness_config::AppConfig;
 use harness_model::{ModelClient, ModelClientHandle};
 use harness_session::SessionLog;
-use harness_system_prompt::{PromptAssembler, system_prompt_of};
+use harness_system_prompt::PromptAssembler;
 use harness_tools::Tools;
 
 use harness_agent_default_model::ModelSelector;
@@ -44,6 +44,7 @@ pub struct AgentLoop {
     prompt: Arc<PromptAssembler>,
     selector: Arc<ModelSelector>,
     model: Arc<ModelClientHandle>,
+    system_prompt: String,
     max_iterations: u32,
 }
 
@@ -57,6 +58,7 @@ impl AgentLoop {
         prompt: Arc<PromptAssembler>,
         selector: Arc<ModelSelector>,
         model: Arc<ModelClientHandle>,
+        system_prompt: String,
         max_iterations: u32,
     ) -> Self {
         AgentLoop {
@@ -67,6 +69,7 @@ impl AgentLoop {
             prompt,
             selector,
             model,
+            system_prompt,
             max_iterations,
         }
     }
@@ -88,6 +91,7 @@ impl AgentLoop {
             prompt: self.prompt.clone(),
             selector: self.selector.clone(),
             model: self.model.clone(),
+            system_prompt: self.system_prompt.clone(),
             max_iterations: self.max_iterations,
             agent_id: agent_id.to_owned(),
             session_id: session_id.to_owned(),
@@ -110,6 +114,7 @@ struct TurnTask {
     prompt: Arc<PromptAssembler>,
     selector: Arc<ModelSelector>,
     model: Arc<ModelClientHandle>,
+    system_prompt: String,
     max_iterations: u32,
     agent_id: String,
     session_id: SessionId,
@@ -173,7 +178,7 @@ impl TurnTask {
             },
         );
 
-        let system_prompt = system_prompt_of(&self.ctx);
+        let system_prompt = self.system_prompt.clone();
 
         let mut iterations = 0u32;
         loop {
@@ -249,6 +254,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
             .injects(KEY_SESSIONS)
             .injects(KEY_TOOLS)
             .injects(KEY_PROMPT)
+            .injects(KEY_PROMPT_TEXT)
             .injects(KEY_MODEL_SELECTOR)
             .injects(KEY_MODEL_CLIENT)
             .injects(KEY_CONFIG)
@@ -263,6 +269,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
         let sessions: Arc<SessionLog> = ctx.inject_key(KEY_SESSIONS)?;
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS)?;
         let prompt: Arc<PromptAssembler> = ctx.inject_key(KEY_PROMPT)?;
+        let system_prompt: Arc<String> = ctx.inject_key(KEY_PROMPT_TEXT)?;
         let selector: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR)?;
         let model: Arc<ModelClientHandle> = ctx.inject_key(KEY_MODEL_CLIENT)?;
         let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
@@ -275,6 +282,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
             prompt,
             selector,
             model,
+            (*system_prompt).clone(),
             config.agent.max_iterations,
         );
         ctx.provide_key(KEY_AGENT_LOOP, Arc::new(agent_loop));
