@@ -7,7 +7,7 @@ edition = "2024"
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
 harness-tui-state = { path = "../tui-state" }
-mdfrier.workspace = true
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 syntect.workspace = true
 
