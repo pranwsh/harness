@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use harness_contracts::{CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, Message, PromptAssembled, Role};
+use harness_contracts::{
+    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, KEY_PROMPT_TEXT, Message, PromptAssembled, Role,
+};
 use harness_core::{Context, Result};
 
 /// Builds the message array sent to the model from session history.
@@ -94,21 +96,22 @@ impl harness_core::Plugin for SystemPromptPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("system-prompt")
             .provides(KEY_PROMPT)
+            .provides(KEY_PROMPT_TEXT)
             .emits::<PromptAssembled>(CH_PROMPT_ASSEMBLED)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         ctx.provide_key(KEY_PROMPT, Arc::new(PromptAssembler::new(ctx.clone())));
         // The prompt text itself is carried by this plugin instance; the
-        // loop queries it via `system_prompt()`.
-        ctx.provide_key("prompt.text", Arc::new(self.prompt.clone()));
+        // loop injects it via `KEY_PROMPT_TEXT`.
+        ctx.provide_key(KEY_PROMPT_TEXT, Arc::new(self.prompt.clone()));
         Ok(())
     }
 }
 
 /// Convenience: fetch the configured system prompt text.
 pub fn system_prompt_of(ctx: &Context) -> String {
-    ctx.try_inject_key::<String>("prompt.text")
+    ctx.try_inject_key::<String>(KEY_PROMPT_TEXT)
         .map(|s| (*s).clone())
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned())
 }
