@@ -1,37 +1,39 @@
-//! Headless shell tool plugin: safe, bounded, non-interactive subprocesses.
+//! Headless shell tool plugin: bounded, non-interactive subprocesses.
 //!
 //! Four tools over one [`ShellService`]:
 //! `shell_exec` (sync), `shell_start` / `shell_poll` / `shell_stop`
-//! (background). Every call passes through [`CompiledPolicy`] first; output
-//! is tail-truncated and labeled; background jobs can never stall the loop
-//! (`start` returns an id immediately, `poll` is a non-blocking snapshot).
+//! (background). No policy guardrails live here: any executable runs with
+//! the agent's environment. Output is tail-truncated and labeled; background
+//! jobs can never stall the loop (`start` returns an id immediately, `poll`
+//! is a non-blocking snapshot).
 //!
-//! Safety is best-effort, not a sandbox: an allowlisted binary can still be
-//! abused (`python3 -c ...`). Run untrusted work in a container.
+//! Policy (allowlist, workdir scoping, env filtering) belongs in a future
+//! guardrail plugin via the `tool.approval` waterfall on [`harness_tools`],
+//! which can rewrite or deny calls before they reach these handlers.
+//!
+//! Without that plugin this is unconstrained execution: run only trusted
+//! work, preferably in a container.
 
 mod env;
 mod exec;
 mod jobs;
 mod output;
-mod policy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use harness_config::{AppConfig, ShellConfig, ShellEnvMode};
-use harness_contracts::{KEY_TOOLS, ToolError, ToolSpec};
+use harness_config::{AppConfig, ShellConfig};
+use harness_contracts::{KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOLS, ToolError, ToolSpec};
 use harness_core::{Context, Result};
 
-pub use harness_config::LLM_API_KEY_ENV_PATTERNS;
 pub use jobs::JobLimits;
 pub use output::{Tail, format_result, format_result_full, tail_truncate};
-pub use policy::CompiledPolicy;
 
 use exec::resolve_request;
 use jobs::{JobManager, validate_env_keys};
 
-const SAFETY_NOTE: &str = "Best-effort safety net, not a sandbox: argv-only (no shell), strict allowlist, dangerous operators and TTY commands blocked. Run untrusted work in a container.";
+const NO_POLICY_NOTE: &str = "No policy guardrails: any executable runs. A future guardrail plugin may deny via tool.approval. Run trusted work only, preferably in a container.";
 
 fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError {
@@ -43,17 +45,14 @@ fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
 /// Runtime service behind the four shell tools. Clone via `Arc`.
 pub struct ShellService {
     cfg: ShellConfig,
-    policy: CompiledPolicy,
     jobs: JobManager,
 }
 
 impl ShellService {
     pub fn new(cfg: ShellConfig) -> Self {
-        let policy = CompiledPolicy::compile(&cfg);
         let limits = JobLimits::from_config(&cfg);
         ShellService {
             cfg,
-            policy,
             jobs: JobManager::new(limits),
         }
     }
@@ -71,14 +70,7 @@ impl ShellService {
         self.jobs.shutdown().await;
     }
 
-    fn denied_env(&self) -> &[String] {
-        &self.cfg.env.denied_patterns
-    }
-
-    fn env_mode(&self) -> ShellEnvMode {
-        self.cfg.env.mode
-    }
-
+    /// Argument-shape validation only (no policy). Returns the executable.
     fn check_common(
         &self,
         tool: &str,
@@ -95,14 +87,15 @@ impl ShellService {
             return Err(tool_err(tool, "command is too long (max 64KiB total)"));
         }
         validate_env_keys(env.as_ref()).map_err(|e| tool_err(tool, e))?;
-        self.policy.check(argv).map_err(|e| tool_err(tool, e))?;
-        // Spawn the original argv[0] (not the policy basename) so absolute
-        // paths keep working, e.g. under a clean env with no PATH.
-        Ok(argv[0].trim().to_owned())
+        let exe = argv[0].trim().to_owned();
+        if exe.is_empty() {
+            return Err(tool_err(tool, "empty executable"));
+        }
+        Ok(exe)
     }
 
     /// Synchronous execution. Non-zero exits are `Ok` (labeled output);
-    /// policy/spawn failures are `Err`.
+    /// spawn failures are `Err`.
     pub async fn exec_sync(
         &self,
         tool: &'static str,
@@ -114,7 +107,7 @@ impl ShellService {
         let exe = self.check_common(tool, &argv, &env)?;
         let req = resolve_request(&self.cfg, exe, argv, workdir, timeout_ms, env)
             .map_err(|e| tool_err(tool, e))?;
-        exec::run_once(&self.cfg, req, self.denied_env(), self.env_mode())
+        exec::run_once(&self.cfg, req)
             .await
             .map_err(|e| tool_err(tool, e))
     }
@@ -131,16 +124,7 @@ impl ShellService {
         let exe = self.check_common(tool, &argv, &env)?;
         let id = self
             .jobs
-            .start(
-                &self.cfg,
-                exe,
-                argv,
-                workdir,
-                timeout_ms,
-                env,
-                self.denied_env(),
-                self.env_mode(),
-            )
+            .start(&self.cfg, exe, argv, workdir, timeout_ms, env)
             .await
             .map_err(|e| tool_err(tool, e))?;
         Ok(format!(
@@ -209,7 +193,7 @@ fn parse_exec_args(tool: &'static str, args: &str) -> std::result::Result<ExecAr
 }
 
 // ---------------------------------------------------------------------------
-// Handlers (each: parse -> service call; service enforces policy)
+// Handlers (each: parse -> service call; policy lives in tool.approval)
 // ---------------------------------------------------------------------------
 
 fn shell_exec_handler(
@@ -264,8 +248,8 @@ fn exec_params() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "command": { "type": "array", "items": { "type": "string" }, "description": "argv array, e.g. [\"git\", \"status\"]. No shell; operators like > | ; are rejected." },
-            "workdir": { "type": "string", "description": "Working directory (must be under allowed_workdirs, default cwd)" },
+            "command": { "type": "array", "items": { "type": "string" }, "description": "argv array, e.g. [\"git\", \"status\"]. Runs directly, no shell." },
+            "workdir": { "type": "string", "description": "Working directory (must exist, default cwd)" },
             "timeout_ms": { "type": "integer", "minimum": 1, "description": "Timeout override, clamped to max_timeout_ms" },
             "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "If given, subprocess gets ONLY these vars (clean env)" }
         },
@@ -277,7 +261,7 @@ pub fn shell_exec_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_exec".to_owned(),
         description: format!(
-            "Run a command synchronously and return labeled tail-truncated [stdout]/[stderr]. {SAFETY_NOTE}"
+            "Run a command synchronously and return labeled tail-truncated [stdout]/[stderr]. {NO_POLICY_NOTE}"
         ),
         parameters: exec_params(),
     }
@@ -287,7 +271,7 @@ pub fn shell_start_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_start".to_owned(),
         description: format!(
-            "Start a long-running command in the background; returns a job id immediately (never blocks). Poll with shell_poll, end with shell_stop. {SAFETY_NOTE}"
+            "Start a long-running command in the background; returns a job id immediately (never blocks). Poll with shell_poll, end with shell_stop. {NO_POLICY_NOTE}"
         ),
         parameters: exec_params(),
     }
@@ -328,40 +312,28 @@ pub fn shell_stop_spec() -> ToolSpec {
 // Plugin
 // ---------------------------------------------------------------------------
 
-/// Headless shell plugin. Build from `[shell]` config or defaults.
+/// Headless shell plugin. Reads `[shell]` bounds from `config.app` via DI.
 ///
 /// ```rust,no_run
 /// # use harness_shell::ShellPlugin;
-/// # use harness_config::AppConfig;
-/// let plugin = ShellPlugin::default();
+/// let plugin = ShellPlugin;
 /// ```
-#[derive(Default)]
-pub struct ShellPlugin {
-    config: ShellConfig,
-}
-
-impl ShellPlugin {
-    pub fn new(config: ShellConfig) -> Self {
-        ShellPlugin { config }
-    }
-
-    /// Build from the full app config (`[shell]` section).
-    pub fn from_app_config(cfg: &AppConfig) -> Self {
-        ShellPlugin {
-            config: cfg.shell.clone(),
-        }
-    }
-}
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ShellPlugin;
 
 impl harness_core::Plugin for ShellPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
-        harness_core::PluginMeta::new("shell").injects(KEY_TOOLS)
+        harness_core::PluginMeta::new("shell")
+            .provides(KEY_SHELL_SERVICE)
+            .injects(KEY_TOOLS)
+            .injects(KEY_CONFIG)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         use harness_tools::Tools;
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS)?;
-        let svc = Arc::new(ShellService::new(self.config.clone()));
+        let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
+        let svc = Arc::new(ShellService::new(config.shell.clone()));
         tools.register(shell_exec_spec(), {
             let svc = Arc::clone(&svc);
             move |args| shell_exec_handler(Arc::clone(&svc), args)
@@ -379,9 +351,9 @@ impl harness_core::Plugin for ShellPlugin {
             move |args| shell_stop_handler(Arc::clone(&svc), args)
         })?;
         // Keep the service alive for the plugin lifetime; dropping it aborts
-        // background jobs via JobManager::drop. Stored under an internal key
+        // background jobs via JobManager::drop. Stored under `KEY_SHELL_SERVICE`
         // owned by this plugin so unload cleans it up.
-        ctx.provide_key("shell.service", svc);
+        ctx.provide_key(KEY_SHELL_SERVICE, svc);
         Ok(())
     }
 }
@@ -392,22 +364,24 @@ mod tests {
     use harness_contracts::{KEY_TOOLS, ToolCall};
     use harness_tools::{Tools, ToolsPlugin};
 
-    fn test_config() -> ShellConfig {
-        let mut cfg = ShellConfig::default();
-        for extra in ["python3", "sleep", "sh"] {
-            if !cfg.allowlist.iter().any(|s| s == extra) {
-                cfg.allowlist.push(extra.to_owned());
-            }
-        }
-        cfg
-    }
+    const TEST_CONFIG_TOML: &str = r#"
+[llm]
+base_url = "u"
+model = "m"
+api_key = "k"
+user_agent = "a"
+"#;
 
-    fn ctx_with_shell(cfg: ShellConfig) -> (Context, Arc<Tools>, Arc<ShellService>) {
+    fn ctx_with_shell() -> (Context, Arc<Tools>, Arc<ShellService>) {
         let ctx = Context::root();
+        ctx.load(
+            harness_config::ConfigPlugin::from_toml(TEST_CONFIG_TOML).unwrap(),
+        )
+        .unwrap();
         ctx.load(ToolsPlugin).unwrap();
-        ctx.load(ShellPlugin::new(cfg)).unwrap();
+        ctx.load(ShellPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
-        let svc: Arc<ShellService> = ctx.inject_key("shell.service").unwrap();
+        let svc: Arc<ShellService> = ctx.inject_key(KEY_SHELL_SERVICE).unwrap();
         (ctx, tools, svc)
     }
 
@@ -420,8 +394,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_tool_runs_allowlisted_command() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
+    async fn exec_tool_runs_any_command() {
+        let (_ctx, tools, _svc) = ctx_with_shell();
         let out = tools
             .execute(
                 "a",
@@ -436,82 +410,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_tool_denies_rm() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
+    async fn exec_tool_rejects_empty_command() {
+        let (_ctx, tools, _svc) = ctx_with_shell();
         let err = tools
             .execute(
                 "a",
                 "s",
                 1,
-                call(
-                    "shell_exec",
-                    serde_json::json!({"command": ["rm", "-rf", "/"]}),
-                ),
+                call("shell_exec", serde_json::json!({"command": []})),
             )
             .await
             .unwrap_err();
         assert_eq!(err.tool, "shell_exec");
-        assert!(err.message.contains("denylist") || err.message.contains("allowlist"));
-    }
-
-    #[tokio::test]
-    async fn exec_tool_denies_unknown_binary() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
-        let err = tools
-            .execute(
-                "a",
-                "s",
-                1,
-                call(
-                    "shell_exec",
-                    serde_json::json!({"command": ["evilminer", "--go"]}),
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("allowlist"), "got: {}", err.message);
-    }
-
-    #[tokio::test]
-    async fn exec_tool_denies_operators_and_shell_strings() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
-        let err = tools
-            .execute(
-                "a",
-                "s",
-                1,
-                call(
-                    "shell_exec",
-                    serde_json::json!({"command": ["echo", "a", ">", "/tmp/x"]}),
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.message.contains("operator"), "got: {}", err.message);
-        // Single-string shell command: `sh` not allowlisted by default config,
-        // but test config adds it with allow_shell=false -> blocked.
-        let err2 = tools
-            .execute(
-                "a",
-                "s",
-                1,
-                call(
-                    "shell_exec",
-                    serde_json::json!({"command": ["sh", "-c", "echo hi"]}),
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err2.message.contains("shell") || err2.message.contains("allow"),
-            "got: {}",
-            err2.message
-        );
     }
 
     #[tokio::test]
     async fn background_lifecycle_through_registry() {
-        let (_ctx, tools, svc) = ctx_with_shell(test_config());
+        let (_ctx, tools, svc) = ctx_with_shell();
         let out = tools
             .execute(
                 "a",
@@ -559,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_unknown_job_is_clean_error() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
+        let (_ctx, tools, _svc) = ctx_with_shell();
         let err = tools
             .execute(
                 "a",
@@ -574,10 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_env_gives_clean_subprocess() {
-        let (_ctx, tools, _svc) = ctx_with_shell(test_config());
-        // Clean env has no PATH, so resolve the interpreter absolutely
-        // (basename must stay `python3` for the allowlist; do NOT
-        // canonicalize — it may resolve a versioned symlink target).
+        let (_ctx, tools, _svc) = ctx_with_shell();
         let py = [
             "/etc/profiles/per-user/pranesh/bin/python3",
             "/usr/bin/python3",
