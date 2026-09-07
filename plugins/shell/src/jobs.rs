@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::env::apply_env;
 use crate::exec::{Ring, drain_into, resolve_workdir};
 use crate::output::tail_truncate;
-use harness_config::{ShellConfig, ShellEnvMode};
+use harness_config::ShellConfig;
 
 /// Limits snapshot copied out of `ShellConfig` at build.
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +79,8 @@ impl JobManager {
     }
 
     /// Spawn a background job; returns the job id immediately.
-    #[allow(clippy::too_many_arguments)]
+    /// No policy checks: any executable runs. Resource bounds
+    /// (`max_jobs`, `max_job_time`) still apply.
     pub async fn start(
         &self,
         cfg: &ShellConfig,
@@ -88,11 +89,8 @@ impl JobManager {
         workdir: Option<String>,
         deadline_override_ms: Option<u64>,
         explicit_env: Option<std::collections::HashMap<String, String>>,
-        denied_env: &[String],
-        env_mode: ShellEnvMode,
     ) -> Result<String, String> {
-        // Reuse workdir validation; argv already policy-checked by caller.
-        let workdir: PathBuf = resolve_workdir(&cfg.allowed_workdirs, workdir.as_deref())?;
+        let workdir: PathBuf = resolve_workdir(workdir.as_deref())?;
         let deadline = match deadline_override_ms {
             Some(ms) => Duration::from_millis(ms.clamp(1, cfg.max_job_time_ms.max(1))),
             None => self.limits.max_job_time,
@@ -141,12 +139,7 @@ impl JobManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_env(
-            cmd.as_std_mut(),
-            explicit_env.as_ref(),
-            env_mode,
-            denied_env,
-        );
+        apply_env(cmd.as_std_mut(), explicit_env.as_ref());
         let mut child = cmd.spawn().map_err(|e| format!("spawn `{exe}`: {e}"))?;
 
         let id = format!("sh-{}", self.next.fetch_add(1, Ordering::Relaxed));
@@ -436,13 +429,9 @@ pub fn validate_env_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_config::ShellEnvMode;
 
     fn test_config() -> ShellConfig {
-        let mut cfg = ShellConfig::default();
-        cfg.allowlist.push("python3".to_owned());
-        cfg.allowlist.push("echo".to_owned());
-        cfg
+        ShellConfig::default()
     }
 
     #[tokio::test]
@@ -461,8 +450,6 @@ mod tests {
                 None,
                 None,
                 None,
-                &[],
-                ShellEnvMode::InheritFiltered,
             )
             .await
             .unwrap();
@@ -490,8 +477,6 @@ mod tests {
                 None,
                 None,
                 None,
-                &[],
-                ShellEnvMode::InheritFiltered,
             )
             .await
             .unwrap();
@@ -534,8 +519,6 @@ mod tests {
                 None,
                 None,
                 None,
-                &[],
-                ShellEnvMode::InheritFiltered,
             )
         };
         mk().await.unwrap();
@@ -560,8 +543,6 @@ mod tests {
                 None,
                 None,
                 None,
-                &[],
-                ShellEnvMode::InheritFiltered,
             )
             .await
             .unwrap();
@@ -592,8 +573,6 @@ mod tests {
             None,
             None,
             None,
-            &[],
-            ShellEnvMode::InheritFiltered,
         )
         .await
         .unwrap();
