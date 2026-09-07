@@ -1,9 +1,10 @@
-//! Synchronous execution: argv-only spawn, bounded pipe drain, timeout kill.
+//! Synchronous execution: direct spawn, bounded pipe drain, timeout kill.
 //!
-//! Memory is bounded by `max_capture_bytes` per stream regardless of child
-//! output volume; wall time is bounded by the clamped timeout. Non-zero
-//! exits are `Ok` (visible to the model); policy/spawn failures are `Err`.
-//! Timeouts return `Ok` with `timed_out=true` plus the partial tail.
+//! No policy guardrails here: any `argv` runs as-is. Memory is bounded by
+//! `max_capture_bytes` per stream regardless of child output volume; wall
+//! time is bounded by the clamped timeout. Non-zero exits are `Ok` (visible
+//! to the model); spawn failures are `Err`. Timeouts return `Ok` with
+//! `timed_out=true` plus the partial tail.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::env::apply_env;
 use crate::output::format_result_full;
-use harness_config::{ShellConfig, ShellEnvMode};
+use harness_config::ShellConfig;
 
 /// Validated request for one synchronous run.
 pub struct ExecRequest {
@@ -36,7 +37,7 @@ pub fn resolve_request(
     timeout_ms: Option<u64>,
     explicit_env: Option<HashMap<String, String>>,
 ) -> Result<ExecRequest, String> {
-    let workdir = resolve_workdir(&cfg.allowed_workdirs, workdir.as_deref())?;
+    let workdir = resolve_workdir(workdir.as_deref())?;
     let want = timeout_ms.unwrap_or(cfg.default_timeout_ms);
     let clamped = want.clamp(1, cfg.max_timeout_ms.max(1));
     Ok(ExecRequest {
@@ -48,8 +49,10 @@ pub fn resolve_request(
     })
 }
 
-/// Canonicalize `workdir` (or cwd) and require it under an allowed dir.
-pub fn resolve_workdir(allowed: &[String], workdir: Option<&str>) -> Result<PathBuf, String> {
+/// Resolve `workdir` (or cwd). No allowlist: any existing directory is fine.
+/// Guardrails on *where* a command may run belong in a future guardrail
+/// plugin via the `tool.approval` waterfall.
+pub fn resolve_workdir(workdir: Option<&str>) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
     let cwd_canon = canonical_or(&cwd);
     let target = match workdir {
@@ -68,25 +71,6 @@ pub fn resolve_workdir(allowed: &[String], workdir: Option<&str>) -> Result<Path
                 return Err(format!(
                     "workdir `{w}` does not exist or is not a directory"
                 ));
-            }
-            let roots: Vec<PathBuf> = if allowed.is_empty() {
-                vec![cwd_canon]
-            } else {
-                allowed
-                    .iter()
-                    .map(|r| {
-                        let rp = Path::new(r);
-                        let j = if rp.is_absolute() {
-                            rp.to_path_buf()
-                        } else {
-                            cwd.join(rp)
-                        };
-                        canonical_or(&j)
-                    })
-                    .collect()
-            };
-            if !roots.iter().any(|r| canon.starts_with(r)) {
-                return Err(format!("workdir `{w}` is outside allowed_workdirs"));
             }
             canon
         }
@@ -140,12 +124,7 @@ where
 }
 
 /// Run one command synchronously. Returns labeled output (tail-truncated).
-pub async fn run_once(
-    cfg: &ShellConfig,
-    req: ExecRequest,
-    denied_env: &[String],
-    env_mode: ShellEnvMode,
-) -> Result<String, String> {
+pub async fn run_once(cfg: &ShellConfig, req: ExecRequest) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(&req.exe);
     if req.argv.len() > 1 {
         cmd.args(&req.argv[1..]);
@@ -155,12 +134,7 @@ pub async fn run_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    apply_env(
-        cmd.as_std_mut(),
-        req.explicit_env.as_ref(),
-        env_mode,
-        denied_env,
-    );
+    apply_env(cmd.as_std_mut(), req.explicit_env.as_ref());
 
     let mut child = cmd
         .spawn()
@@ -236,15 +210,14 @@ mod tests {
 
     #[test]
     fn workdir_defaults_to_cwd() {
-        let wd = resolve_workdir(&[".".to_owned()], None).unwrap();
+        let wd = resolve_workdir(None).unwrap();
         assert!(wd.is_dir());
     }
 
     #[test]
-    fn workdir_escape_rejected() {
-        let err =
-            resolve_workdir(&[".".to_owned()], Some("/definitely/not/allowed-xyz")).unwrap_err();
-        assert!(err.contains("does not exist") || err.contains("outside"));
+    fn workdir_missing_is_error() {
+        let err = resolve_workdir(Some("/definitely/not/allowed-xyz")).unwrap_err();
+        assert!(err.contains("does not exist"));
     }
 
     #[test]
@@ -274,9 +247,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run_once(&cfg, req, &[], ShellEnvMode::InheritFiltered)
-            .await
-            .unwrap();
+        let out = run_once(&cfg, req).await.unwrap();
         assert!(out.contains("[stdout]"));
         assert!(out.contains("hello"));
         assert!(out.contains("[exit 0"));
@@ -298,9 +269,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run_once(&cfg, req, &[], ShellEnvMode::InheritFiltered)
-            .await
-            .unwrap();
+        let out = run_once(&cfg, req).await.unwrap();
         assert!(out.contains("timed_out=true"), "got: {out}");
     }
 
@@ -320,9 +289,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run_once(&cfg, req, &[], ShellEnvMode::InheritFiltered)
-            .await
-            .unwrap();
+        let out = run_once(&cfg, req).await.unwrap();
         // Labeled output must stay well under raw 16MB.
         assert!(
             out.len() < cfg.max_output_bytes * 2 + 1024,
