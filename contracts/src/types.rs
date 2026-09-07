@@ -211,6 +211,59 @@ pub struct ToolExecuted {
     pub result: Result<String, ToolError>,
 }
 
+/// `CH_TOOL_APPROVAL` waterfall payload: pre-execution gate for tool calls.
+///
+/// A future guardrail plugin registers a waterfall handler on
+/// `CH_TOOL_APPROVAL`, inspects/rewrites `call`, and sets `denied = Some(reason)`
+/// to veto. With no handlers the call runs unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolApproval {
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub turn: u64,
+    pub call: ToolCall,
+    /// `Some(reason)` vetoes execution; `None` allows (possibly rewritten) `call`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+impl ToolApproval {
+    pub fn allow(
+        agent_id: impl Into<String>,
+        session_id: impl Into<String>,
+        turn: u64,
+        call: ToolCall,
+    ) -> Self {
+        ToolApproval {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            turn,
+            call,
+            denied: None,
+        }
+    }
+
+    pub fn deny(
+        agent_id: impl Into<String>,
+        session_id: impl Into<String>,
+        turn: u64,
+        call: ToolCall,
+        reason: impl Into<String>,
+    ) -> Self {
+        ToolApproval {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            turn,
+            call,
+            denied: Some(reason.into()),
+        }
+    }
+
+    pub fn is_denied(&self) -> bool {
+        self.denied.is_some()
+    }
+}
+
 /// `CH_PROMPT_ASSEMBLED`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptAssembled {
