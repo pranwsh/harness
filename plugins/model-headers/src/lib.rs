@@ -29,13 +29,24 @@ const OBSERVED_HEADERS: &[&str] = &[
     "retry-after",
 ];
 
-/// Merges configured headers over the seeded ones and validates auth.
+/// Generates one session id (UUID4) per plugin load. The id is reused for
+/// every request of the process lifetime, matching the official client's
+/// `X-Session-ID` attribution header.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Merges configured headers, stamps the session id, and validates auth.
 /// Pure: unit-tested without DI or HTTP.
 ///
 /// Configured names merge case-insensitively, except `authorization` and
 /// `content-type`, which stay owned by the model plugin and are never
 /// overridden from config. An empty bearer vetoes the send.
-pub fn check_request(config: &AppConfig, mut req: LlmRequestHeaders) -> LlmRequestHeaders {
+pub fn check_request(
+    config: &AppConfig,
+    mut req: LlmRequestHeaders,
+    session_id: &str,
+) -> LlmRequestHeaders {
     for (name, value) in &config.llm.headers {
         if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("content-type")
         {
@@ -43,6 +54,7 @@ pub fn check_request(config: &AppConfig, mut req: LlmRequestHeaders) -> LlmReque
         }
         req.set(name.clone(), value.clone());
     }
+    req.set("X-Session-ID", session_id);
     match req.get("authorization").map(str::trim) {
         Some(value) if !value.is_empty() && value != "Bearer" => req,
         _ => LlmRequestHeaders::deny(
@@ -81,9 +93,12 @@ impl harness_core::Plugin for ModelHeadersPlugin {
 
     fn build(&self, ctx: Context) -> Result<()> {
         let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
+        // One session id per plugin load, reused for every request.
+        let session_id = new_session_id();
         ctx.on_waterfall_key::<LlmRequestHeaders, _, _>(CH_LLM_REQUEST_HEADERS, move |req| {
             let config = config.clone();
-            async move { check_request(&config, (*req).clone()) }
+            let session_id = session_id.clone();
+            async move { check_request(&config, (*req).clone(), &session_id) }
         })?;
         ctx.on_key::<LlmResponseHeaders, _, _>(CH_LLM_RESPONSE_HEADERS, |resp| async move {
             eprintln!("{}", format_observed(&resp));
@@ -131,7 +146,7 @@ mod tests {
         let mut seed = seeded("m");
         // Differently-cased seed entry is replaced, not duplicated.
         seed.set("x-TITLE", "seed");
-        let out = check_request(&config, seed);
+        let out = check_request(&config, seed, "s1");
         assert!(!out.is_denied());
         let titles: Vec<_> = out
             .headers
@@ -148,7 +163,7 @@ mod tests {
             ("authorization", "Bearer evil"),
             ("Content-Type", "text/plain"),
         ]);
-        let out = check_request(&config, seeded("m"));
+        let out = check_request(&config, seeded("m"), "s1");
         assert!(!out.is_denied());
         assert_eq!(out.get("authorization"), Some("Bearer k"));
         assert!(out.get("content-type").is_none());
@@ -156,20 +171,40 @@ mod tests {
 
     #[test]
     fn empty_table_is_a_pass_through() {
-        let out = check_request(&plain_config(), seeded("m"));
+        let out = check_request(&plain_config(), seeded("m"), "s1");
         assert!(!out.is_denied());
-        assert_eq!(out.headers.len(), 1);
+        // Seeded auth plus the stamped session id.
+        assert_eq!(out.headers.len(), 2);
     }
 
     #[test]
     fn missing_or_bare_bearer_is_denied() {
         let config = plain_config();
         let no_auth = LlmRequestHeaders::allow("m", vec![]);
-        let denied = check_request(&config, no_auth);
+        let denied = check_request(&config, no_auth, "s1");
         assert!(denied.is_denied());
 
         let bare = LlmRequestHeaders::allow("m", vec![("authorization".into(), "Bearer".into())]);
-        assert!(check_request(&config, bare).is_denied());
+        assert!(check_request(&config, bare, "s1").is_denied());
+    }
+
+    #[test]
+    fn session_id_is_stamped() {
+        let out = check_request(&plain_config(), seeded("m"), "session-123");
+        assert_eq!(out.get("X-Session-ID"), Some("session-123"));
+        // Denied responses carry the session id too.
+        let no_auth = LlmRequestHeaders::allow("m", vec![]);
+        let denied = check_request(&plain_config(), no_auth, "session-123");
+        assert!(denied.is_denied());
+        assert_eq!(denied.get("x-session-id"), Some("session-123"));
+    }
+
+    #[test]
+    fn new_session_id_is_uuid_v4() {
+        let id = new_session_id();
+        let parsed = uuid::Uuid::parse_str(&id).expect("hyphenated uuid");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        assert_ne!(new_session_id(), id);
     }
 
     #[test]
@@ -211,6 +246,10 @@ mod tests {
             .unwrap();
         assert!(!out.is_denied());
         assert_eq!(out.get("x-title"), Some("agent"));
+        // Session id is stamped per plugin load and parses as UUID v4.
+        let session = out.get("x-session-id").expect("session id stamped");
+        let parsed = uuid::Uuid::parse_str(session).expect("hyphenated uuid");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     }
 
     #[test]

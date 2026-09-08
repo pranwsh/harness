@@ -829,6 +829,7 @@ dependencies = [
  "harness-contracts",
  "harness-core",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

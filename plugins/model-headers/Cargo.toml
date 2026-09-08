@@ -7,6 +7,7 @@ edition = "2024"
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
 harness-config = { path = "../config" }
+uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
