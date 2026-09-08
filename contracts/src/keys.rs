@@ -7,6 +7,10 @@
 
 /// `Arc<AppConfig>` — provided by the config plugin.
 pub const KEY_CONFIG: &str = "config.app";
+/// `Arc<ConfigService>` — provided by the config plugin. General,
+/// domain-agnostic read/modify/persist access to `config.toml`; consumers
+/// (e.g. the `/model` bridge) mutate through it instead of touching files.
+pub const KEY_CONFIG_SERVICE: &str = "config.service";
 /// `Arc<dyn ModelClient>` — provided by the model plugin.
 pub const KEY_MODEL_CLIENT: &str = "model.chat";
 /// `Arc<AgentRegistry>` — provided by the agent plugin.

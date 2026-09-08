@@ -14,7 +14,7 @@ use harness_config::AppConfig;
 /// is the only bridge between this and the generic popup service.
 pub struct ModelSelector {
     ctx: Context,
-    default: String,
+    default: RwLock<String>,
     current: RwLock<String>,
     catalog: RwLock<Vec<String>>,
     base_url: String,
@@ -26,9 +26,9 @@ impl ModelSelector {
         let default = default.into();
         ModelSelector {
             ctx,
+            default: RwLock::new(default.clone()),
             current: RwLock::new(default.clone()),
-            catalog: RwLock::new(vec![default.clone()]),
-            default,
+            catalog: RwLock::new(vec![default]),
             base_url: String::new(),
             api_key: String::new(),
         }
@@ -38,9 +38,9 @@ impl ModelSelector {
         let default = config.llm.model.clone();
         ModelSelector {
             ctx,
+            default: RwLock::new(default.clone()),
             current: RwLock::new(default.clone()),
-            catalog: RwLock::new(vec![default.clone()]),
-            default,
+            catalog: RwLock::new(vec![default]),
             base_url: config.llm.base_url.clone(),
             api_key: config.llm.api_key.clone(),
         }
@@ -68,8 +68,11 @@ impl ModelSelector {
             .clone()
     }
 
-    pub fn default_model(&self) -> &str {
-        &self.default
+    pub fn default_model(&self) -> String {
+        self.default
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Cached catalog; at least the default is always present.
@@ -93,12 +96,31 @@ impl ModelSelector {
     /// Replaces the cached catalog (keeps the default listed). Used by the
     /// background `/models` refresh while the popup is open.
     pub fn set_catalog(&self, mut models: Vec<String>) {
-        if !models.iter().any(|m| m == &self.default) {
-            models.push(self.default.clone());
+        let default = self.default_model();
+        if !models.iter().any(|m| m == &default) {
+            models.push(default);
         }
         models.sort();
         models.dedup();
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = models;
+    }
+
+    /// Snapshot of `(current, catalog)` for orchestrated rollback when a
+    /// downstream persist fails. See `restore`.
+    pub fn snapshot(&self) -> (String, Vec<String>) {
+        (self.current(), self.models())
+    }
+
+    /// Restores a `snapshot`, verbatim (no default re-anchoring, no sort).
+    pub fn restore(&self, current: String, catalog: Vec<String>) {
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = current;
+        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
+
+    /// Marks a successfully persisted model as the new default, so a later
+    /// `set_catalog` fallback and a fresh process agree on it.
+    pub fn sync_default(&self, model: &str) {
+        *self.default.write().unwrap_or_else(|e| e.into_inner()) = model.to_owned();
     }
 
     /// Fetches `GET {base_url}/models` once and caches the result. Returns
@@ -218,6 +240,25 @@ mod tests {
         let sel: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR).unwrap();
         sel.set_catalog(vec!["b".into(), "a".into(), "a".into()]);
         assert_eq!(sel.models(), vec!["a", "b", "m"]);
+    }
+
+    #[test]
+    fn snapshot_restore_and_sync_default() {
+        let ctx = Context::root();
+        load_all(&ctx);
+        let sel: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR).unwrap();
+        let prev = sel.snapshot();
+        sel.set_current("other");
+        assert_eq!(sel.current(), "other");
+        sel.restore(prev.0.clone(), prev.1.clone());
+        assert_eq!(sel.snapshot(), prev);
+        assert_eq!(sel.default_model(), "m");
+        sel.set_current("other");
+        sel.sync_default("other");
+        assert_eq!(sel.default_model(), "other");
+        // New default anchors future catalogs.
+        sel.set_catalog(vec!["z".into()]);
+        assert_eq!(sel.models(), vec!["other", "z"]);
     }
 
     #[test]

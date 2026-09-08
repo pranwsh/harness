@@ -868,6 +868,7 @@ dependencies = [
  "crossterm",
  "harness-agent-default-model",
  "harness-agent-loop",
+ "harness-config",
  "harness-contracts",
  "harness-core",
  "harness-tui-input",
