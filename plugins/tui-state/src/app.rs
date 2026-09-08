@@ -141,6 +141,11 @@ pub struct App {
     /// scrolling moves smoothly one row at a time. Clamped to the
     /// displayable range whenever the view reports fresh geometry.
     scroll_rows: usize,
+    /// Streaming follow anchor: while set, the view follows new content
+    /// only until the latest submitted user message reaches the viewport
+    /// top, then freezes there instead of scrolling lower. Armed on submit,
+    /// cleared by any manual scroll, by `/clear`, and once no turn is live.
+    anchor_follow: bool,
     /// Measured chat content height and viewport height in rows,
     /// reported by the view each draw.
     chat_total_rows: usize,
@@ -164,6 +169,7 @@ impl App {
             chat_viewport_rows: 0,
             input_width: DEFAULT_INPUT_WIDTH,
             input_scroll: 0,
+            anchor_follow: false,
             quit: false,
         }
     }
@@ -219,6 +225,17 @@ impl App {
     /// the view to the newest content.
     pub fn scroll_rows(&self) -> usize {
         self.scroll_rows
+    }
+
+    /// Whether the streaming follow anchor is armed (see the field docs).
+    pub fn anchor_follow(&self) -> bool {
+        self.anchor_follow
+    }
+
+    /// Sets the scroll offset directly (called by the view each draw to
+    /// enforce the streaming anchor), clamped to the displayable range.
+    pub fn set_scroll_rows(&mut self, rows: usize) {
+        self.scroll_rows = rows.min(self.max_chat_scroll());
     }
 
     /// Records the measured chat geometry (called by the view each
@@ -331,9 +348,13 @@ impl App {
 
     /// Called by the runtime when a turn stream ends, successfully or not.
     /// `AppMsg::Completed`/`Failed` already carry the outcome; this only
-    /// clears the busy state.
+    /// clears the busy state. Once no turn is live the anchor has served
+    /// its purpose, so it disarms (a later submit re-arms it).
     pub fn turn_finished(&mut self) {
         self.live_turns = self.live_turns.saturating_sub(1);
+        if self.live_turns == 0 {
+            self.anchor_follow = false;
+        }
     }
 
     /// Handles a keypress, returning the effect for the runtime. Every
@@ -429,6 +450,7 @@ impl App {
             "/clear" => {
                 self.items.clear();
                 self.scroll_rows = 0;
+                self.anchor_follow = false;
                 return Effect::redraw();
             }
             cmd if cmd.starts_with('/') => {
@@ -441,6 +463,7 @@ impl App {
             _ => {}
         }
         self.push(ChatItem::new(trimmed.clone(), ItemKind::User));
+        self.anchor_follow = true;
         Effect {
             redraw: true,
             submitted: Some(trimmed),
@@ -465,8 +488,10 @@ impl App {
     /// Moves the chat viewport `delta` content rows (`+` scrolls up
     /// toward older content, `-` scrolls down). Reaching zero
     /// re-engages follow mode; the view clamps against the measured
-    /// content height at draw time.
+    /// content height at draw time. Any manual scroll disarms the
+    /// streaming follow anchor; every scroll input funnels through here.
     fn scroll_chat(&mut self, delta: isize) {
+        self.anchor_follow = false;
         self.scroll_rows = self.scroll_rows.saturating_add_signed(delta);
     }
 
@@ -892,6 +917,78 @@ mod tests {
         assert!(app.update(AppMsg::AssistantDelta("more".into())));
         assert_eq!(app.scroll_rows(), pinned);
         assert!(!app.follows());
+    }
+
+    fn submit_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(key(KeyEvent::Char(c)));
+        }
+        app.update(key(KeyEvent::Enter));
+    }
+
+    #[test]
+    fn submit_arms_anchor_follow() {
+        let mut app = App::new();
+        assert!(!app.anchor_follow());
+        submit_text(&mut app, "hi");
+        assert!(app.anchor_follow());
+    }
+
+    #[test]
+    fn non_user_submits_do_not_arm_anchor() {
+        let mut app = App::new();
+        // Empty and whitespace-only submits push nothing.
+        assert!(!app.update(key(KeyEvent::Enter)));
+        assert!(!app.anchor_follow());
+        // Unknown commands and quit never produce a user message.
+        submit_text(&mut app, "/bogus");
+        assert!(!app.anchor_follow());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn clear_disarms_anchor_follow() {
+        let mut app = App::new();
+        submit_text(&mut app, "hi");
+        assert!(app.anchor_follow());
+        submit_text(&mut app, "/clear");
+        assert!(app.items().is_empty());
+        assert!(!app.anchor_follow());
+    }
+
+    #[test]
+    fn manual_scroll_disarms_anchor_follow() {
+        let mut app = App::new();
+        submit_text(&mut app, "hi");
+        assert!(app.update(key(KeyEvent::PageUp)));
+        assert!(!app.anchor_follow());
+
+        submit_text(&mut app, "again");
+        assert!(app.anchor_follow());
+        assert!(app.update(AppMsg::ScrollUp));
+        assert!(!app.anchor_follow());
+    }
+
+    #[test]
+    fn turn_finish_disarms_anchor_only_when_no_turn_live() {
+        let mut app = App::new();
+        submit_text(&mut app, "hi");
+        app.turn_started();
+        app.turn_started();
+        app.update(AppMsg::TurnFinished);
+        assert!(app.anchor_follow(), "second turn still live");
+        app.update(AppMsg::TurnFinished);
+        assert!(!app.anchor_follow());
+    }
+
+    #[test]
+    fn set_scroll_rows_clamps_to_displayable_range() {
+        let mut app = App::new();
+        app.set_chat_geometry(10, 9);
+        app.set_scroll_rows(100);
+        assert_eq!(app.scroll_rows(), 2);
+        app.set_scroll_rows(1);
+        assert_eq!(app.scroll_rows(), 1);
     }
 
     #[test]

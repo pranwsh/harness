@@ -88,6 +88,16 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect, renderer: &dyn MessageRen
     // the displayable range (no invisible scroll debt).
     app.set_chat_geometry(total, viewport);
 
+    // Streaming follow anchor: follow new content only until the latest
+    // submitted user message reaches the viewport top, then freeze there
+    // by hiding every row below that window. `scroll = total - viewport
+    // - anchor` is zero while the message still fits below the top edge
+    // (plain follow) and grows with each streamed row after.
+    if app.anchor_follow() {
+        let anchor = anchor_start_row(app, &layouts, total);
+        app.set_scroll_rows(total.saturating_sub(viewport).saturating_sub(anchor));
+    }
+
     // Bottom-anchored row window: `scroll` content rows stay hidden
     // below the viewport; the rest fills upward from the bottom edge.
     let (skip, used) = visible_range(total, app.scroll_rows(), viewport);
@@ -123,6 +133,25 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect, renderer: &dyn MessageRen
         if remaining == 0 {
             break;
         }
+    }
+}
+
+/// First content row of the latest submitted user message: the sum of the
+/// laid-out heights of everything before the last `User` item. Submits
+/// always append, so the last user item is the latest one; with no user
+/// message yet the anchor is the content end (plain follow).
+fn anchor_start_row(app: &App, layouts: &[MsgLayout], total: usize) -> usize {
+    match app
+        .items()
+        .iter()
+        .rposition(|item| item.kind == ItemKind::User)
+    {
+        Some(index) => layouts
+            .iter()
+            .take(index.min(layouts.len()))
+            .map(|lay| lay.height)
+            .sum(),
+        None => total,
     }
 }
 
@@ -742,5 +771,50 @@ mod tests {
         let plain_rows = render(&mut app, &plain(), 30, 12);
         let popup_rows = render_popup(&mut app, &plain(), None, 30, 12);
         assert_eq!(plain_rows, popup_rows);
+    }
+
+    #[test]
+    fn anchor_freezes_user_message_at_top() {
+        let mut app = App::new();
+        submit(&mut app, "hi");
+        assert!(app.anchor_follow());
+        // 30-wide chat wraps assistant text at 22 columns, so each
+        // 30-word reply is 5 rows. User box (3) plus one reply (5) still
+        // fits the 9-row chat area and follows the tail.
+        app.update(AppMsg::Assistant("ab ".repeat(30)));
+        let _ = render_chat(&mut app, &plain(), 30, 12);
+        assert_eq!(app.scroll_rows(), 0);
+        // Overflowing with the next reply freezes the user box at the top
+        // instead of following the tail down.
+        app.update(AppMsg::Assistant("cd ".repeat(30)));
+        let frozen = render_chat(&mut app, &plain(), 30, 12);
+        assert_eq!(app.scroll_rows(), 4);
+        let top: Vec<char> = frozen[0].chars().collect();
+        assert_eq!(&top[23..25], &['─', '─'], "user box pinned: {frozen:?}");
+        assert!(frozen[1].ends_with("│hi│"), "user text first: {frozen:?}");
+        // Streaming further grows the hidden tail but changes nothing on
+        // screen: the same 9 rows, newest rows out of view.
+        app.update(AppMsg::Assistant("ef ".repeat(30)));
+        let again = render_chat(&mut app, &plain(), 30, 12);
+        assert_eq!(app.scroll_rows(), 9);
+        assert_eq!(again, frozen);
+        assert!(!frozen.iter().any(|r| r.contains("ef")));
+    }
+
+    #[test]
+    fn without_anchor_long_replies_follow_the_tail() {
+        let mut app = App::new();
+        // No submit: Assistant items never arm the anchor.
+        app.update(AppMsg::Assistant("ab ".repeat(30)));
+        app.update(AppMsg::Assistant("cd ".repeat(30)));
+        app.update(AppMsg::Assistant("ef ".repeat(30)));
+        assert!(!app.anchor_follow());
+        let rows = render_chat(&mut app, &plain(), 30, 12);
+        // Newest reply sits at the bottom; earliest content scrolled off.
+        assert!(rows[8].contains("ef"), "tail: {rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.contains("ab")),
+            "head hidden: {rows:?}"
+        );
     }
 }
