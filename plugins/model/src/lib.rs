@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use harness_contracts::{KEY_CONFIG, KEY_MODEL_CLIENT, Message, Role, ToolCall, ToolSpec};
+use harness_contracts::{
+    CH_LLM_REQUEST_HEADERS, CH_LLM_RESPONSE_HEADERS, KEY_CONFIG, KEY_MODEL_CLIENT,
+    LlmRequestHeaders, LlmResponseHeaders, Message, Role, ToolCall, ToolSpec,
+};
 use harness_core::{Context, Plugin, PluginMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -42,21 +45,30 @@ pub enum ModelError {
     EmptyChoices,
     #[error("provider returned no message content")]
     EmptyContent,
+    #[error("request denied: {0}")]
+    Denied(String),
 }
 
 /// OpenAI-compatible `/chat/completions` client.
+///
+/// Sends through the `llm.request_headers` waterfall before each request so
+/// an optional headers plugin can inject/validate headers (or veto the
+/// send), and emits `llm.response_headers` after each response for
+/// observation. With no listeners both hooks are no-ops.
 pub struct HttpModelClient {
+    ctx: Context,
     client: reqwest::Client,
     base_url: String,
     api_key: String,
 }
 
 impl HttpModelClient {
-    pub fn new(config: &AppConfig) -> Result<Self, ModelError> {
+    pub fn new(ctx: Context, config: &AppConfig) -> Result<Self, ModelError> {
         let client = reqwest::Client::builder()
             .user_agent(&config.llm.user_agent)
             .build()?;
         Ok(HttpModelClient {
+            ctx,
             client,
             base_url: config.llm.base_url.trim_end_matches('/').to_owned(),
             api_key: config.llm.api_key.clone(),
@@ -158,6 +170,26 @@ struct RespFunction {
     arguments: String,
 }
 
+/// Applies one `(name, value)` header pair, skipping entries that fail
+/// client-side parsing instead of failing the whole request.
+fn apply_header(
+    request: reqwest::RequestBuilder,
+    name: &str,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    if !valid_header(name, value) {
+        return request;
+    }
+    request.header(name, value)
+}
+
+/// True when both sides parse as a valid HTTP header pair.
+fn valid_header(name: &str, value: &str) -> bool {
+    use std::str::FromStr;
+    reqwest::header::HeaderName::from_str(name).is_ok()
+        && reqwest::header::HeaderValue::from_str(value).is_ok()
+}
+
 impl ModelClient for HttpModelClient {
     fn complete<'a>(
         &'a self,
@@ -178,14 +210,58 @@ impl ModelClient for HttpModelClient {
                     })
                     .collect(),
             };
-            let resp = self
-                .client
-                .post(url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await?;
+            // Pre hook: optional headers plugins may inject/validate headers
+            // or veto the send. No handlers = send as seeded. Fail-closed on
+            // waterfall infra errors so a broken hook can't be bypassed.
+            let seed = vec![(
+                "authorization".to_owned(),
+                format!("Bearer {}", self.api_key),
+            )];
+            let hooked = match self
+                .ctx
+                .waterfall_key(
+                    CH_LLM_REQUEST_HEADERS,
+                    LlmRequestHeaders::allow(model, seed),
+                )
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(ModelError::Denied(format!("request hook failed: {e}")));
+                }
+            };
+            if let Some(reason) = hooked.denied.as_deref().map(str::trim) {
+                return Err(ModelError::Denied(if reason.is_empty() {
+                    "denied by headers hook".to_owned()
+                } else {
+                    format!("denied by headers hook: {reason}")
+                }));
+            }
+            let mut request = self.client.post(url);
+            for (name, value) in &hooked.headers {
+                request = apply_header(request, name, value);
+            }
+            let resp = request.json(&body).send().await?;
             let status = resp.status();
+            // Post hook (observation only): fire-and-forget so slow
+            // listeners can never stall the turn.
+            let _ = self.ctx.emit_key_detached(
+                CH_LLM_RESPONSE_HEADERS,
+                LlmResponseHeaders {
+                    model: model.to_owned(),
+                    status: status.as_u16(),
+                    headers: resp
+                        .headers()
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.to_string(),
+                                value.to_str().unwrap_or_default().to_owned(),
+                            )
+                        })
+                        .collect(),
+                },
+            );
             if !status.is_success() {
                 // Provider error bodies carry the actual reason (unknown
                 // model, bad field, auth gating, …); keep a prefix so the
@@ -244,11 +320,13 @@ impl Plugin for ModelPlugin {
         PluginMeta::new("model")
             .provides(KEY_MODEL_CLIENT)
             .injects(KEY_CONFIG)
+            .waterfalls::<LlmRequestHeaders>(CH_LLM_REQUEST_HEADERS)
+            .emits::<LlmResponseHeaders>(CH_LLM_RESPONSE_HEADERS)
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
         let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
-        let client = HttpModelClient::new(&config)
+        let client = HttpModelClient::new(ctx.clone(), &config)
             .map_err(|e| harness_core::Error::PluginPanicked("model".to_owned(), e.to_string()))?;
         ctx.provide_key(
             KEY_MODEL_CLIENT,
@@ -309,5 +387,58 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("400"), "status: {msg:?}");
         assert!(msg.contains("MissingSessionID"), "body: {msg:?}");
+    }
+
+    #[test]
+    fn invalid_header_pairs_are_rejected() {
+        assert!(valid_header("x-title", "agent"));
+        assert!(valid_header("authorization", "Bearer k"));
+        assert!(!valid_header("not a name", "v"));
+        assert!(!valid_header("x-ok", "bad\nvalue"));
+        assert!(!valid_header("", "v"));
+    }
+
+    fn test_client(ctx: harness_core::Context) -> HttpModelClient {
+        let config = AppConfig::from_toml(
+            "[llm]\nbase_url = \"http://127.0.0.1:9\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\n",
+            "test",
+        )
+        .unwrap();
+        HttpModelClient::new(ctx, &config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn denied_request_never_sends() {
+        use harness_contracts::{CH_LLM_REQUEST_HEADERS, LlmRequestHeaders};
+
+        let ctx = harness_core::Context::root();
+        ctx.on_waterfall_key::<LlmRequestHeaders, _, _>(CH_LLM_REQUEST_HEADERS, |req| async move {
+            LlmRequestHeaders::deny(req.model.clone(), req.headers.clone(), "nope")
+        })
+        .unwrap();
+        // Unroutable base URL proves nothing is sent: the veto fires first.
+        let client = test_client(ctx);
+        let err = client.complete("m", &[], &[]).await.unwrap_err();
+        assert!(matches!(err, ModelError::Denied(_)), "got: {err:?}");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn waterfall_rewrite_reaches_send() {
+        use harness_contracts::{CH_LLM_REQUEST_HEADERS, LlmRequestHeaders};
+
+        let ctx = harness_core::Context::root();
+        ctx.on_waterfall_key::<LlmRequestHeaders, _, _>(CH_LLM_REQUEST_HEADERS, |req| async move {
+            let mut next = (*req).clone();
+            // Invalid entry must be skipped, not fail the request.
+            next.headers.push(("not a name".to_owned(), "v".to_owned()));
+            next
+        })
+        .unwrap();
+        // Unroutable: any send attempt surfaces as Http, proving the
+        // waterfall ran and only the veto path short-circuits.
+        let client = test_client(ctx);
+        let err = client.complete("m", &[], &[]).await.unwrap_err();
+        assert!(matches!(err, ModelError::Http(_)), "got: {err:?}");
     }
 }

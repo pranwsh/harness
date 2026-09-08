@@ -46,6 +46,13 @@ async fn run() -> Result<ExitCode> {
     // plugin whose dependencies are not yet registered and cascades them in.
     load!(ctx, "config", config);
     load!(ctx, "model", harness_model::ModelPlugin);
+    // Optional: injects/validates LLM headers via the request waterfall and
+    // observes response headers. Omit with no effect on requests.
+    load!(
+        ctx,
+        "model-headers",
+        harness_model_headers::ModelHeadersPlugin
+    );
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);

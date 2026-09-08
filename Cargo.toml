@@ -6,6 +6,7 @@ members = [
     "harness",
     "plugins/config",
     "plugins/model",
+    "plugins/model-headers",
     "plugins/agent",
     "plugins/session",
     "plugins/tools",

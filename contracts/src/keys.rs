@@ -75,6 +75,15 @@ pub const CH_PROMPT_ASSEMBLED: &str = "prompt.assembled";
 /// `ModelSelected` — a model was chosen for an iteration (telemetry).
 pub const CH_MODEL_SELECTED: &str = "model.selected";
 
+/// `LlmRequestHeaders` — waterfall gate before an LLM HTTP request is sent.
+/// Handlers may rewrite `headers` or set `denied` to veto. No handlers =
+/// send as seeded by the model plugin.
+pub const CH_LLM_REQUEST_HEADERS: &str = "llm.request_headers";
+
+/// `LlmResponseHeaders` — an LLM HTTP response arrived (post hook,
+/// observation only).
+pub const CH_LLM_RESPONSE_HEADERS: &str = "llm.response_headers";
+
 /// `TurnStarted` — a loop turn began.
 pub const CH_TURN_STARTED: &str = "turn.started";
 /// `TurnIteration` — a loop iteration began.

@@ -682,6 +682,7 @@ dependencies = [
  "harness-hashline-edit",
  "harness-hashline-read",
  "harness-model",
+ "harness-model-headers",
  "harness-session",
  "harness-shell",
  "harness-system-prompt",
@@ -817,6 +818,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "harness-model-headers"
+version = "0.1.0"
+dependencies = [
+ "harness-config",
+ "harness-contracts",
+ "harness-core",
  "tokio",
 ]
 

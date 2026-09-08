@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -28,6 +29,12 @@ pub struct LlmConfig {
     pub model: String,
     pub api_key: String,
     pub user_agent: String,
+    /// Extra headers merged into LLM HTTP requests by the optional
+    /// model-headers plugin (`[llm.headers]` table). Empty/absent means
+    /// pass-through. `authorization` and `content-type` keys are ignored
+    /// there; auth stays owned by the model plugin.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -656,5 +663,18 @@ denied_patterns = ["CUSTOM_*"]
         let svc: Arc<ConfigService> = ctx.inject_key(KEY_CONFIG_SERVICE).unwrap();
         assert!(svc.path().is_none());
         assert_eq!(svc.get().llm.model, "test-model");
+    }
+
+    #[test]
+    fn llm_headers_default_to_empty_and_parse_when_present() {
+        let cfg = AppConfig::from_toml(RAW, "test").unwrap();
+        assert!(cfg.llm.headers.is_empty());
+
+        let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\n[llm.headers]\nx-title = \"agent\"\n";
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
+        assert_eq!(
+            cfg.llm.headers.get("x-title").map(String::as_str),
+            Some("agent")
+        );
     }
 }

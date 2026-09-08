@@ -279,6 +279,84 @@ pub struct ModelSelected {
     pub model: String,
 }
 
+/// `CH_LLM_REQUEST_HEADERS` waterfall payload: pre-send gate for LLM HTTP
+/// requests, mirroring `ToolApproval`.
+///
+/// Handlers may append/overwrite entries in `headers` or set
+/// `denied = Some(reason)` to veto the send. With no handlers the request
+/// goes out with `headers` as seeded by the model plugin. Header names and
+/// values are plain strings so this crate stays HTTP-client-free; the
+/// runner skips entries that fail client-side parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmRequestHeaders {
+    pub model: String,
+    /// `(name, value)` pairs, e.g. `("authorization", "Bearer …")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// `Some(reason)` vetoes the send; `None` allows (possibly rewritten)
+    /// `headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+impl LlmRequestHeaders {
+    pub fn allow(model: impl Into<String>, headers: Vec<(String, String)>) -> Self {
+        LlmRequestHeaders {
+            model: model.into(),
+            headers,
+            denied: None,
+        }
+    }
+
+    pub fn deny(
+        model: impl Into<String>,
+        headers: Vec<(String, String)>,
+        reason: impl Into<String>,
+    ) -> Self {
+        LlmRequestHeaders {
+            model: model.into(),
+            headers,
+            denied: Some(reason.into()),
+        }
+    }
+
+    pub fn is_denied(&self) -> bool {
+        self.denied.is_some()
+    }
+
+    /// Value of the first header whose name matches case-insensitively.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Inserts or replaces (case-insensitively) a header.
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let name = name.into();
+        let value = value.into();
+        match self
+            .headers
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+        {
+            Some(slot) => slot.1 = value,
+            None => self.headers.push((name, value)),
+        }
+    }
+}
+
+/// `CH_LLM_RESPONSE_HEADERS`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmResponseHeaders {
+    pub model: String,
+    pub status: u16,
+    /// `(name, value)` pairs as received (names lowercased by the runner).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+}
+
 /// `CH_TURN_STARTED`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStarted {
