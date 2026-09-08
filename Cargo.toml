@@ -21,6 +21,7 @@ members = [
     "plugins/tui-markdown",
     "plugins/tui-input",
     "plugins/tui-popup",
+    "plugins/tui-model",
     "plugins/tui",
 ]
 

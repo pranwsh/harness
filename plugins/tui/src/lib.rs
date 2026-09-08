@@ -12,16 +12,14 @@
 use std::sync::Arc;
 
 use harness_contracts::{
-    KEY_AGENT_LOOP, KEY_CONFIG_SERVICE, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_MODEL_SELECTOR,
-    KEY_POPUP, KEY_TUI,
+    KEY_AGENT_LOOP, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_MODEL_POPUP, KEY_POPUP, KEY_TUI,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
 
-use harness_agent_default_model::ModelSelector;
 use harness_agent_loop::AgentLoop;
-use harness_config::ConfigService;
 use harness_tui_input::Input;
+use harness_tui_model::ModelPopup;
 use harness_tui_popup::Popup;
 use harness_tui_state::render::RendererHandle;
 
@@ -38,8 +36,7 @@ pub struct Tui {
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
     popup: Arc<Popup>,
-    selector: Arc<ModelSelector>,
-    config_service: Option<Arc<ConfigService>>,
+    model_popup: Arc<ModelPopup>,
     done: mpsc::Sender<()>,
 }
 
@@ -52,8 +49,7 @@ impl Tui {
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
         popup: Arc<Popup>,
-        selector: Arc<ModelSelector>,
-        config_service: Option<Arc<ConfigService>>,
+        model_popup: Arc<ModelPopup>,
         done: mpsc::Sender<()>,
     ) -> Self {
         Tui {
@@ -63,8 +59,7 @@ impl Tui {
             renderer,
             input,
             popup,
-            selector,
-            config_service,
+            model_popup,
             done,
         }
     }
@@ -79,8 +74,7 @@ impl Tui {
             self.renderer.clone(),
             self.input.clone(),
             self.popup.clone(),
-            self.selector.clone(),
-            self.config_service.clone(),
+            self.model_popup.clone(),
         )
         .await;
         let _ = self.done.send(()).await;
@@ -105,7 +99,7 @@ impl harness_core::Plugin for TuiPlugin {
             .injects(KEY_MARKDOWN_RENDERER)
             .injects(KEY_INPUT)
             .injects(KEY_POPUP)
-            .injects(KEY_MODEL_SELECTOR)
+            .injects(KEY_MODEL_POPUP)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
@@ -113,11 +107,7 @@ impl harness_core::Plugin for TuiPlugin {
         let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER)?;
         let input: Arc<Input> = ctx.inject_key(KEY_INPUT)?;
         let popup: Arc<Popup> = ctx.inject_key(KEY_POPUP)?;
-        let selector: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR)?;
-        // Optional on purpose (no `injects` declaration, so parking behavior
-        // is unchanged): embedded/test contexts without a file-backed config
-        // degrade to session-only model switches.
-        let config_service: Option<Arc<ConfigService>> = ctx.try_inject_key(KEY_CONFIG_SERVICE);
+        let model_popup: Arc<ModelPopup> = ctx.inject_key(KEY_MODEL_POPUP)?;
         ctx.provide_key(
             KEY_TUI,
             Arc::new(Tui::new(
@@ -127,8 +117,7 @@ impl harness_core::Plugin for TuiPlugin {
                 renderer,
                 input,
                 popup,
-                selector,
-                config_service,
+                model_popup,
                 self.done.clone(),
             )),
         );

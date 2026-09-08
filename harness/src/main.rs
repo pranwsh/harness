@@ -88,6 +88,7 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "tui-input", harness_tui_input::InputPlugin);
     load!(ctx, "tui-markdown", harness_tui_markdown::MarkdownPlugin);
     load!(ctx, "tui-popup", harness_tui_popup::TuiPopupPlugin);
+    load!(ctx, "tui-model", harness_tui_model::TuiModelPlugin);
     load!(ctx, "tui", harness_tui::TuiPlugin::new(done_tx));
 
     let tui: Arc<harness_tui::Tui> = ctx.inject_key(KEY_TUI)?;

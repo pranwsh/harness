@@ -21,6 +21,7 @@ harness-shell = { path = "../plugins/shell" }
 harness-tui-markdown = { path = "../plugins/tui-markdown" }
 harness-tui-input = { path = "../plugins/tui-input" }
 harness-tui-popup = { path = "../plugins/tui-popup" }
+harness-tui-model = { path = "../plugins/tui-model" }
 harness-tui = { path = "../plugins/tui" }
 harness-contracts = { path = "../contracts" }
 tokio.workspace = true

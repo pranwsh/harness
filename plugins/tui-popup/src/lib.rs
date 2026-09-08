@@ -2,8 +2,9 @@
 //!
 //! Fully decoupled by design: this crate knows nothing about models,
 //! autocomplete, or any other domain. Providers push plain `String` items
-//! (plus a title and which item is "current"); the TUI shell owns the only
-//! bridge that fills those in and renders the snapshot above the input bar.
+//! (plus a title and which item is "current"); provider plugins such as
+//! `tui-model` own the bridge that fills those in, while the TUI shell
+//! renders the snapshot above the input bar.
 //!
 //! Provided as `Arc<Popup>` under [`KEY_POPUP`](harness_contracts::KEY_POPUP).
 //! All methods lock briefly and clone, so `draw` never holds the lock and

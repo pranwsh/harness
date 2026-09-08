@@ -8,10 +8,10 @@ use harness_config::AppConfig;
 /// Chooses which model an agent uses.
 ///
 /// Simple and UI-free: holds the configured default, an in-memory override
-/// set by the `/model` popup, and a cached catalog (seeded with the default
+/// set through the `/model` popup, and a cached catalog (seeded with the default
 /// so the popup opens instantly; refreshed from `GET {base_url}/models` in
-/// the background). Knows nothing about popups or the TUI — the TUI shell
-/// is the only bridge between this and the generic popup service.
+/// the background). Knows nothing about popups or the TUI — the tui-model
+/// plugin is the only bridge between this and the generic popup service.
 pub struct ModelSelector {
     ctx: Context,
     default: RwLock<String>,
