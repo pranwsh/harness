@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use harness_agent::AgentRegistry;
 use harness_config::AppConfig;
-use harness_model::{ModelClient, ModelClientHandle};
+use harness_model::{ModelClient, ModelClientHandle, StreamEvent};
 use harness_session::SessionLog;
 use harness_system_prompt::PromptAssembler;
 use harness_tools::Tools;
@@ -23,7 +23,10 @@ use harness_agent_default_model::ModelSelector;
 pub enum TurnEvent {
     Started,
     Iteration(u32),
-    Assistant(String),
+    /// A slice of assistant text, to display immediately. Slices for one
+    /// reply arrive in order; the loop stores the full message once it
+    /// completes and never re-emits it whole.
+    AssistantDelta(String),
     ToolStarted(ToolCall),
     ToolResult(ToolCall, Result<String, harness_contracts::ToolError>),
     Completed(u32),
@@ -210,21 +213,26 @@ impl TurnTask {
                 &history,
             );
 
-            // 2. Pick model, call it.
+            // 2. Pick model, stream it. Text slices go out immediately;
+            // the full message is stored once it completes.
             let model = self.selector.select(&self.agent_id);
-            let reply = self
-                .model
-                .complete(&model, &messages, &self.tools.specs())
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut stream = Arc::clone(&self.model).stream(&model, &messages, &self.tools.specs());
+            let reply = loop {
+                match stream.recv().await {
+                    Some(StreamEvent::Content(delta)) => {
+                        let _ = self.tx.send(TurnEvent::AssistantDelta(delta)).await;
+                    }
+                    Some(StreamEvent::Done(message)) => break message,
+                    Some(StreamEvent::Failed(err)) => return Err(err),
+                    // The producer task died without a terminal event:
+                    // surface as a turn failure; shown text stays visible.
+                    None => return Err("model stream ended without a response".to_owned()),
+                }
+            };
 
-            // 3. Record the assistant message.
+            // 3. Record the assistant message (deltas already displayed).
             self.sessions
                 .append(&self.session_id, self.turn_no, Entry::from_message(&reply));
-            let _ = self
-                .tx
-                .send(TurnEvent::Assistant(reply.content.clone()))
-                .await;
 
             // 4. No tool calls → done. Otherwise execute each call; the
             //    session plugin's sync listener has already appended the

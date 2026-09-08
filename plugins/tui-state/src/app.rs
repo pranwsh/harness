@@ -67,6 +67,9 @@ pub enum AppMsg {
     Key(KeyEvent),
     /// An assistant text chunk arrived on a turn stream.
     Assistant(String),
+    /// A streamed assistant text slice: appended to the trailing assistant
+    /// item when there is one, otherwise starts a new one.
+    AssistantDelta(String),
     /// A tool call started on a turn stream.
     ToolStarted(ToolCall),
     /// A tool call finished on a turn stream.
@@ -256,6 +259,17 @@ impl App {
             AppMsg::Key(key) => self.on_key(key),
             AppMsg::Assistant(text) => {
                 self.push(ChatItem::new(text, ItemKind::Assistant));
+                Effect::redraw()
+            }
+            AppMsg::AssistantDelta(delta) => {
+                // Streaming append: slices extend the in-progress reply so
+                // the transcript holds one item per reply, not per slice.
+                // Scroll position is untouched, so a pinned tail follows
+                // while a scrolled-up view stays put.
+                match self.items.last_mut() {
+                    Some(item) if item.kind == ItemKind::Assistant => item.text.push_str(&delta),
+                    _ => self.push(ChatItem::new(delta, ItemKind::Assistant)),
+                }
                 Effect::redraw()
             }
             AppMsg::ToolStarted(call) => {
@@ -839,6 +853,45 @@ mod tests {
         assert!(app.update(AppMsg::Notice("model → x".into())));
         assert_eq!(last(&app).kind, ItemKind::Notice);
         assert_eq!(last(&app).text, "model → x");
+    }
+
+    #[test]
+    fn assistant_deltas_append_to_one_item() {
+        let mut app = App::new();
+        assert!(app.update(AppMsg::AssistantDelta("hel".into())));
+        assert!(app.update(AppMsg::AssistantDelta("lo".into())));
+        assert_eq!(app.items().len(), 1);
+        assert_eq!(last(&app).kind, ItemKind::Assistant);
+        assert_eq!(last(&app).text, "hello");
+    }
+
+    #[test]
+    fn assistant_delta_starts_new_item_after_other_kinds() {
+        let mut app = App::new();
+        assert!(app.update(AppMsg::AssistantDelta("first".into())));
+        assert!(app.update(AppMsg::Completed(1)));
+        assert!(app.update(AppMsg::AssistantDelta("second".into())));
+        assert_eq!(app.items().len(), 3);
+        assert_eq!(app.items()[0].text, "first");
+        assert_eq!(app.items()[2].text, "second");
+        // A delta keeps extending only the trailing reply.
+        assert!(app.update(AppMsg::AssistantDelta("!".into())));
+        assert_eq!(app.items().len(), 3);
+        assert_eq!(app.items()[2].text, "second!");
+    }
+
+    #[test]
+    fn assistant_deltas_do_not_disturb_chat_scroll() {
+        let mut app = App::new();
+        for i in 0..3 {
+            app.update(AppMsg::Assistant(format!("m{i}")));
+        }
+        assert!(app.update(key(KeyEvent::PageUp)));
+        assert!(!app.follows());
+        let pinned = app.scroll_rows();
+        assert!(app.update(AppMsg::AssistantDelta("more".into())));
+        assert_eq!(app.scroll_rows(), pinned);
+        assert!(!app.follows());
     }
 
     #[test]

@@ -254,7 +254,7 @@ impl EventLoop {
                 let msg = match event {
                     // Lifecycle bookkeeping the chat pane doesn't render.
                     TurnEvent::Started | TurnEvent::Iteration(_) => continue,
-                    TurnEvent::Assistant(text) => AppMsg::Assistant(text),
+                    TurnEvent::AssistantDelta(delta) => AppMsg::AssistantDelta(delta),
                     TurnEvent::ToolStarted(call) => AppMsg::ToolStarted(call),
                     TurnEvent::ToolResult(call, result) => AppMsg::ToolResult(call, result),
                     TurnEvent::Completed(n) => AppMsg::Completed(n),

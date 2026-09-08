@@ -115,14 +115,19 @@ async fn completes_after_tool_round_trip() {
     let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
     let events = drain(loop_svc.run("a1", "s1", "hello")).await;
 
-    // Stream shape: started, iter1, assistant, tool, iter2, assistant, done.
+    // Stream shape: started, iter1, deltas, tool, iter2, deltas, done.
+    // The fake model replays each reply as one slice via the default
+    // `stream` impl, so each reply surfaces as exactly one delta.
     assert!(matches!(events.first(), Some(TurnEvent::Started)));
     assert!(matches!(events.last(), Some(TurnEvent::Completed(2))));
-    let assistant = events
+    let deltas: Vec<&str> = events
         .iter()
-        .filter(|e| matches!(e, TurnEvent::Assistant(_)))
-        .count();
-    assert_eq!(assistant, 2);
+        .filter_map(|e| match e {
+            TurnEvent::AssistantDelta(d) => Some(d.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["let me check", "all done"]);
 
     // Session: user, assistant+calls, tool result, assistant — in order.
     let log: Arc<SessionLog> = ctx.inject_key(KEY_SESSIONS).unwrap();
