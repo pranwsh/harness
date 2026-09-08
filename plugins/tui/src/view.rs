@@ -6,9 +6,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
 
+use harness_tui_popup::ActivePopup;
 use harness_tui_state::{
     app::{App, ChatItem, INPUT_VISIBLE_ROWS, ItemKind, max_chat_scroll},
     render::{ASSISTANT_BASE, MessageRenderer},
@@ -17,6 +18,11 @@ use harness_tui_state::{
 
 /// Margin, in columns, on each side of assistant/tool/notice output.
 const SIDE_MARGIN: u16 = 4;
+
+/// Max popup rows including its border, so a huge `/models` catalog never
+/// eats the whole chat pane (the list itself is not scrollable in v1; the
+/// catalog is small and the cap only guards tiny terminals).
+const MAX_POPUP_HEIGHT: u16 = 10;
 
 /// Single source for box corners: user messages (synthesized text rows)
 /// and the input box (`Block`) both use rounded corners from here.
@@ -29,6 +35,20 @@ const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 /// messages render through `renderer`, keeping this module free of any
 /// markdown engine dependency.
 pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer) {
+    draw_with_popup(f, app, renderer, None);
+}
+
+/// Same as [`draw`], plus a floating single-list popup anchored directly
+/// above the input box when `popup` is `Some`. The popup is a pure overlay:
+/// chat geometry is untouched, `Clear` erases the chat rows underneath, and
+/// the terminal cursor stays in the input box (set by `draw_input` before
+/// the popup renders; list widgets never move it).
+pub fn draw_with_popup(
+    f: &mut Frame,
+    app: &mut App,
+    renderer: &dyn MessageRenderer,
+    popup: Option<&ActivePopup>,
+) {
     let area = f.area();
     app.set_input_width(area.width.saturating_sub(2).max(1) as usize);
     let input_height = app.input_rows().min(INPUT_VISIBLE_ROWS) as u16 + 2;
@@ -37,6 +57,9 @@ pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer) {
 
     draw_chat(f, app, chat_area, renderer);
     draw_input(f, app, input_area);
+    if let Some(popup) = popup {
+        draw_popup(f, chat_area, input_area, popup);
+    }
 }
 
 /// One chat item laid out for the current chat-area width: position,
@@ -164,6 +187,69 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         x: inner.x.saturating_add(col),
         y: inner.y.saturating_add(row as u16),
     });
+}
+
+/// Floating list anchored directly above the input box. The popup owns a
+/// rounded border (same corners as the input box); the arrow-key cursor is
+/// the highlighted (reversed + bold) row, while the active value (e.g. the
+/// current model) carries a `●` marker so cursor and value never conflate.
+fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePopup) {
+    if input_area.width == 0 || chat_area.height == 0 {
+        return;
+    }
+    let want = popup.items.len().max(1) as u16 + 2;
+    let height = want
+        .min(MAX_POPUP_HEIGHT)
+        .min(chat_area.height.max(1))
+        .min(input_area.y.saturating_sub(chat_area.y).max(1));
+    if height < 3 || input_area.y < chat_area.y {
+        return;
+    }
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    if area.width < 4 {
+        return;
+    }
+    let selected = popup.selected.min(popup.items.len().saturating_sub(1));
+    let items: Vec<ListItem<'static>> = popup
+        .items
+        .iter()
+        .map(|item| {
+            let marker = if popup.current.as_deref() == Some(item.as_str()) {
+                "● "
+            } else {
+                "  "
+            };
+            ListItem::new(Line::from(format!("{marker}{item}")))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BOX_BORDER_TYPE)
+                .border_style(Style::new().fg(Color::Cyan))
+                .title(format!(" {} ", popup.title))
+                .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        )
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Never);
+    f.render_widget(Clear, area);
+    let mut state = ratatui::widgets::ListState::default();
+    if !popup.items.is_empty() {
+        state.select(Some(selected));
+    }
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 /// Lays out one chat item for a chat area of `area_width` columns.
@@ -602,5 +688,59 @@ mod tests {
         assert_eq!(input.len(), 4, "input box: {input:?}");
         assert!(input[1].contains("ab"), "first line: {input:?}");
         assert!(input[2].contains("cd"), "second line: {input:?}");
+    }
+
+    /// Renders `draw_with_popup` on a fixed-size test backend.
+    fn render_popup(
+        app: &mut App,
+        renderer: &dyn MessageRenderer,
+        popup: Option<&harness_tui_popup::ActivePopup>,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| draw_with_popup(f, app, renderer, popup))
+            .expect("test draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn model_popup_floats_above_input_with_border() {
+        let mut app = App::new();
+        let popup = harness_tui_popup::ActivePopup {
+            title: " model ".into(),
+            items: vec!["aaa".into(), "bbb".into()],
+            selected: 1,
+            current: Some("aaa".into()),
+        };
+        let rows = render_popup(&mut app, &plain(), Some(&popup), 30, 12);
+        // Input box is 3 rows at the bottom (rows 9..=11); the 4-row popup
+        // (border + 2 items + border) sits directly above it (rows 5..=8).
+        assert!(rows[5].contains("model"), "title: {rows:?}");
+        assert!(rows[6].contains("aaa"), "current: {rows:?}");
+        assert!(rows[6].contains("●"), "current marker: {rows:?}");
+        assert!(rows[7].contains("bbb"), "selected: {rows:?}");
+        assert!(rows[9].contains("input"), "input intact: {rows:?}");
+    }
+
+    #[test]
+    fn no_popup_renders_like_plain_draw() {
+        let mut app = App::new();
+        let plain_rows = render(&mut app, &plain(), 30, 12);
+        let popup_rows = render_popup(&mut app, &plain(), None, 30, 12);
+        assert_eq!(plain_rows, popup_rows);
     }
 }

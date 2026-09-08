@@ -11,12 +11,16 @@
 
 use std::sync::Arc;
 
-use harness_contracts::{KEY_AGENT_LOOP, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_TUI};
+use harness_contracts::{
+    KEY_AGENT_LOOP, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_MODEL_SELECTOR, KEY_POPUP, KEY_TUI,
+};
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
 
+use harness_agent_default_model::ModelSelector;
 use harness_agent_loop::AgentLoop;
 use harness_tui_input::Input;
+use harness_tui_popup::Popup;
 use harness_tui_state::render::RendererHandle;
 
 pub mod runtime;
@@ -31,16 +35,21 @@ pub struct Tui {
     session_id: String,
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
+    popup: Arc<Popup>,
+    selector: Arc<ModelSelector>,
     done: mpsc::Sender<()>,
 }
 
 impl Tui {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_loop: Arc<AgentLoop>,
         agent_id: impl Into<String>,
         session_id: impl Into<String>,
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
+        popup: Arc<Popup>,
+        selector: Arc<ModelSelector>,
         done: mpsc::Sender<()>,
     ) -> Self {
         Tui {
@@ -49,6 +58,8 @@ impl Tui {
             session_id: session_id.into(),
             renderer,
             input,
+            popup,
+            selector,
             done,
         }
     }
@@ -62,6 +73,8 @@ impl Tui {
             self.session_id.clone(),
             self.renderer.clone(),
             self.input.clone(),
+            self.popup.clone(),
+            self.selector.clone(),
         )
         .await;
         let _ = self.done.send(()).await;
@@ -85,12 +98,16 @@ impl harness_core::Plugin for TuiPlugin {
             .injects(KEY_AGENT_LOOP)
             .injects(KEY_MARKDOWN_RENDERER)
             .injects(KEY_INPUT)
+            .injects(KEY_POPUP)
+            .injects(KEY_MODEL_SELECTOR)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         let agent_loop: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP)?;
         let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER)?;
         let input: Arc<Input> = ctx.inject_key(KEY_INPUT)?;
+        let popup: Arc<Popup> = ctx.inject_key(KEY_POPUP)?;
+        let selector: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR)?;
         ctx.provide_key(
             KEY_TUI,
             Arc::new(Tui::new(
@@ -99,6 +116,8 @@ impl harness_core::Plugin for TuiPlugin {
                 "session-1",
                 renderer,
                 input,
+                popup,
+                selector,
                 self.done.clone(),
             )),
         );

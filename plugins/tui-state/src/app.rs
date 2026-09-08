@@ -78,6 +78,8 @@ pub enum AppMsg {
     /// A turn's stream ended (always sent exactly once per spawned
     /// turn, after `Completed`/`Failed`); releases the busy slot.
     TurnFinished,
+    /// A non-turn system line (e.g. `/model` changed the active model).
+    Notice(String),
     /// A mouse-wheel notch over the chat pane: scroll up by a step.
     ScrollUp,
     /// A mouse-wheel notch over the chat pane: scroll down by a step.
@@ -171,6 +173,14 @@ impl App {
     /// Current input text.
     pub fn input(&self) -> &str {
         self.editor.text()
+    }
+
+    /// Discards the current input line (used when `/model` is hijacked to
+    /// open the popup instead of submitting as chat).
+    pub fn clear_input(&mut self) {
+        let _ = self.editor.take();
+        self.input_scroll = 0;
+        self.follow_input_cursor();
     }
 
     /// Byte cursor offset within the input, for render-time positioning.
@@ -282,6 +292,10 @@ impl App {
             }
             AppMsg::TurnFinished => {
                 self.turn_finished();
+                Effect::redraw()
+            }
+            AppMsg::Notice(text) => {
+                self.push(ChatItem::new(text, ItemKind::Notice));
                 Effect::redraw()
             }
             AppMsg::ScrollUp => {
@@ -817,5 +831,23 @@ mod tests {
         app.set_chat_geometry(5, 9);
         assert_eq!(app.scroll_rows(), 0);
         assert!(app.follows());
+    }
+
+    #[test]
+    fn notice_appends_system_line() {
+        let mut app = App::new();
+        assert!(app.update(AppMsg::Notice("model → x".into())));
+        assert_eq!(last(&app).kind, ItemKind::Notice);
+        assert_eq!(last(&app).text, "model → x");
+    }
+
+    #[test]
+    fn clear_input_discards_model_command() {
+        let mut app = App::new();
+        type_text(&mut app, "/model");
+        assert_eq!(app.input(), "/model");
+        app.clear_input();
+        assert_eq!(app.input(), "");
+        assert_eq!(app.input_scroll(), 0);
     }
 }

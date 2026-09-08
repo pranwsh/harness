@@ -32,6 +32,11 @@ pub const KEY_MARKDOWN_RENDERER: &str = "markdown.renderer";
 /// `Arc<Input>` — provided by the tui-input plugin, injected by the tui
 /// plugin to read terminal key/mouse events.
 pub const KEY_INPUT: &str = "ui.input";
+/// `Arc<Popup>` — provided by the tui-popup plugin, injected by the tui
+/// plugin to show a single floating list above the input bar. Generic
+/// single-select state only; providers push plain `String` items so the
+/// popup never depends on any domain plugin.
+pub const KEY_POPUP: &str = "ui.popup";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
 pub const KEY_HASH_STORE: &str = "hash.store";

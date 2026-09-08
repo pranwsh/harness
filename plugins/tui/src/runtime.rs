@@ -12,10 +12,12 @@ use crossterm::{
 };
 use tokio::sync::mpsc;
 
+use harness_agent_default_model::ModelSelector;
 use harness_agent_loop::{AgentLoop, TurnEvent};
 use harness_tui_input::Input;
+use harness_tui_popup::Popup;
 use harness_tui_state::{
-    app::{App, AppMsg},
+    app::{App, AppMsg, KeyEvent},
     render::RendererHandle,
 };
 
@@ -34,12 +36,16 @@ pub async fn run(
     session_id: String,
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
+    popup: Arc<Popup>,
+    selector: Arc<ModelSelector>,
 ) {
     let terminal = ratatui::init();
     enable_terminal_features();
-    let result = EventLoop::new(agent_loop, agent_id, session_id, renderer, input)
-        .run(terminal)
-        .await;
+    let result = EventLoop::new(
+        agent_loop, agent_id, session_id, renderer, input, popup, selector,
+    )
+    .run(terminal)
+    .await;
     disable_terminal_features();
     ratatui::restore();
     if let Err(err) = result {
@@ -77,6 +83,8 @@ struct EventLoop {
     session_id: String,
     app: App,
     renderer: Arc<RendererHandle>,
+    popup: Arc<Popup>,
+    selector: Arc<ModelSelector>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
 }
@@ -88,6 +96,8 @@ impl EventLoop {
         session_id: String,
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
+        popup: Arc<Popup>,
+        selector: Arc<ModelSelector>,
     ) -> Self {
         // Bound generous enough to absorb bursts of stream events; the
         // input task bails out if the loop ever stops draining.
@@ -99,6 +109,8 @@ impl EventLoop {
             session_id,
             app: App::new(),
             renderer,
+            popup,
+            selector,
             tx,
             rx,
         }
@@ -109,8 +121,16 @@ impl EventLoop {
         mut terminal: ratatui::DefaultTerminal,
     ) -> std::result::Result<(), String> {
         loop {
+            let snapshot = self.popup.snapshot();
             terminal
-                .draw(|f| view::draw(f, &mut self.app, self.renderer.as_renderer()))
+                .draw(|f| {
+                    view::draw_with_popup(
+                        f,
+                        &mut self.app,
+                        self.renderer.as_renderer(),
+                        snapshot.as_ref(),
+                    )
+                })
                 .map_err(|e| e.to_string())?;
 
             let msg = tokio::select! {
@@ -121,6 +141,23 @@ impl EventLoop {
                 _ = tokio::time::sleep(RENDER_TICK) => continue,
             };
 
+            // Popup-first key routing: while open, arrows/Enter/Esc belong
+            // to the popup and never reach the editor; `/model` Enter opens
+            // it instead of submitting as chat.
+            if let AppMsg::Key(key) = &msg {
+                if self.popup.is_open() {
+                    if self.handle_popup_key(*key) {
+                        if self.app.should_quit() {
+                            break;
+                        }
+                        continue;
+                    }
+                } else if *key == KeyEvent::Enter && self.app.input().trim() == "/model" {
+                    self.open_model_popup();
+                    continue;
+                }
+            }
+
             let effect = self.app.reduce(msg);
             if let Some(input) = effect.submitted {
                 self.spawn_turn(input);
@@ -130,6 +167,56 @@ impl EventLoop {
             }
         }
         Ok(())
+    }
+
+    /// Handles one key while the model popup is open. Returns `true` when
+    /// the key belonged to the popup (consumed; never reaches `App`).
+    /// `Up`/`Down` move the cursor, `Esc` dismisses, `Enter` selects the
+    /// highlighted model and resumes normal input. Anything else is
+    /// swallowed so typing can't leak into the cleared editor mid-select.
+    fn handle_popup_key(&mut self, key: KeyEvent) -> bool {
+        match key {
+            KeyEvent::Up => {
+                self.popup.move_up();
+                true
+            }
+            KeyEvent::Down => {
+                self.popup.move_down();
+                true
+            }
+            KeyEvent::Esc => {
+                self.popup.close();
+                true
+            }
+            KeyEvent::Enter => {
+                if let Some(model) = self.popup.selected_item() {
+                    self.selector.set_current(&model);
+                    self.app.update(AppMsg::Notice(format!("model → {model}")));
+                }
+                self.popup.close();
+                true
+            }
+            KeyEvent::Interrupt => false,
+            _ => true,
+        }
+    }
+
+    /// Opens the model popup for an exact `/model` Enter: clears the
+    /// command line, shows the cached catalog instantly, then refreshes
+    /// `GET {base_url}/models` in the background without blocking input.
+    fn open_model_popup(&mut self) {
+        let current = self.selector.current();
+        let models = self.selector.models();
+        let selected = models.iter().position(|m| *m == current).unwrap_or(0);
+        self.app.clear_input();
+        self.popup.open(" model ", models, selected, Some(current));
+        let selector = self.selector.clone();
+        let popup = self.popup.clone();
+        tokio::spawn(async move {
+            if let Some(ids) = selector.refresh().await {
+                popup.refresh_items(ids, Some(selector.current()));
+            }
+        });
     }
 
     /// Spawns a task that runs one agent turn and forwards its stream
@@ -162,3 +249,4 @@ impl EventLoop {
         });
     }
 }
+

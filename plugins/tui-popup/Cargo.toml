@@ -1,11 +1,8 @@
 [package]
-name = "harness-agent-default-model"
+name = "harness-tui-popup"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-config = { path = "../config" }
-reqwest.workspace = true
-serde_json.workspace = true

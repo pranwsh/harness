@@ -689,6 +689,7 @@ dependencies = [
  "harness-tui",
  "harness-tui-input",
  "harness-tui-markdown",
+ "harness-tui-popup",
  "tokio",
 ]
 
@@ -708,6 +709,8 @@ dependencies = [
  "harness-config",
  "harness-contracts",
  "harness-core",
+ "reqwest",
+ "serde_json",
 ]
 
 [[package]]
@@ -863,11 +866,13 @@ name = "harness-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "harness-agent-default-model",
  "harness-agent-loop",
  "harness-contracts",
  "harness-core",
  "harness-tui-input",
  "harness-tui-markdown",
+ "harness-tui-popup",
  "harness-tui-state",
  "ratatui",
  "tokio",
@@ -896,6 +901,14 @@ dependencies = [
  "ratatui",
  "syntect",
  "unicode-width",
+]
+
+[[package]]
+name = "harness-tui-popup"
+version = "0.1.0"
+dependencies = [
+ "harness-contracts",
+ "harness-core",
 ]
 
 [[package]]
