@@ -9,6 +9,11 @@
 //! Presence-based opt-out: an empty `[llm.headers]` table is a pass-through
 //! (auth validation still applies), and omitting this plugin from the
 //! harness changes nothing — the waterfall is a no-op without handlers.
+//!
+//! The post-hook log line is opt-in via `HARNESS_LOG_LLM_HEADERS`: anything
+//! written to stderr while the TUI owns the screen corrupts the display
+//! (it shows up as ghost text in the input box), so observation stays silent
+//! by default.
 
 use std::sync::Arc;
 
@@ -29,6 +34,13 @@ const OBSERVED_HEADERS: &[&str] = &[
     "retry-after",
 ];
 
+/// Opt-in stderr logging for the post hook. Off by default: writing to
+/// stderr while the TUI owns the terminal sprays ghost text into the input
+/// box, so observation only prints when explicitly enabled.
+pub fn observe_enabled() -> bool {
+    std::env::var_os("HARNESS_LOG_LLM_HEADERS").is_some()
+}
+
 /// Generates one session id (UUID4) per plugin load. The id is reused for
 /// every request of the process lifetime, matching the official client's
 /// `X-Session-ID` attribution header.
@@ -48,8 +60,7 @@ pub fn check_request(
     session_id: &str,
 ) -> LlmRequestHeaders {
     for (name, value) in &config.llm.headers {
-        if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("content-type")
-        {
+        if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("content-type") {
             continue;
         }
         req.set(name.clone(), value.clone());
@@ -101,7 +112,9 @@ impl harness_core::Plugin for ModelHeadersPlugin {
             async move { check_request(&config, (*req).clone(), &session_id) }
         })?;
         ctx.on_key::<LlmResponseHeaders, _, _>(CH_LLM_RESPONSE_HEADERS, |resp| async move {
-            eprintln!("{}", format_observed(&resp));
+            if observe_enabled() {
+                eprintln!("{}", format_observed(&resp));
+            }
         })?;
         Ok(())
     }
