@@ -28,6 +28,12 @@ pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// Optional `User-Agent` sent on LLM HTTP requests. Empty/absent means
+    /// no `User-Agent` header goes out at all — the right default for most
+    /// providers. Note: the Zen free tier gates on an `opencode/...` value,
+    /// so point `user_agent` at one (or set per-request `User-Agent` under
+    /// `[llm.headers]`) when using `opencode.ai/zen`.
+    #[serde(default)]
     pub user_agent: String,
     /// Extra headers merged into LLM HTTP requests by the optional
     /// model-headers plugin (`[llm.headers]` table). Empty/absent means
@@ -676,5 +682,12 @@ denied_patterns = ["CUSTOM_*"]
             cfg.llm.headers.get("x-title").map(String::as_str),
             Some("agent")
         );
+    }
+
+    #[test]
+    fn user_agent_defaults_to_empty_when_absent() {
+        let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\n";
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
+        assert_eq!(cfg.llm.user_agent, "");
     }
 }

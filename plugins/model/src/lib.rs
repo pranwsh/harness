@@ -64,9 +64,13 @@ pub struct HttpModelClient {
 
 impl HttpModelClient {
     pub fn new(ctx: Context, config: &AppConfig) -> Result<Self, ModelError> {
-        let client = reqwest::Client::builder()
-            .user_agent(&config.llm.user_agent)
-            .build()?;
+        // No `User-Agent` header goes out at all when unconfigured; reqwest
+        // only sends one when the builder flag is set.
+        let mut builder = reqwest::Client::builder();
+        if !config.llm.user_agent.trim().is_empty() {
+            builder = builder.user_agent(&config.llm.user_agent);
+        }
+        let client = builder.build()?;
         Ok(HttpModelClient {
             ctx,
             client,
@@ -405,6 +409,20 @@ mod tests {
         )
         .unwrap();
         HttpModelClient::new(ctx, &config).unwrap()
+    }
+
+    #[test]
+    fn client_builds_without_user_agent() {
+        // Absent/empty UA must not fail construction; no `User-Agent`
+        // header goes out in that case.
+        for raw in [
+            "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\n",
+            "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"  \"\n",
+        ] {
+            let config = AppConfig::from_toml(raw, "test").unwrap();
+            assert_eq!(config.llm.user_agent.trim(), "");
+            let _ = HttpModelClient::new(harness_core::Context::root(), &config).unwrap();
+        }
     }
 
     #[tokio::test]

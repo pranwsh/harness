@@ -53,7 +53,9 @@ pub fn new_session_id() -> String {
 ///
 /// Configured names merge case-insensitively, except `authorization` and
 /// `content-type`, which stay owned by the model plugin and are never
-/// overridden from config. An empty bearer vetoes the send.
+/// overridden from config. `User-Agent` may be set here per request, which
+/// is also the escape hatch when `user_agent` is left empty in config.
+/// An empty bearer vetoes the send.
 pub fn check_request(
     config: &AppConfig,
     mut req: LlmRequestHeaders,
