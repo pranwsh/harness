@@ -41,6 +41,15 @@ pub struct LlmConfig {
     /// there; auth stays owned by the model plugin.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    /// Model ids that must use the OpenAI Responses transport
+    /// (`POST {base_url}/responses`) instead of chat completions. Extends
+    /// the model plugin's built-in table (currently the `muse-spark-`
+    /// family, which Zen serves on Responses only); empty/absent means
+    /// "built-ins only". Lets future endpoint migrations be handled in
+    /// config without a code change, as long as the model speaks a
+    /// protocol the client already implements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -689,5 +698,15 @@ denied_patterns = ["CUSTOM_*"]
         let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\n";
         let cfg = AppConfig::from_toml(raw, "test").unwrap();
         assert_eq!(cfg.llm.user_agent, "");
+    }
+
+    #[test]
+    fn responses_models_default_to_empty_and_parse_when_present() {
+        let cfg = AppConfig::from_toml(RAW, "test").unwrap();
+        assert!(cfg.llm.responses_models.is_empty());
+
+        let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\nresponses_models = [\"future-1\", \"future-2\"]\n";
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
+        assert_eq!(cfg.llm.responses_models, vec!["future-1", "future-2"]);
     }
 }

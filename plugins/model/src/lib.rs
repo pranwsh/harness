@@ -10,6 +10,14 @@ use thiserror::Error;
 
 use harness_config::AppConfig;
 
+mod responses;
+
+pub use responses::Transport;
+use responses::{
+    ResponsesAccum, ResponsesFoldEnd, ResponsesResponse, assemble_responses_output,
+    assemble_responses_stream, fold_responses_bytes, responses_body, transport_for,
+};
+
 /// Boxed completion future returned by [`ModelClient`].
 pub type CompletionFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<Message, ModelError>> + Send + 'a>>;
@@ -97,17 +105,20 @@ pub enum ModelError {
     Denied(String),
 }
 
-/// OpenAI-compatible `/chat/completions` client.
+/// OpenAI-compatible `/chat/completions` client, with an OpenAI Responses
+/// (`/responses`) transport for models that need it.
 ///
-/// Sends through the `llm.request_headers` waterfall before each request so
-/// an optional headers plugin can inject/validate headers (or veto the
-/// send), and emits `llm.response_headers` after each response for
-/// observation. With no listeners both hooks are no-ops.
+/// Transport selection is per model id ([`Transport`]): chat completions is
+/// the default, while the `muse-spark-` family plus `[llm.responses_models]`
+/// ids route to Responses. Both modes share the `llm.request_headers`
+/// waterfall (pre-send hook) and the `llm.response_headers` emit (post
+/// hook); with no listeners both hooks are no-ops.
 pub struct HttpModelClient {
     ctx: Context,
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    responses_models: Vec<String>,
 }
 
 impl HttpModelClient {
@@ -124,7 +135,13 @@ impl HttpModelClient {
             client,
             base_url: config.llm.base_url.trim_end_matches('/').to_owned(),
             api_key: config.llm.api_key.clone(),
+            responses_models: config.llm.responses_models.clone(),
         })
+    }
+
+    /// Which wire protocol serves `model` (see [`Transport`]).
+    pub fn transport(&self, model: &str) -> Transport {
+        transport_for(model, &self.responses_models)
     }
 
     /// Pre hook shared by both modes: optional headers plugins may
@@ -196,6 +213,57 @@ impl HttpModelClient {
             request = apply_header(request, name, value);
         }
         request
+    }
+
+    /// One non-streaming chat completion.
+    async fn complete_chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Message, ModelError> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = completion_body(model, messages, tools, false);
+        let hooked = self.gate_request(model).await?;
+        let resp = self
+            .with_headers(self.client.post(url), &hooked.headers)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        self.observe_response(model, status, resp.headers());
+        if !status.is_success() {
+            // Provider error bodies carry the actual reason (unknown
+            // model, bad field, auth gating, …); keep a prefix so the
+            // message stays one line in the TUI.
+            let raw = resp.text().await.unwrap_or_default();
+            let body: String = raw.chars().take(300).collect();
+            return Err(ModelError::Provider { status, body });
+        }
+        let resp: CompletionResponse = resp.json().await?;
+
+        let choice = resp
+            .choices
+            .into_iter()
+            .next()
+            .ok_or(ModelError::EmptyChoices)?;
+        let msg = choice.message;
+        let tool_calls: Vec<ToolCall> = msg
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| ToolCall {
+                id: c.id,
+                name: c.function.name,
+                arguments: c.function.arguments,
+            })
+            .collect();
+
+        let content = msg.content.unwrap_or_default();
+        if content.is_empty() && tool_calls.is_empty() {
+            return Err(ModelError::EmptyContent);
+        }
+        Ok(Message::assistant_with_calls(content, tool_calls))
     }
 
     /// Streams one completion, forwarding text slices immediately and
@@ -275,6 +343,134 @@ impl HttpModelClient {
             }
         }
         match assemble_stream(accum) {
+            Some(msg) => {
+                let _ = tx.send(StreamEvent::Done(msg)).await;
+            }
+            None => {
+                let _ = tx
+                    .send(StreamEvent::Failed(
+                        "provider returned no message content".to_owned(),
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    /// Runs one non-streaming Responses completion and resolves it to the
+    /// fully assembled message.
+    async fn complete_responses(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Message, ModelError> {
+        let url = format!("{}/responses", self.base_url);
+        let body = responses_body(model, messages, tools, false);
+        let hooked = self.gate_request(model).await?;
+        let resp = self
+            .with_headers(self.client.post(url), &hooked.headers)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        self.observe_response(model, status, resp.headers());
+        if !status.is_success() {
+            // Same one-line provider error shape as chat completions mode.
+            let raw = resp.text().await.unwrap_or_default();
+            let body: String = raw.chars().take(300).collect();
+            return Err(ModelError::Provider { status, body });
+        }
+        let parsed: ResponsesResponse = resp.json().await?;
+        if parsed.status == "failed" {
+            let detail: String = parsed
+                .error
+                .as_ref()
+                .and_then(responses::responses_error_message)
+                .unwrap_or_else(|| "response failed".to_owned())
+                .chars()
+                .take(300)
+                .collect();
+            return Err(ModelError::Provider {
+                status,
+                body: detail,
+            });
+        }
+        assemble_responses_output(parsed.output).ok_or(ModelError::EmptyContent)
+    }
+
+    /// Streams one Responses completion, forwarding text slices immediately
+    /// and resolving to the fully assembled message. Runs on a spawned task
+    /// so `stream` can hand back the receiver synchronously.
+    async fn run_responses_stream(
+        self: Arc<Self>,
+        model: String,
+        messages: Vec<Message>,
+        tools: Vec<ToolSpec>,
+        tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) {
+        let hooked = match self.gate_request(&model).await {
+            Ok(hooked) => hooked,
+            Err(err) => {
+                let _ = tx.send(StreamEvent::Failed(err.to_string())).await;
+                return;
+            }
+        };
+        let url = format!("{}/responses", self.base_url);
+        let body = responses_body(&model, &messages, &tools, true);
+        let resp = match self
+            .with_headers(self.client.post(url), &hooked.headers)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let _ = tx.send(StreamEvent::Failed(err.to_string())).await;
+                return;
+            }
+        };
+        let status = resp.status();
+        self.observe_response(&model, status, resp.headers());
+        if !status.is_success() {
+            // Same one-line provider error shape as chat completions mode.
+            let raw = resp.text().await.unwrap_or_default();
+            let body: String = raw.chars().take(300).collect();
+            let _ = tx
+                .send(StreamEvent::Failed(format!(
+                    "provider error {status}: {body}"
+                )))
+                .await;
+            return;
+        }
+        let mut accum = ResponsesAccum::default();
+        let mut buffer = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut byte_stream = resp.bytes_stream();
+        use futures::StreamExt;
+        loop {
+            let Some(chunk) = byte_stream.next().await else {
+                break;
+            };
+            let Ok(bytes) = chunk else {
+                let _ = tx
+                    .send(StreamEvent::Failed("stream interrupted".to_owned()))
+                    .await;
+                return;
+            };
+            let (slices, end) = fold_responses_bytes(&mut buffer, &bytes, &mut pending, &mut accum);
+            for text in slices {
+                let _ = tx.send(StreamEvent::Content(text)).await;
+            }
+            match end {
+                ResponsesFoldEnd::Ongoing => {}
+                ResponsesFoldEnd::Finished => break,
+                ResponsesFoldEnd::Failed(reason) => {
+                    let _ = tx.send(StreamEvent::Failed(reason)).await;
+                    return;
+                }
+            }
+        }
+        match assemble_responses_stream(accum) {
             Some(msg) => {
                 let _ = tx.send(StreamEvent::Done(msg)).await;
             }
@@ -593,48 +789,10 @@ impl ModelClient for HttpModelClient {
         tools: &'a [ToolSpec],
     ) -> CompletionFuture<'a> {
         Box::pin(async move {
-            let url = format!("{}/chat/completions", self.base_url);
-            let body = completion_body(model, messages, tools, false);
-            let hooked = self.gate_request(model).await?;
-            let resp = self
-                .with_headers(self.client.post(url), &hooked.headers)
-                .json(&body)
-                .send()
-                .await?;
-            let status = resp.status();
-            self.observe_response(model, status, resp.headers());
-            if !status.is_success() {
-                // Provider error bodies carry the actual reason (unknown
-                // model, bad field, auth gating, …); keep a prefix so the
-                // message stays one line in the TUI.
-                let raw = resp.text().await.unwrap_or_default();
-                let body: String = raw.chars().take(300).collect();
-                return Err(ModelError::Provider { status, body });
+            match self.transport(model) {
+                Transport::ChatCompletions => self.complete_chat(model, messages, tools).await,
+                Transport::Responses => self.complete_responses(model, messages, tools).await,
             }
-            let resp: CompletionResponse = resp.json().await?;
-
-            let choice = resp
-                .choices
-                .into_iter()
-                .next()
-                .ok_or(ModelError::EmptyChoices)?;
-            let msg = choice.message;
-            let tool_calls: Vec<ToolCall> = msg
-                .tool_calls
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| ToolCall {
-                    id: c.id,
-                    name: c.function.name,
-                    arguments: c.function.arguments,
-                })
-                .collect();
-
-            let content = msg.content.unwrap_or_default();
-            if content.is_empty() && tool_calls.is_empty() {
-                return Err(ModelError::EmptyContent);
-            }
-            Ok(Message::assistant_with_calls(content, tool_calls))
         })
     }
 
@@ -648,9 +806,18 @@ impl ModelClient for HttpModelClient {
         let model = model.to_owned();
         let messages = messages.to_vec();
         let tools = tools.to_vec();
-        tokio::spawn(async move {
-            self.run_stream(model, messages, tools, tx).await;
-        });
+        match self.transport(&model) {
+            Transport::ChatCompletions => {
+                tokio::spawn(async move {
+                    self.run_stream(model, messages, tools, tx).await;
+                });
+            }
+            Transport::Responses => {
+                tokio::spawn(async move {
+                    self.run_responses_stream(model, messages, tools, tx).await;
+                });
+            }
+        }
         rx
     }
 }
@@ -1012,5 +1179,161 @@ mod tests {
             StreamEvent::Failed(err) => assert!(err.contains("nope"), "got: {err}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transport_honors_configured_responses_models() {
+        let config = AppConfig::from_toml(
+            "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\nresponses_models = [\"future-1\"]\n",
+            "test",
+        )
+        .unwrap();
+        let client = HttpModelClient::new(harness_core::Context::root(), &config).unwrap();
+        assert_eq!(client.transport("future-1"), Transport::Responses);
+        assert_eq!(
+            client.transport("muse-spark-1.3-contributor-free"),
+            Transport::Responses,
+            "built-in family needs no config"
+        );
+        assert_eq!(client.transport("other"), Transport::ChatCompletions);
+    }
+
+    /// Minimal raw-TCP mock origin: reads one request (headers + body) and
+    /// replies with a canned response. Returns the base URL and the raw
+    /// request text for path/body assertions.
+    async fn mock_origin(response: String) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(&mut sock);
+            let mut head = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let done = line == "\r\n" || line == "\n" || line.is_empty();
+                head.push(line);
+                if done {
+                    break;
+                }
+            }
+            let header_block = head.concat();
+            let content_length: usize = header_block
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("Content-Length:")
+                        .or_else(|| l.strip_prefix("content-length:"))
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let _ = tx.send(format!("{header_block}{}", String::from_utf8_lossy(&body)));
+            reader
+                .into_inner()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn client_for(base: &str, model: &str) -> Arc<HttpModelClient> {
+        let config = AppConfig::from_toml(
+            &format!(
+                "[llm]\nbase_url = \"{base}\"\nmodel = \"{model}\"\napi_key = \"k\"\nuser_agent = \"a\"\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        Arc::new(HttpModelClient::new(harness_core::Context::root(), &config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn responses_stream_posts_to_responses_path() {
+        let sse = concat!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            "\n",
+            "event: response.output_item.added\n",
+            "data: {\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"echo\",\"call_id\":\"call_1\"}}\n",
+            "\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"item_id\":\"fc_1\",\"delta\":\"{\\\"text\\\":\\\"hi\\\"}\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\"}\n",
+            "\n",
+        );
+        let (base, req_rx) = mock_origin(sse.to_owned()).await;
+        let client = client_for(&base, "muse-spark-1.3-contributor-free");
+
+        let mut rx = client.stream(
+            "muse-spark-1.3-contributor-free",
+            &[Message::user("hi")],
+            &[],
+        );
+        let events = collect_stream(&mut rx).await;
+        match events.last().expect("terminal event") {
+            StreamEvent::Done(msg) => {
+                assert_eq!(msg.content, "hello");
+                assert_eq!(msg.tool_calls.len(), 1);
+                assert_eq!(msg.tool_calls[0].id, "call_1");
+                assert_eq!(msg.tool_calls[0].arguments, "{\"text\":\"hi\"}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        let raw = req_rx.await.unwrap();
+        assert!(raw.starts_with("POST /responses "), "{raw:?}");
+        assert!(raw.contains("muse-spark-1.3-contributor-free"), "{raw:?}");
+        assert!(raw.contains("\"input\""), "{raw:?}");
+    }
+
+    #[tokio::test]
+    async fn responses_complete_parses_output_items() {
+        let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base, req_rx) = mock_origin(resp).await;
+        let client = client_for(&base, "muse-spark-1.3-contributor-free");
+
+        let msg = client
+            .complete(
+                "muse-spark-1.3-contributor-free",
+                &[Message::user("hi")],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg.content, "hi");
+
+        let raw = req_rx.await.unwrap();
+        assert!(raw.starts_with("POST /responses "), "{raw:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_model_still_posts_to_chat_completions() {
+        let body = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base, req_rx) = mock_origin(resp).await;
+        let client = client_for(&base, "mimo-v2.5-free");
+
+        let msg = client
+            .complete("mimo-v2.5-free", &[Message::user("hi")], &[])
+            .await
+            .unwrap();
+        assert_eq!(msg.content, "hi");
+
+        let raw = req_rx.await.unwrap();
+        assert!(raw.starts_with("POST /chat/completions "), "{raw:?}");
     }
 }

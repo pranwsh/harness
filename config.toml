@@ -11,6 +11,11 @@ user_agent = "opencode/1.18.18"
 HTTP-Referer = "https://opencode.ai/"
 X-Title = "opencode"
 
+# Models that must use the Responses transport (POST {base_url}/responses)
+# instead of chat completions. Extends the built-in muse-spark-* family
+# mapping for future endpoint migrations; chat completions stays the default.
+# responses_models = ["future-model-free"]
+
 [agent]
 # agent configuration
 max_iterations = 128
