@@ -1,6 +1,6 @@
 [llm]
 base_url = "https://opencode.ai/zen/v1"
-model = "mimo-v2.5-free"
+model = "muse-spark-1.3-contributor-free"
 api_key = "public"
 user_agent = "opencode/1.18.18"
 
