@@ -1,0 +1,52 @@
+# Example configuration for `harness`.
+#
+# Resolution order (see plugins/config/src/lib.rs):
+#   $HARNESS_CONFIG, else ./config.toml (cwd-relative).
+#
+# Copy to config.toml and edit, or point HARNESS_CONFIG at it:
+#   cp ${"..."}config.example.toml config.toml
+#   HARNESS_CONFIG=./config.toml harness
+
+[llm]
+base_url = "https://opencode.ai/zen/v1"
+model = "muse-spark-1.3-contributor-free"
+api_key = "public"
+user_agent = "opencode/1.18.18"
+
+# Identify as the official client: Zen rejects requests that don't look
+# like they come from inside opencode ("can only be used in opencode").
+# Merged into every LLM request by the model-headers plugin.
+[llm.headers]
+HTTP-Referer = "https://opencode.ai/"
+X-Title = "opencode"
+
+# Models that must use the Responses transport (POST {base_url}/responses)
+# instead of chat completions. Extends the built-in muse-spark-* family
+# mapping for future endpoint migrations; chat completions stays the default.
+# responses_models = ["future-model-free"]
+
+# Alternative: local llama.cpp server.
+# [llm]
+# base_url = "http://127.0.0.1:8080/v1"
+# model = "<model-file.gguf>"
+# api_key = "none"
+
+[agent]
+# Hard cap on model iterations per turn.
+max_iterations = 128
+
+[session]
+backend = "memory"
+
+# Headless shell tools (shell_exec / shell_start / shell_poll / shell_stop).
+# No policy guardrails: any executable runs. Resource bounds only (timeouts,
+# output caps, max jobs). Policy belongs in a future guardrail plugin via
+# the `tool.approval` waterfall. Run trusted work only, preferably in a container.
+[shell]
+default_timeout_ms = 30000
+max_timeout_ms = 120000
+max_output_bytes = 65536
+max_capture_bytes = 1048576
+max_jobs = 32
+max_job_time_ms = 600000
+max_job_output_bytes = 262144
