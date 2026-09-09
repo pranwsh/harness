@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use crate::env::apply_env;
-use crate::output::format_result_full;
+use crate::output::format_shell_result;
 use harness_config::ShellConfig;
 
 /// Validated request for one synchronous run.
@@ -185,7 +185,7 @@ pub async fn run_once(cfg: &ShellConfig, req: ExecRequest) -> Result<String, Str
         );
         push_bounded(&mut stderr, note.as_bytes(), cap);
     }
-    Ok(format_result_full(
+    Ok(format_shell_result(
         exit_code,
         timed_out,
         &stdout,
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_echo_returns_labeled_output() {
+    async fn sync_echo_returns_output_quietly() {
         let cfg = ShellConfig::default();
         let req = resolve_request(
             &cfg,
@@ -248,9 +248,7 @@ mod tests {
         )
         .unwrap();
         let out = run_once(&cfg, req).await.unwrap();
-        assert!(out.contains("[stdout]"));
-        assert!(out.contains("hello"));
-        assert!(out.contains("[exit 0"));
+        assert_eq!(out, "hello\n");
     }
 
     #[tokio::test]

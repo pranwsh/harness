@@ -1,11 +1,14 @@
-//! Headless shell tool plugin: bounded, non-interactive subprocesses.
+//! Headless shell tool plugin over a persistent bash session.
 //!
 //! Four tools over one [`ShellService`]:
-//! `shell_exec` (sync), `shell_start` / `shell_poll` / `shell_stop`
-//! (background). No policy guardrails live here: any executable runs with
-//! the agent's environment. Output is tail-truncated and labeled; background
-//! jobs can never stall the loop (`start` returns an id immediately, `poll`
-//! is a non-blocking snapshot).
+//! `shell_exec` (sync, in-session), `shell_start` / `shell_poll` /
+//! `shell_stop` (background, one-shot `bash -c`). No policy guardrails live
+//! here: any command runs with the agent's environment. `shell_exec` takes
+//! a shell command *string* run in a long-lived bash: pipes, redirects,
+//! `&&`, `;` all work, and `cd`/env changes persist across calls. Output
+//! is quiet on success (raw stdout) with a one-line trailer otherwise;
+//! background jobs can never stall the loop (`start` returns an id
+//! immediately, `poll` is a non-blocking snapshot).
 //!
 //! Policy (allowlist, workdir scoping, env filtering) belongs in a future
 //! guardrail plugin via the `tool.approval` waterfall on [`harness_tools`],
@@ -18,9 +21,11 @@ mod env;
 mod exec;
 mod jobs;
 mod output;
+mod session;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use harness_config::{AppConfig, ShellConfig};
@@ -28,10 +33,11 @@ use harness_contracts::{KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOLS, ToolError, Too
 use harness_core::{Context, Result};
 
 pub use jobs::JobLimits;
-pub use output::{Tail, format_result, format_result_full, tail_truncate};
+pub use output::{Tail, format_result, format_result_full, format_shell_result, tail_truncate};
 
-use exec::resolve_request;
+use exec::{resolve_request, resolve_workdir};
 use jobs::{JobManager, validate_env_keys};
+use session::BashSession;
 
 const NO_POLICY_NOTE: &str = "No policy guardrails: any executable runs. A future guardrail plugin may deny via tool.approval. Run trusted work only, preferably in a container.";
 
@@ -46,6 +52,7 @@ fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
 pub struct ShellService {
     cfg: ShellConfig,
     jobs: JobManager,
+    session: BashSession,
 }
 
 impl ShellService {
@@ -54,6 +61,7 @@ impl ShellService {
         ShellService {
             cfg,
             jobs: JobManager::new(limits),
+            session: BashSession::new(),
         }
     }
 
@@ -65,66 +73,106 @@ impl ShellService {
         self.jobs.job_count()
     }
 
-    /// Graceful shutdown: kill all background jobs (harness exit / tests).
+    /// Graceful shutdown: kill the session shell and all background jobs
+    /// (harness exit / tests).
     pub async fn shutdown(&self) {
+        self.session.shutdown().await;
         self.jobs.shutdown().await;
     }
 
-    /// Argument-shape validation only (no policy). Returns the executable.
+    /// Argument-shape validation only (no policy).
     fn check_common(
         &self,
         tool: &str,
-        argv: &[String],
+        command: &str,
         env: &Option<HashMap<String, String>>,
-    ) -> std::result::Result<String, ToolError> {
-        if argv.is_empty() {
-            return Err(tool_err(tool, "command must be a non-empty array"));
+    ) -> std::result::Result<(), ToolError> {
+        if command.trim().is_empty() {
+            return Err(tool_err(tool, "command must be a non-empty string"));
         }
-        if argv.len() > 128 {
-            return Err(tool_err(tool, "command has too many arguments (max 128)"));
-        }
-        if argv.iter().map(String::len).sum::<usize>() > 64 * 1024 {
+        if command.len() > 64 * 1024 {
             return Err(tool_err(tool, "command is too long (max 64KiB total)"));
         }
         validate_env_keys(env.as_ref()).map_err(|e| tool_err(tool, e))?;
-        let exe = argv[0].trim().to_owned();
-        if exe.is_empty() {
-            return Err(tool_err(tool, "empty executable"));
-        }
-        Ok(exe)
+        Ok(())
     }
 
-    /// Synchronous execution. Non-zero exits are `Ok` (labeled output);
-    /// spawn failures are `Err`.
+    /// Synchronous execution in the persistent bash session. Clean runs
+    /// return raw stdout; failures carry streams plus a one-line trailer.
+    /// An explicit `env` bypasses the session into an isolated one-shot
+    /// `bash -c` with ONLY these vars (the session environment is never
+    /// polluted). Only spawn-level failures are `Err`.
     pub async fn exec_sync(
         &self,
         tool: &'static str,
-        argv: Vec<String>,
+        command: String,
         workdir: Option<String>,
         timeout_ms: Option<u64>,
         env: Option<HashMap<String, String>>,
     ) -> std::result::Result<String, ToolError> {
-        let exe = self.check_common(tool, &argv, &env)?;
-        let req = resolve_request(&self.cfg, exe, argv, workdir, timeout_ms, env)
+        self.check_common(tool, &command, &env)?;
+        let want = timeout_ms.unwrap_or(self.cfg.default_timeout_ms);
+        let timeout = Duration::from_millis(want.clamp(1, self.cfg.max_timeout_ms.max(1)));
+        if env.is_some() {
+            let req = resolve_request(
+                &self.cfg,
+                "bash".to_owned(),
+                vec!["bash".to_owned(), "-c".to_owned(), command],
+                workdir,
+                Some(timeout.as_millis() as u64),
+                env,
+            )
             .map_err(|e| tool_err(tool, e))?;
-        exec::run_once(&self.cfg, req)
+            return exec::run_once(&self.cfg, req)
+                .await
+                .map_err(|e| tool_err(tool, e));
+        }
+        let dir = match workdir {
+            None => None,
+            Some(w) => Some(resolve_workdir(Some(w.as_str())).map_err(|e| tool_err(tool, e))?),
+        };
+        let out = self
+            .session
+            .run(
+                &command,
+                dir.as_deref(),
+                timeout,
+                self.cfg.max_capture_bytes.max(1024),
+            )
             .await
-            .map_err(|e| tool_err(tool, e))
+            .map_err(|e| tool_err(tool, e))?;
+        Ok(format_shell_result(
+            out.exit_code,
+            out.timed_out,
+            &out.stdout,
+            &out.stderr,
+            self.cfg.max_output_bytes,
+            out.out_omitted,
+            out.err_omitted,
+        ))
     }
 
-    /// Launch a background job; returns immediately with the job id.
+    /// Launch a background job (`bash -c` one-shot); returns immediately
+    /// with the job id.
     pub async fn start(
         &self,
         tool: &'static str,
-        argv: Vec<String>,
+        command: String,
         workdir: Option<String>,
         timeout_ms: Option<u64>,
         env: Option<HashMap<String, String>>,
     ) -> std::result::Result<String, ToolError> {
-        let exe = self.check_common(tool, &argv, &env)?;
+        self.check_common(tool, &command, &env)?;
         let id = self
             .jobs
-            .start(&self.cfg, exe, argv, workdir, timeout_ms, env)
+            .start(
+                &self.cfg,
+                "bash".to_owned(),
+                vec!["bash".to_owned(), "-c".to_owned(), command],
+                workdir,
+                timeout_ms,
+                env,
+            )
             .await
             .map_err(|e| tool_err(tool, e))?;
         Ok(format!(
@@ -167,7 +215,7 @@ impl ShellService {
 
 #[derive(Debug, serde::Deserialize)]
 struct ExecArgs {
-    command: Vec<String>,
+    command: String,
     #[serde(default)]
     workdir: Option<String>,
     #[serde(default)]
@@ -248,10 +296,10 @@ fn exec_params() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "command": { "type": "array", "items": { "type": "string" }, "description": "argv array, e.g. [\"git\", \"status\"]. Runs directly, no shell." },
-            "workdir": { "type": "string", "description": "Working directory (must exist, default cwd)" },
+            "command": { "type": "string", "description": "Shell command string, e.g. \"ls -la; cat package.json | head -n 100\". Runs in a persistent bash session: pipes, redirects, &&, ; all work, and cwd/env changes persist across calls." },
+            "workdir": { "type": "string", "description": "Working directory for this call only (must exist, default session cwd)" },
             "timeout_ms": { "type": "integer", "minimum": 1, "description": "Timeout override, clamped to max_timeout_ms" },
-            "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "If given, subprocess gets ONLY these vars (clean env)" }
+            "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "If given, the command runs one-shot with ONLY these vars (clean env, outside the session)" }
         },
         "required": ["command"]
     })
@@ -261,7 +309,7 @@ pub fn shell_exec_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_exec".to_owned(),
         description: format!(
-            "Run a command synchronously and return labeled tail-truncated [stdout]/[stderr]. {NO_POLICY_NOTE}"
+            "Run a shell command string in the persistent bash session and return its output. {NO_POLICY_NOTE}"
         ),
         parameters: exec_params(),
     }
@@ -271,7 +319,7 @@ pub fn shell_start_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_start".to_owned(),
         description: format!(
-            "Start a long-running command in the background; returns a job id immediately (never blocks). Poll with shell_poll, end with shell_stop. {NO_POLICY_NOTE}"
+            "Start a shell command string in the background (bash -c); returns a job id immediately (never blocks). Poll with shell_poll, end with shell_stop. {NO_POLICY_NOTE}"
         ),
         parameters: exec_params(),
     }
@@ -394,9 +442,62 @@ user_agent = "a"
     }
 
     #[tokio::test]
-    async fn exec_tool_runs_any_command() {
+    async fn exec_tool_runs_shell_strings() {
         let (_ctx, tools, _svc) = ctx_with_shell();
         let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_exec", serde_json::json!({"command": "echo hi"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "hi\n", "quiet success returns raw stdout: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn exec_tool_runs_pipelines_and_chains() {
+        // The exact shape that failed as argv now works as a shell string.
+        let (_ctx, tools, _svc) = ctx_with_shell();
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command": "pwd; ls -la | head -n 3; echo hi | tr a-z A-Z"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("HI"), "got: {out}");
+        assert!(out.contains("total"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn exec_tool_rejects_bad_commands() {
+        let (_ctx, tools, _svc) = ctx_with_shell();
+        // Empty string.
+        let err = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_exec", serde_json::json!({"command": ""})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.tool, "shell_exec");
+        // Missing key.
+        let err = tools
+            .execute("a", "s", 1, call("shell_exec", serde_json::json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(err.tool, "shell_exec");
+        // Old argv shape is a type error, not a silent misroute.
+        let err = tools
             .execute(
                 "a",
                 "s",
@@ -404,24 +505,104 @@ user_agent = "a"
                 call("shell_exec", serde_json::json!({"command": ["echo", "hi"]})),
             )
             .await
-            .unwrap();
-        assert!(out.contains("hi"), "got: {out}");
-        assert!(out.contains("[stdout]"));
+            .unwrap_err();
+        assert_eq!(err.tool, "shell_exec");
     }
 
     #[tokio::test]
-    async fn exec_tool_rejects_empty_command() {
+    async fn exec_tool_reports_failures_with_trailer() {
         let (_ctx, tools, _svc) = ctx_with_shell();
-        let err = tools
+        let out = tools
             .execute(
                 "a",
                 "s",
                 1,
-                call("shell_exec", serde_json::json!({"command": []})),
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command": "echo out; echo err >&2; exit 3"}),
+                ),
             )
             .await
-            .unwrap_err();
-        assert_eq!(err.tool, "shell_exec");
+            .unwrap();
+        assert!(out.contains("[exit 3"), "got: {out}");
+        assert!(out.contains("[stderr]"), "got: {out}");
+        assert!(out.contains("out") && out.contains("err"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn exec_tool_session_state_persists() {
+        let (_ctx, tools, _svc) = ctx_with_shell();
+        let unique = format!("HARNESS_PERSIST_{}", std::process::id());
+        tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command": format!("export {unique}=yes")}),
+                ),
+            )
+            .await
+            .unwrap();
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command": format!("echo ${unique}")}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "yes\n", "export persisted: {out:?}");
+
+        tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_exec", serde_json::json!({"command": "cd /"})),
+            )
+            .await
+            .unwrap();
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_exec", serde_json::json!({"command": "pwd"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "/");
+
+        // Explicit workdir scopes one call; the session cwd is untouched.
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command": "pwd", "workdir": "/tmp"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "/tmp");
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_exec", serde_json::json!({"command": "pwd"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "/");
     }
 
     #[tokio::test]
@@ -432,10 +613,7 @@ user_agent = "a"
                 "a",
                 "s",
                 1,
-                call(
-                    "shell_start",
-                    serde_json::json!({"command": ["python3", "-c", "import time; time.sleep(30)"]}),
-                ),
+                call("shell_start", serde_json::json!({"command": "sleep 30"})),
             )
             .await
             .unwrap();
@@ -499,7 +677,8 @@ user_agent = "a"
         .find(|p| std::path::Path::new(p).exists())
         .unwrap_or(&"python3")
         .to_string();
-        // python3 prints ONLY_THIS; a leaked PATH would show Some(...).
+        // One-shot bypasses the session with ONLY_THIS set; a leaked PATH
+        // would show Some(...). Single-quoted shell keeps it intact.
         let out = tools
             .execute(
                 "a",
@@ -507,7 +686,7 @@ user_agent = "a"
                 1,
                 call(
                     "shell_exec",
-                    serde_json::json!({"command": [py, "-c", "import os; print(os.environ.get('ONLY_THIS'), os.environ.get('PATH'))"],
+                    serde_json::json!({"command": format!("{py} -c 'import os; print(os.environ.get(\"ONLY_THIS\"), os.environ.get(\"PATH\"))'"),
                         "env": {"ONLY_THIS": "yes"}}),
                 ),
             )

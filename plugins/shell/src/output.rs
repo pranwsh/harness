@@ -50,6 +50,65 @@ pub fn format_result(
     format_result_full(exit_code, timed_out, stdout, stderr, cap, 0, 0)
 }
 
+/// Format a finished shell execution for the model (Claude-style quiet
+/// success).
+///
+/// A clean run (`exit 0`, no timeout, empty stderr, nothing truncated)
+/// returns the raw stdout text with zero envelope overhead. Anything else
+/// appends the streams that exist plus a one-line trailer carrying the
+/// exit code and flags, so failures stay fully attributed without taxing
+/// the common case.
+pub fn format_shell_result(
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    cap: usize,
+    ring_omitted_out: u64,
+    ring_omitted_err: u64,
+) -> String {
+    let out = tail_truncate(stdout, cap);
+    let err = tail_truncate(stderr, cap);
+    let omitted_out = out.omitted_bytes + ring_omitted_out;
+    let omitted_err = err.omitted_bytes + ring_omitted_err;
+    let truncated = out.truncated || err.truncated || omitted_out > 0 || omitted_err > 0;
+
+    if exit_code == Some(0) && !timed_out && err.text.is_empty() && !truncated {
+        return out.text;
+    }
+
+    let mut s = String::with_capacity(out.text.len() + err.text.len() + 128);
+    if !out.text.is_empty() {
+        if !err.text.is_empty() {
+            s.push_str("[stdout]\n");
+        }
+        s.push_str(&out.text);
+        if !out.text.ends_with('\n') {
+            s.push('\n');
+        }
+    }
+    if !err.text.is_empty() {
+        s.push_str("[stderr]\n");
+        s.push_str(&err.text);
+        if !err.text.ends_with('\n') {
+            s.push('\n');
+        }
+    }
+    s.push_str("[exit ");
+    match exit_code {
+        Some(c) => s.push_str(&c.to_string()),
+        None => s.push_str("signal"),
+    }
+    s.push_str(&format!(", timed_out={timed_out}, truncated={truncated}"));
+    if truncated {
+        s.push_str(&format!(
+            ", omitted_stdout={omitted_out}B, omitted_stderr={omitted_err}B"
+        ));
+    }
+    s.push_str("]\n");
+    s
+}
+
 /// Like [`format_result`] but adds upstream (ring-buffer) omission counts so
 /// truncation reporting stays accurate when snapshots are already tails.
 pub fn format_result_full(
@@ -133,5 +192,56 @@ mod tests {
         assert!(s.contains("[stderr]"));
         assert!(s.contains("out"));
         assert!(s.contains("err"));
+    }
+
+    #[test]
+    fn shell_result_quiet_success_returns_raw_stdout() {
+        let s = format_shell_result(Some(0), false, b"hello\n", b"", 64, 0, 0);
+        assert_eq!(s, "hello\n");
+    }
+
+    #[test]
+    fn shell_result_nonzero_exit_carries_streams_and_trailer() {
+        let s = format_shell_result(Some(3), false, b"out", b"err\n", 64, 0, 0);
+        assert!(s.contains("[stdout]"), "got: {s}");
+        assert!(s.contains("[stderr]"), "got: {s}");
+        assert!(s.contains("out"));
+        assert!(s.contains("err"));
+        assert!(
+            s.contains("[exit 3, timed_out=false, truncated=false]"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn shell_result_stdout_only_failure_skips_stderr_section() {
+        let s = format_shell_result(Some(1), false, b"nope\n", b"", 64, 0, 0);
+        assert!(!s.contains("[stderr]"), "got: {s}");
+        assert!(!s.contains("[stdout]"), "got: {s}");
+        assert!(s.contains("nope"));
+        assert!(s.contains("[exit 1"), "got: {s}");
+    }
+
+    #[test]
+    fn shell_result_stderr_only_failure_has_trailer() {
+        let s = format_shell_result(Some(127), false, b"", b"not found\n", 64, 0, 0);
+        assert!(s.contains("[stderr]"), "got: {s}");
+        assert!(s.contains("[exit 127"), "got: {s}");
+    }
+
+    #[test]
+    fn shell_result_timeout_reports_signal_or_timeout() {
+        let s = format_shell_result(None, true, b"partial", b"", 64, 0, 0);
+        assert!(s.contains("timed_out=true"), "got: {s}");
+        let s = format_shell_result(Some(0), false, b"x", b"y", 64, 0, 0);
+        assert!(s.contains("[stderr]"), "stderr forces envelope: {s}");
+    }
+
+    #[test]
+    fn shell_result_truncation_is_flagged_with_counts() {
+        let s = format_shell_result(Some(0), false, b"hello\n", b"", 4, 2, 0);
+        assert!(s.contains("truncated=true"), "got: {s}");
+        assert!(s.contains("omitted_stdout="), "got: {s}");
+        assert!(s.contains("[exit 0"), "got: {s}");
     }
 }
