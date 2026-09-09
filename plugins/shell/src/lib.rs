@@ -328,7 +328,7 @@ pub fn shell_start_spec() -> ToolSpec {
 pub fn shell_poll_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_poll".to_owned(),
-        description: "Non-blocking snapshot of a background job: running state plus tail-truncated [stdout]/[stderr].".to_owned(),
+        description: "Non-blocking snapshot of a background job: running state plus output streams when non-empty.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

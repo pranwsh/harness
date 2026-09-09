@@ -78,22 +78,7 @@ pub fn format_shell_result(
     }
 
     let mut s = String::with_capacity(out.text.len() + err.text.len() + 128);
-    if !out.text.is_empty() {
-        if !err.text.is_empty() {
-            s.push_str("[stdout]\n");
-        }
-        s.push_str(&out.text);
-        if !out.text.ends_with('\n') {
-            s.push('\n');
-        }
-    }
-    if !err.text.is_empty() {
-        s.push_str("[stderr]\n");
-        s.push_str(&err.text);
-        if !err.text.ends_with('\n') {
-            s.push('\n');
-        }
-    }
+    push_stream_sections(&mut s, &out.text, &err.text);
     s.push_str("[exit ");
     match exit_code {
         Some(c) => s.push_str(&c.to_string()),
@@ -107,6 +92,29 @@ pub fn format_shell_result(
     }
     s.push_str("]\n");
     s
+}
+
+/// Appends stream sections, omitting headers for empty streams: a lone
+/// non-empty stream needs no label, while two non-empty streams get
+/// `[stdout]`/`[stderr]` delineation. Shared by the sync formatter and
+/// the background-job snapshot so the styles cannot drift apart.
+pub fn push_stream_sections(s: &mut String, out_text: &str, err_text: &str) {
+    if !out_text.is_empty() {
+        if !err_text.is_empty() {
+            s.push_str("[stdout]\n");
+        }
+        s.push_str(out_text);
+        if !out_text.ends_with('\n') {
+            s.push('\n');
+        }
+    }
+    if !err_text.is_empty() {
+        s.push_str("[stderr]\n");
+        s.push_str(err_text);
+        if !err_text.ends_with('\n') {
+            s.push('\n');
+        }
+    }
 }
 
 /// Like [`format_result`] but adds upstream (ring-buffer) omission counts so

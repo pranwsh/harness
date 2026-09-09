@@ -50,7 +50,6 @@ struct JobExit {
 }
 
 struct JobHandle {
-    cmdline: String,
     started: Instant,
     out: Arc<Mutex<Ring>>,
     err: Arc<Mutex<Ring>>,
@@ -165,7 +164,6 @@ impl JobManager {
             tasks.push(waiter.abort_handle());
         }
 
-        let cmdline = argv.join(" ");
         let mut map = self
             .inner
             .lock()
@@ -173,7 +171,6 @@ impl JobManager {
         map.insert(
             id.clone(),
             JobHandle {
-                cmdline,
                 started: Instant::now(),
                 out,
                 err,
@@ -195,7 +192,6 @@ impl JobManager {
             let h = map.get(id).ok_or_else(|| format!("unknown job `{id}`"))?;
             (
                 (
-                    h.cmdline.clone(),
                     h.started,
                     Arc::clone(&h.out),
                     Arc::clone(&h.err),
@@ -206,7 +202,7 @@ impl JobManager {
                     .clamp(1, self.limits.ring_cap),
             )
         };
-        let (cmdline, started, out, err, exit) = handle_refs;
+        let (started, out, err, exit) = handle_refs;
         let ((o, o_omit), (e, e_omit), x) = tokio::join!(
             async { out.lock().await.snapshot_with_omitted() },
             async { err.lock().await.snapshot_with_omitted() },
@@ -214,7 +210,6 @@ impl JobManager {
         );
         Ok(format_job(
             id,
-            &cmdline,
             started.elapsed(),
             x,
             &o,
@@ -366,7 +361,6 @@ async fn waiter_task(
 #[allow(clippy::too_many_arguments)]
 fn format_job(
     id: &str,
-    cmdline: &str,
     age: Duration,
     exit: Option<JobExit>,
     stdout: &[u8],
@@ -380,14 +374,19 @@ fn format_job(
     let omitted_out = out.omitted_bytes + ring_omitted_out;
     let omitted_err = err.omitted_bytes + ring_omitted_err;
     let mut s = String::with_capacity(out.text.len() + err.text.len() + 160);
+    // Status header always: this is the signal poll exists for. Streams
+    // follow only when non-empty (quiet-success rule); the start call in
+    // history already shows the command, so it is not repeated here.
     match exit {
         None => s.push_str(&format!(
-            "[job {id}, running=true, age_ms={}]\ncmd: {cmdline}\n",
+            "[job {id}, running=true, age_ms={}]\n",
             age.as_millis()
         )),
         Some(x) => s.push_str(&format!(
-            "[job {id}, running=false, exit={}, expired={}, stopped={}, age_ms={}]\ncmd: {cmdline}\n",
-            x.code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_owned()),
+            "[job {id}, running=false, exit={}, expired={}, stopped={}, age_ms={}]\n",
+            x.code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_owned()),
             x.expired,
             x.stopped,
             age.as_millis()
@@ -399,16 +398,7 @@ fn format_job(
             omitted_out, omitted_err
         ));
     }
-    s.push_str("[stdout]\n");
-    s.push_str(&out.text);
-    if !out.text.ends_with('\n') {
-        s.push('\n');
-    }
-    s.push_str("[stderr]\n");
-    s.push_str(&err.text);
-    if !err.text.ends_with('\n') {
-        s.push('\n');
-    }
+    crate::output::push_stream_sections(&mut s, &out.text, &err.text);
     s
 }
 
@@ -579,5 +569,68 @@ mod tests {
         assert_eq!(mgr.job_count(), 1);
         mgr.shutdown().await;
         assert_eq!(mgr.job_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn poll_omits_empty_sections_and_cmdline() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "python3".to_owned(),
+                vec![
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    "import time; time.sleep(30)".to_owned(),
+                ],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snap = mgr.poll(&id, None).await.unwrap();
+        // Status header always; no scaffolding for empty streams and no
+        // command repeat (the start call in history already shows it).
+        assert!(snap.contains("running=true"), "got: {snap}");
+        assert!(!snap.contains("[stdout]"), "got: {snap}");
+        assert!(!snap.contains("[stderr]"), "got: {snap}");
+        assert!(!snap.contains("cmd:"), "got: {snap}");
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_shows_lone_stream_without_header() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "echo".to_owned(),
+                vec!["echo".to_owned(), "job-out".to_owned()],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut snap = String::new();
+        for _ in 0..50 {
+            snap = mgr.poll(&id, None).await.unwrap();
+            if snap.contains("running=false") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(snap.contains("running=false"), "got: {snap}");
+        assert!(snap.contains("job-out"), "got: {snap}");
+        assert!(
+            !snap.contains("[stdout]"),
+            "lone stream needs no label: {snap}"
+        );
+        assert!(!snap.contains("[stderr]"), "got: {snap}");
+        assert!(!snap.contains("cmd:"), "got: {snap}");
+        mgr.shutdown().await;
     }
 }
