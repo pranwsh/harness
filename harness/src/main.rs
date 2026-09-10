@@ -5,6 +5,8 @@ use harness_contracts::KEY_TUI;
 use harness_core::{Context, LoadOutcome, Result};
 use tokio::sync::mpsc;
 
+mod cli;
+
 macro_rules! load {
     ($ctx:expr, $name:literal, $plugin:expr) => {
         match $ctx.load($plugin) {
@@ -32,9 +34,18 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<ExitCode> {
+    let cli = match cli::parse_args(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+
     let ctx = Context::root();
 
-    let config = match ConfigPlugin::from_file(&config_path()) {
+    let path = cli.config.unwrap_or_else(config_path);
+    let config = match ConfigPlugin::from_file(&path) {
         Ok(plugin) => plugin,
         Err(err) => {
             eprintln!("harness: {err}");
