@@ -45,26 +45,6 @@ impl LineHasher for Xxh3Hasher {
     }
 }
 
-/// Fallback hasher: 64-bit FNV-1a over trimmed line bytes.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Fnv1aHasher;
-
-impl LineHasher for Fnv1aHasher {
-    fn hash_normalized(&self, line: &[u8]) -> u64 {
-        const OFFSET: u64 = 0xcbf29ce484222325;
-        const PRIME: u64 = 0x100000001b3;
-        let mut h = OFFSET;
-        for &b in trim_ws(line) {
-            h ^= b as u64;
-            h = h.wrapping_mul(PRIME);
-        }
-        h
-    }
-    fn name(&self) -> &'static str {
-        "fnv1a64"
-    }
-}
-
 /// Strip leading/trailing ASCII space, tab, and CR.
 ///
 /// Inner spacing is preserved so `content` round-trips exactly while
@@ -597,14 +577,10 @@ mod tests {
     }
 
     #[test]
-    fn hashers_are_whitespace_insensitive() {
-        for h in [
-            Arc::new(Xxh3Hasher) as Arc<dyn LineHasher>,
-            Arc::new(Fnv1aHasher),
-        ] {
-            assert_eq!(h.hash_normalized(b"  x"), h.hash_normalized(b"x\t"));
-            assert_ne!(h.hash_normalized(b"a b"), h.hash_normalized(b"ab"));
-        }
+    fn hasher_is_whitespace_insensitive() {
+        let h = Xxh3Hasher;
+        assert_eq!(h.hash_normalized(b"  x"), h.hash_normalized(b"x\t"));
+        assert_ne!(h.hash_normalized(b"a b"), h.hash_normalized(b"ab"));
     }
 
     #[test]
