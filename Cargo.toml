@@ -42,5 +42,8 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = true

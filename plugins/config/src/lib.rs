@@ -208,21 +208,8 @@ impl AppConfig {
     }
 }
 
-/// Resolves the config path: `$HARNESS_CONFIG`, else
-/// `$XDG_CONFIG_HOME/harness/config.toml`, else `config.toml` in cwd.
+/// Config lives at `./config.toml` (cwd-relative) only.
 pub fn config_path() -> String {
-    if let Ok(p) = std::env::var("HARNESS_CONFIG") {
-        return p;
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        let base = PathBuf::from(&xdg);
-        // Per spec XDG_CONFIG_HOME must be absolute; ignore it otherwise.
-        if base.is_absolute() {
-            return base.join("harness/config.toml").display().to_string();
-        }
-    }
     DEFAULT_CONFIG_PATH.to_owned()
 }
 
