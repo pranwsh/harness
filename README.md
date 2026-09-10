@@ -23,11 +23,12 @@ nix flake check
 Configure:
 
 ```sh
-cp config.example.toml config.toml
+mkdir -p "$XDG_CONFIG_HOME/harness"
+cp config.example.toml "$XDG_CONFIG_HOME/harness/config.toml"
 # or: HARNESS_CONFIG=./config.toml harness
 ```
 
-Resolution: `$HARNESS_CONFIG`, else `./config.toml` (cwd-relative). Packaged example also at `$out/share/doc/harness/config.example.toml`.
+Resolution: `$HARNESS_CONFIG`, else `$XDG_CONFIG_HOME/harness/config.toml`, else `./config.toml` (cwd-relative). Packaged example also at `$out/share/doc/harness/config.example.toml`.
 
 ## Architecture
 

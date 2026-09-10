@@ -1,10 +1,12 @@
 # Example configuration for `harness`.
 #
 # Resolution order (see plugins/config/src/lib.rs):
-#   $HARNESS_CONFIG, else ./config.toml (cwd-relative).
+#   $HARNESS_CONFIG, else $XDG_CONFIG_HOME/harness/config.toml,
+#   else ./config.toml (cwd-relative).
 #
-# Copy to config.toml and edit, or point HARNESS_CONFIG at it:
-#   cp ${"..."}config.example.toml config.toml
+# Install to the default location and edit, or point HARNESS_CONFIG at it:
+#   mkdir -p "$XDG_CONFIG_HOME/harness"
+#   cp ${"..."}config.example.toml "$XDG_CONFIG_HOME/harness/config.toml"
 #   HARNESS_CONFIG=./config.toml harness
 
 [llm]
