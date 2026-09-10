@@ -8,7 +8,8 @@
 //! `&&`, `;` all work, and `cd`/env changes persist across calls. Output
 //! is quiet on success (raw stdout) with a one-line trailer otherwise;
 //! background jobs can never stall the loop (`start` returns an id
-//! immediately, `poll` is a non-blocking snapshot).
+//! immediately, `poll` long-polls up to a bounded `wait_ms` and returns
+//! early on exit).
 //!
 //! Policy (allowlist, workdir scoping, env filtering) belongs in a future
 //! guardrail plugin via the `tool.approval` waterfall on [`harness_tools`],
@@ -32,7 +33,7 @@ use harness_config::{AppConfig, ShellConfig};
 use harness_contracts::{KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOLS, ToolError, ToolSpec};
 use harness_core::{Context, Result};
 
-pub use jobs::JobLimits;
+pub use jobs::{DEFAULT_POLL_WAIT_MS, JobLimits, MAX_POLL_WAIT_MS};
 pub use output::{Tail, format_result, format_result_full, format_shell_result, tail_truncate};
 
 use exec::{resolve_request, resolve_workdir};
@@ -180,18 +181,20 @@ impl ShellService {
         ))
     }
 
-    /// Non-blocking output snapshot for a job.
+    /// Output snapshot for a job, optionally long-polling for completion.
+    /// `wait_ms` omits to ~2s; `Some(0)` is instant. Bounded, early-exits.
     pub async fn poll(
         &self,
         tool: &'static str,
         job_id: &str,
         tail_bytes: Option<usize>,
+        wait_ms: Option<u64>,
     ) -> std::result::Result<String, ToolError> {
         if job_id.trim().is_empty() {
             return Err(tool_err(tool, "job_id must not be empty"));
         }
         self.jobs
-            .poll(job_id, tail_bytes)
+            .poll(job_id, tail_bytes, wait_ms)
             .await
             .map_err(|e| tool_err(tool, e))
     }
@@ -229,6 +232,8 @@ struct PollArgs {
     job_id: String,
     #[serde(default)]
     tail_bytes: Option<usize>,
+    #[serde(default)]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -273,7 +278,8 @@ fn shell_poll_handler(
     Box::pin(async move {
         let a: PollArgs = serde_json::from_str(&args)
             .map_err(|e| tool_err("shell_poll", format!("invalid arguments: {e}")))?;
-        svc.poll("shell_poll", &a.job_id, a.tail_bytes).await
+        svc.poll("shell_poll", &a.job_id, a.tail_bytes, a.wait_ms)
+            .await
     })
 }
 
@@ -328,12 +334,13 @@ pub fn shell_start_spec() -> ToolSpec {
 pub fn shell_poll_spec() -> ToolSpec {
     ToolSpec {
         name: "shell_poll".to_owned(),
-        description: "Non-blocking snapshot of a background job: running state plus output streams when non-empty.".to_owned(),
+        description: "Snapshot of a background job: waits up to wait_ms for exit (early-exits), then running state plus output streams when non-empty. Prefer one poll with a generous wait_ms over tight polling.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "Job id from shell_start (e.g. sh-1)" },
-                "tail_bytes": { "type": "integer", "minimum": 1, "description": "Tail bytes per stream" }
+                "tail_bytes": { "type": "integer", "minimum": 1, "description": "Tail bytes per stream" },
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "description": "Long-poll up to N ms for exit, returning early when the job finishes. Omit for ~2000ms. Use 0 for an instant snapshot." }
             },
             "required": ["job_id"]
         }),
@@ -422,10 +429,8 @@ user_agent = "a"
 
     fn ctx_with_shell() -> (Context, Arc<Tools>, Arc<ShellService>) {
         let ctx = Context::root();
-        ctx.load(
-            harness_config::ConfigPlugin::from_toml(TEST_CONFIG_TOML).unwrap(),
-        )
-        .unwrap();
+        ctx.load(harness_config::ConfigPlugin::from_toml(TEST_CONFIG_TOML).unwrap())
+            .unwrap();
         ctx.load(ToolsPlugin).unwrap();
         ctx.load(ShellPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
@@ -629,7 +634,10 @@ user_agent = "a"
                 "a",
                 "s",
                 1,
-                call("shell_poll", serde_json::json!({"job_id": id})),
+                call(
+                    "shell_poll",
+                    serde_json::json!({"job_id": id, "wait_ms": 0}),
+                ),
             )
             .await
             .unwrap();
@@ -706,5 +714,45 @@ user_agent = "a"
             assert!(!spec.name.is_empty());
             assert!(spec.parameters.get("type").is_some());
         }
+        let poll_params = shell_poll_spec().parameters;
+        assert!(
+            poll_params["properties"].get("wait_ms").is_some(),
+            "poll must advertise wait_ms: {poll_params}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_long_waits_resolve_quick_job_in_one_call() {
+        let (_ctx, tools, svc) = ctx_with_shell();
+        let out = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call("shell_start", serde_json::json!({"command": "echo waited"})),
+            )
+            .await
+            .unwrap();
+        let id: String = out
+            .split_whitespace()
+            .find(|w| w.starts_with("sh-"))
+            .unwrap()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_owned();
+        let snap = tools
+            .execute(
+                "a",
+                "s",
+                1,
+                call(
+                    "shell_poll",
+                    serde_json::json!({"job_id": id, "wait_ms": 5000}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(snap.contains("running=false"), "got: {snap}");
+        assert!(snap.contains("waited"), "got: {snap}");
+        svc.shutdown().await;
     }
 }

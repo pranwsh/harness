@@ -1,7 +1,8 @@
-//! Background jobs: non-blocking start/poll/stop over a bounded map.
+//! Background jobs: non-blocking start, long-polling poll, bounded stop.
 //!
-//! `start` returns immediately (never stalls the agent loop); `poll` is a
-//! lock-and-copy snapshot, O(tail). Every job is bounded by `max_job_time`,
+//! `start` returns immediately (never stalls the agent loop); `poll` waits up
+//! to a bounded `wait_ms` for exit (early-exits) then takes a lock-and-copy
+//! snapshot, O(tail). Every job is bounded by `max_job_time`,
 //! `ring_cap` per stream, and `max_jobs` map-wide. Cleanup is layered:
 //! `kill_on_drop` on every child + waiter-owned `Child` + `Drop`/`shutdown`
 //! aborting all tasks (abort drops the waiter, which drops/kills the child).
@@ -49,12 +50,18 @@ struct JobExit {
     stopped: bool,
 }
 
+/// Default long-poll wait for `poll` when the caller omits `wait_ms`.
+pub const DEFAULT_POLL_WAIT_MS: u64 = 2_000;
+/// Hard clamp for `poll`'s `wait_ms` so one poll can never stall the loop.
+pub const MAX_POLL_WAIT_MS: u64 = 30_000;
+
 struct JobHandle {
     started: Instant,
     out: Arc<Mutex<Ring>>,
     err: Arc<Mutex<Ring>>,
     exit: Arc<Mutex<Option<JobExit>>>,
     kill: Arc<Notify>,
+    done: Arc<Notify>,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 
@@ -146,6 +153,7 @@ impl JobManager {
         let err = Arc::new(Mutex::new(Ring::default()));
         let exit = Arc::new(Mutex::new(None::<JobExit>));
         let kill = Arc::new(Notify::new());
+        let done = Arc::new(Notify::new());
         let mut tasks = Vec::with_capacity(3);
         let ring_cap = self.limits.ring_cap;
 
@@ -158,8 +166,9 @@ impl JobManager {
         {
             let exit_w = Arc::clone(&exit);
             let kill_w = Arc::clone(&kill);
+            let done_w = Arc::clone(&done);
             let waiter = tokio::spawn(async move {
-                waiter_task(child, exit_w, kill_w, deadline).await;
+                waiter_task(child, exit_w, kill_w, done_w, deadline).await;
             });
             tasks.push(waiter.abort_handle());
         }
@@ -176,15 +185,26 @@ impl JobManager {
                 err,
                 exit,
                 kill,
+                done,
                 tasks,
             },
         );
         Ok(id)
     }
 
-    /// Non-blocking snapshot of a job. Never awaits the child.
-    pub async fn poll(&self, id: &str, tail_bytes: Option<usize>) -> Result<String, String> {
-        let (handle_refs, tail_cap) = {
+    /// Snapshot of a job, optionally long-polling for completion.
+    ///
+    /// When `wait_ms` is `None` the call waits `DEFAULT_POLL_WAIT_MS`;
+    /// `Some(0)` is an instant snapshot. The wait is bounded by
+    /// `MAX_POLL_WAIT_MS` and returns early as soon as the job exits, so one
+    /// poll can cover wall-clock time without ever stalling the agent loop.
+    pub async fn poll(
+        &self,
+        id: &str,
+        tail_bytes: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> Result<String, String> {
+        let (handle_refs, tail_cap, wait) = {
             let map = self
                 .inner
                 .lock()
@@ -196,13 +216,27 @@ impl JobManager {
                     Arc::clone(&h.out),
                     Arc::clone(&h.err),
                     Arc::clone(&h.exit),
+                    Arc::clone(&h.done),
                 ),
                 tail_bytes
                     .unwrap_or(self.limits.tail_cap)
                     .clamp(1, self.limits.ring_cap),
+                wait_ms
+                    .unwrap_or(DEFAULT_POLL_WAIT_MS)
+                    .clamp(0, MAX_POLL_WAIT_MS),
             )
         };
-        let (started, out, err, exit) = handle_refs;
+        let (started, out, err, exit, done) = handle_refs;
+        // Subscribe before reading `exit`: the waiter writes `exit` before
+        // notifying `done`, so either we see `Some` and skip the wait, or we
+        // are already subscribed and cannot miss the wakeup. A missed `stop`
+        // placeholder still resolves via the bounded timeout below.
+        if wait > 0 {
+            let notified = done.notified();
+            if exit.lock().await.is_none() {
+                let _ = tokio::time::timeout(Duration::from_millis(wait), notified).await;
+            }
+        }
         let ((o, o_omit), (e, e_omit), x) = tokio::join!(
             async { out.lock().await.snapshot_with_omitted() },
             async { err.lock().await.snapshot_with_omitted() },
@@ -222,16 +256,20 @@ impl JobManager {
 
     /// Signal a job to stop; waits up to ~2s for the waiter to reap it.
     pub async fn stop(&self, id: &str) -> Result<String, String> {
-        let (kill, exit_ref) = {
+        let (kill, exit_ref, done_ref) = {
             let map = self
                 .inner
                 .lock()
                 .map_err(|_| "job table poisoned".to_owned())?;
             let h = map.get(id).ok_or_else(|| format!("unknown job `{id}`"))?;
-            (Arc::clone(&h.kill), Arc::clone(&h.exit))
+            (
+                Arc::clone(&h.kill),
+                Arc::clone(&h.exit),
+                Arc::clone(&h.done),
+            )
         };
         if exit_ref.lock().await.is_some() {
-            let snap = self.poll(id, None).await?;
+            let snap = self.poll(id, None, Some(0)).await?;
             return Ok(format!("already finished\n{snap}"));
         }
         kill.notify_one();
@@ -255,7 +293,8 @@ impl JobManager {
                 });
             }
         }
-        let snap = self.poll(id, None).await?;
+        done_ref.notify_waiters();
+        let snap = self.poll(id, None, Some(0)).await?;
         Ok(format!("stopped\n{snap}"))
     }
 
@@ -309,6 +348,7 @@ async fn waiter_task(
     mut child: tokio::process::Child,
     exit: Arc<Mutex<Option<JobExit>>>,
     kill: Arc<Notify>,
+    done: Arc<Notify>,
     deadline: Duration,
 ) {
     enum Outcome {
@@ -356,6 +396,10 @@ async fn waiter_task(
             });
         }
     }
+    // Signal completion *after* `exit` is written so a poll that
+    // subscribes before reading `exit` can never miss the wakeup: either it
+    // sees `Some` and returns immediately, or it is already subscribed.
+    done.notify_waiters();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,14 +487,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let snap = mgr.poll(&id, None).await.unwrap();
+        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
         assert!(snap.contains("running=true"), "got: {snap}");
         let stopped = mgr.stop(&id).await.unwrap();
         assert!(
             stopped.contains("stopped") || stopped.contains("running=false"),
             "{stopped}"
         );
-        let snap2 = mgr.poll(&id, None).await.unwrap();
+        let snap2 = mgr.poll(&id, None, Some(0)).await.unwrap();
         assert!(snap2.contains("running=false"), "got: {snap2}");
         mgr.shutdown().await;
     }
@@ -473,7 +517,7 @@ mod tests {
         // Wait bounded for natural exit.
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None).await.unwrap();
+            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -488,7 +532,7 @@ mod tests {
     async fn unknown_job_errors() {
         let cfg = test_config();
         let mgr = JobManager::new(JobLimits::from_config(&cfg));
-        assert!(mgr.poll("sh-999", None).await.is_err());
+        assert!(mgr.poll("sh-999", None, Some(0)).await.is_err());
         assert!(mgr.stop("sh-999").await.is_err());
     }
 
@@ -538,7 +582,7 @@ mod tests {
             .unwrap();
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None).await.unwrap();
+            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -590,7 +634,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let snap = mgr.poll(&id, None).await.unwrap();
+        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
         // Status header always; no scaffolding for empty streams and no
         // command repeat (the start call in history already shows it).
         assert!(snap.contains("running=true"), "got: {snap}");
@@ -617,7 +661,7 @@ mod tests {
             .unwrap();
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None).await.unwrap();
+            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -631,6 +675,119 @@ mod tests {
         );
         assert!(!snap.contains("[stderr]"), "got: {snap}");
         assert!(!snap.contains("cmd:"), "got: {snap}");
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_waits_for_quick_exit_and_returns_early() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "echo".to_owned(),
+                vec!["echo".to_owned(), "early".to_owned()],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let snap = mgr.poll(&id, None, Some(5_000)).await.unwrap();
+        assert!(snap.contains("running=false"), "got: {snap}");
+        assert!(snap.contains("early"), "got: {snap}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "early exit must not wait the full deadline"
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_times_out_on_running_job_but_stays_bounded() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "python3".to_owned(),
+                vec![
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    "import time; time.sleep(30)".to_owned(),
+                ],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let snap = mgr.poll(&id, None, Some(300)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(snap.contains("running=true"), "got: {snap}");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "waited less than requested: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "wait exceeded its bound: {elapsed:?}"
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_zero_wait_is_instant() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "python3".to_owned(),
+                vec![
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    "import time; time.sleep(30)".to_owned(),
+                ],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+        assert!(snap.contains("running=true"), "got: {snap}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "instant poll blocked: {:?}",
+            start.elapsed()
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn poll_default_waits_without_explicit_wait() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "echo".to_owned(),
+                vec!["echo".to_owned(), "default-wait".to_owned()],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // `None` must behave like the ~2s default: quick exits resolve in one
+        // call instead of needing a caller poll loop.
+        let snap = mgr.poll(&id, None, None).await.unwrap();
+        assert!(snap.contains("running=false"), "got: {snap}");
+        assert!(snap.contains("default-wait"), "got: {snap}");
         mgr.shutdown().await;
     }
 }
