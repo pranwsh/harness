@@ -23,12 +23,20 @@ nix flake check
 Configure:
 
 ```sh
-mkdir -p "$XDG_CONFIG_HOME/harness"
-cp config.example.toml "$XDG_CONFIG_HOME/harness/config.toml"
-# or: HARNESS_CONFIG=./config.toml harness
+cp config.example.toml ./config.toml
+# then edit ./config.toml
 ```
 
-Resolution: `$HARNESS_CONFIG`, else `$XDG_CONFIG_HOME/harness/config.toml`, else `./config.toml` (cwd-relative). Packaged example also at `$out/share/doc/harness/config.example.toml`.
+Config resolution: `./config.toml` (cwd-relative) by default, or pass an
+explicit path:
+
+```sh
+harness --config PATH
+```
+
+`--config` takes a separate value only (`--config PATH`, exact match;
+`--config=PATH` is rejected). Any other flag or positional argument is an
+error. Packaged example also at `$out/share/doc/harness/config.example.toml`.
 
 ## Architecture
 

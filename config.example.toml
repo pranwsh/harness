@@ -1,13 +1,12 @@
 # Example configuration for `harness`.
 #
-# Resolution order (see plugins/config/src/lib.rs):
-#   $HARNESS_CONFIG, else $XDG_CONFIG_HOME/harness/config.toml,
-#   else ./config.toml (cwd-relative).
+# Resolution (see plugins/config/src/lib.rs and harness/src/cli.rs):
+#   ./config.toml (cwd-relative) by default, or `harness --config PATH`.
 #
-# Install to the default location and edit, or point HARNESS_CONFIG at it:
-#   mkdir -p "$XDG_CONFIG_HOME/harness"
-#   cp ${"..."}config.example.toml "$XDG_CONFIG_HOME/harness/config.toml"
-#   HARNESS_CONFIG=./config.toml harness
+# Copy to the default location and edit:
+#   cp config.example.toml ./config.toml
+# Or point at it explicitly:
+#   harness --config ./config.toml
 
 [llm]
 base_url = "https://opencode.ai/zen/v1"

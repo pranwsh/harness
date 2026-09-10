@@ -25,8 +25,9 @@
         pkgs = nixpkgs.legacyPackages.${system};
         craneLib = crane.mkLib pkgs;
 
-        # The default config lives at $XDG_CONFIG_HOME/harness/config.toml (see
-        # plugins/config/src/lib.rs); local config.toml files are
+        # The default config is ./config.toml (cwd-relative, see
+        # plugins/config/src/lib.rs; override with `harness --config PATH`);
+        # local config.toml files are
         # gitignored/local-only, so only ship the example.
         # crane's default cleaning keeps *.toml at the root; be explicit anyway.
         src = craneLib.cleanCargoSource ./.;
