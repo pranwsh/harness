@@ -3,17 +3,20 @@ name = "harness-agent-loop"
 version = "0.1.0"
 edition = "2024"
 
+# Runtime deps are `contracts` + `core` only: collaborators arrive as trait
+# handles. Sibling provider crates appear under `[dev-dependencies]` purely
+# to wire real plugins in integration tests — never in `src/`.
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-agent = { path = "../agent" }
-harness-session = { path = "../session" }
-harness-tools = { path = "../tools" }
-harness-system-prompt = { path = "../system-prompt" }
-harness-agent-default-model = { path = "../agent-default-model" }
-harness-config = { path = "../config" }
-harness-model = { path = "../model" }
 tokio.workspace = true
 
 [dev-dependencies]
+harness-agent = { path = "../agent" }
+harness-agent-default-model = { path = "../agent-default-model" }
+harness-config = { path = "../config" }
+harness-model = { path = "../model" }
+harness-session = { path = "../session" }
+harness-system-prompt = { path = "../system-prompt" }
+harness-tools = { path = "../tools" }
 serde_json.workspace = true
