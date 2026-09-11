@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use harness_contracts::{
-    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, KEY_PROMPT_TEXT, Message, PromptAssembled, Role,
+    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT, Message,
+    PromptAssembled, PromptAssemblerApi, PromptAssemblerHandle, Role,
 };
 use harness_core::{Context, Result};
 
@@ -46,6 +47,19 @@ impl PromptAssembler {
             },
         );
         messages
+    }
+}
+
+impl PromptAssemblerApi for PromptAssembler {
+    fn assemble(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        iteration: u32,
+        system_prompt: &str,
+        history: &[Entry],
+    ) -> Vec<Message> {
+        PromptAssembler::assemble(self, agent_id, session_id, iteration, system_prompt, history)
     }
 }
 
@@ -96,14 +110,23 @@ impl harness_core::Plugin for SystemPromptPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("system-prompt")
             .provides(KEY_PROMPT)
+            .provides(KEY_PROMPT_ASSEMBLER)
             .provides(KEY_PROMPT_TEXT)
             .emits::<PromptAssembled>(CH_PROMPT_ASSEMBLED)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        ctx.provide_key(KEY_PROMPT, Arc::new(PromptAssembler::new(ctx.clone())));
+        let assembler = Arc::new(PromptAssembler::new(ctx.clone()));
+        ctx.provide_key(KEY_PROMPT, assembler.clone());
+        ctx.provide_key(
+            KEY_PROMPT_ASSEMBLER,
+            Arc::new(PromptAssemblerHandle(
+                assembler as Arc<dyn PromptAssemblerApi>,
+            )),
+        );
         // The prompt text itself is carried by this plugin instance; the
-        // loop injects it via `KEY_PROMPT_TEXT`.
+        // loop pulls it per-iteration via `KEY_PROMPT_TEXT`. Re-providing
+        // the key is the live-update mechanism.
         ctx.provide_key(KEY_PROMPT_TEXT, Arc::new(self.prompt.clone()));
         Ok(())
     }

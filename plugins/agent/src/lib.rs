@@ -8,8 +8,8 @@ use std::{
 
 use arc_swap::ArcSwap;
 use harness_contracts::{
-    AgentCreated, AgentId, AgentState, AgentStateChanged, CH_AGENT_CREATED, CH_AGENT_STATE_CHANGED,
-    KEY_AGENTS,
+    AgentCreated, AgentId, AgentRegistryApi, AgentRegistryHandle, AgentState, AgentStateChanged,
+    CH_AGENT_CREATED, CH_AGENT_STATE_CHANGED, KEY_AGENTS, KEY_AGENTS_API,
 };
 use harness_core::{Context, Result};
 
@@ -108,18 +108,38 @@ impl AgentRegistry {
     }
 }
 
+impl AgentRegistryApi for AgentRegistry {
+    fn get_or_create(&self, id: &str) {
+        AgentRegistry::get_or_create(self, id);
+    }
+
+    fn set_state(&self, id: &str, state: AgentState) {
+        AgentRegistry::set_state(self, id, state);
+    }
+
+    fn state_of(&self, id: &str) -> Option<AgentState> {
+        AgentRegistry::state_of(self, id)
+    }
+}
+
 pub struct AgentPlugin;
 
 impl harness_core::Plugin for AgentPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("agent")
             .provides(KEY_AGENTS)
+            .provides(KEY_AGENTS_API)
             .emits::<AgentCreated>(CH_AGENT_CREATED)
             .emits::<AgentStateChanged>(CH_AGENT_STATE_CHANGED)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        ctx.provide_key(KEY_AGENTS, Arc::new(AgentRegistry::new(ctx.clone())));
+        let registry = Arc::new(AgentRegistry::new(ctx.clone()));
+        ctx.provide_key(KEY_AGENTS, registry.clone());
+        ctx.provide_key(
+            KEY_AGENTS_API,
+            Arc::new(AgentRegistryHandle(registry as Arc<dyn AgentRegistryApi>)),
+        );
         Ok(())
     }
 }

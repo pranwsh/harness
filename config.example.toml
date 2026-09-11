@@ -36,9 +36,6 @@ X-Title = "opencode"
 # Hard cap on model iterations per turn.
 max_iterations = 128
 
-[session]
-backend = "memory"
-
 # Headless shell tools (shell_exec / shell_start / shell_poll / shell_stop).
 # No policy guardrails: any executable runs. Resource bounds only (timeouts,
 # output caps, max jobs). Policy belongs in a future guardrail plugin via

@@ -1,212 +1,17 @@
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-use harness_contracts::{KEY_CONFIG, KEY_CONFIG_SERVICE};
-use harness_core::{Context, Plugin, PluginMeta};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use harness_contracts::{ConfigApi, ConfigHandle, KEY_CONFIG};
+use harness_core::{Context, Plugin};
+
+// Re-export config types from contracts for backward compat: existing
+// `use harness_config::AppConfig` paths keep working, new code should
+// `use harness_contracts::AppConfig`.
+pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, ShellConfig};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
-
-/// Fully parsed application configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct AppConfig {
-    pub llm: LlmConfig,
-    #[serde(default)]
-    pub agent: AgentConfig,
-    #[serde(default)]
-    pub session: SessionConfig,
-    #[serde(default)]
-    pub shell: ShellConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct LlmConfig {
-    pub base_url: String,
-    pub model: String,
-    pub api_key: String,
-    /// Optional `User-Agent` sent on LLM HTTP requests. Empty/absent means
-    /// no `User-Agent` header goes out at all — the right default for most
-    /// providers. Note: the Zen free tier gates on an `opencode/...` value,
-    /// so point `user_agent` at one (or set per-request `User-Agent` under
-    /// `[llm.headers]`) when using `opencode.ai/zen`.
-    #[serde(default)]
-    pub user_agent: String,
-    /// Extra headers merged into LLM HTTP requests by the optional
-    /// model-headers plugin (`[llm.headers]` table). Empty/absent means
-    /// pass-through. `authorization` and `content-type` keys are ignored
-    /// there; auth stays owned by the model plugin.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers: HashMap<String, String>,
-    /// Model ids that must use the OpenAI Responses transport
-    /// (`POST {base_url}/responses`) instead of chat completions. Extends
-    /// the model plugin's built-in table (currently the `muse-spark-`
-    /// family, which Zen serves on Responses only); empty/absent means
-    /// "built-ins only". Lets future endpoint migrations be handled in
-    /// config without a code change, as long as the model speaks a
-    /// protocol the client already implements.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub responses_models: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct AgentConfig {
-    /// Hard cap on model iterations per turn.
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        AgentConfig {
-            max_iterations: default_max_iterations(),
-        }
-    }
-}
-
-fn default_max_iterations() -> u32 {
-    8
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct SessionConfig {
-    /// Storage backend; only "memory" is supported in v1.
-    #[serde(default = "default_session_backend")]
-    pub backend: String,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        SessionConfig {
-            backend: default_session_backend(),
-        }
-    }
-}
-
-fn default_session_backend() -> String {
-    "memory".to_owned()
-}
-
-/// `[shell]` section: resource bounds only. No policy guardrails live here:
-/// policy (allowlist/denylist/workdir/env filtering) is enforced by a future
-/// guardrail plugin via the `tool.approval` waterfall, not by the shell.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ShellConfig {
-    /// Sync default when the call omits `timeout_ms`.
-    #[serde(default = "default_shell_timeout_ms")]
-    pub default_timeout_ms: u64,
-    /// Hard clamp for per-call `timeout_ms`.
-    #[serde(default = "default_shell_max_timeout_ms")]
-    pub max_timeout_ms: u64,
-    /// Tail bytes kept per stream in formatted output.
-    #[serde(default = "default_shell_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// Hard per-stream pipe cap while draining (bounds memory).
-    #[serde(default = "default_shell_max_capture_bytes")]
-    pub max_capture_bytes: usize,
-    /// Max concurrent background jobs.
-    #[serde(default = "default_shell_max_jobs")]
-    pub max_jobs: usize,
-    /// Max lifetime of one background job.
-    #[serde(default = "default_shell_max_job_time_ms")]
-    pub max_job_time_ms: u64,
-    /// Ring-buffer cap per stream per background job.
-    #[serde(default = "default_shell_max_job_output_bytes")]
-    pub max_job_output_bytes: usize,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        ShellConfig {
-            default_timeout_ms: default_shell_timeout_ms(),
-            max_timeout_ms: default_shell_max_timeout_ms(),
-            max_output_bytes: default_shell_max_output_bytes(),
-            max_capture_bytes: default_shell_max_capture_bytes(),
-            max_jobs: default_shell_max_jobs(),
-            max_job_time_ms: default_shell_max_job_time_ms(),
-            max_job_output_bytes: default_shell_max_job_output_bytes(),
-        }
-    }
-}
-
-fn default_shell_timeout_ms() -> u64 {
-    30_000
-}
-
-fn default_shell_max_timeout_ms() -> u64 {
-    120_000
-}
-
-fn default_shell_max_output_bytes() -> usize {
-    65_536
-}
-
-fn default_shell_max_capture_bytes() -> usize {
-    1_048_576
-}
-
-fn default_shell_max_jobs() -> usize {
-    32
-}
-
-fn default_shell_max_job_time_ms() -> u64 {
-    600_000
-}
-
-fn default_shell_max_job_output_bytes() -> usize {
-    262_144
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("failed to read config file {path}: {source}")]
-    Io {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to parse config file {path}: {source}")]
-    Parse {
-        path: String,
-        #[source]
-        source: toml::de::Error,
-    },
-    #[error("config file {path} is empty")]
-    Empty { path: String },
-    #[error("failed to write config file {path}: {source}")]
-    Write {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("config is not file-backed; save unsupported")]
-    NoPath,
-}
-
-impl AppConfig {
-    pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-        let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_toml(&raw, path)
-    }
-
-    pub fn from_toml(raw: &str, path: &str) -> Result<Self, ConfigError> {
-        if raw.trim().is_empty() {
-            return Err(ConfigError::Empty {
-                path: path.to_owned(),
-            });
-        }
-        toml::from_str(raw).map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
-            source,
-        })
-    }
-}
 
 /// Config lives at `./config.toml` (cwd-relative) only.
 pub fn config_path() -> String {
@@ -431,22 +236,26 @@ impl ConfigPlugin {
     }
 }
 
+impl ConfigApi for ConfigService {
+    fn get(&self) -> AppConfig {
+        ConfigService::get(self)
+    }
+    fn set_llm_model(&self, model: &str) -> Result<AppConfig, String> {
+        ConfigService::set_llm_model(self, model).map_err(|e| e.to_string())
+    }
+}
+
 impl Plugin for ConfigPlugin {
-    fn meta(&self) -> PluginMeta {
-        PluginMeta::new("config")
-            .provides(KEY_CONFIG)
-            .provides(KEY_CONFIG_SERVICE)
+    fn meta(&self) -> harness_core::PluginMeta {
+        harness_core::PluginMeta::new("config").provides(KEY_CONFIG)
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
-        ctx.provide_key(KEY_CONFIG, self.config.clone());
-        ctx.provide_key(
-            KEY_CONFIG_SERVICE,
-            Arc::new(ConfigService::new(
-                self.path.clone(),
-                (*self.config).clone(),
-            )),
-        );
+        let svc = Arc::new(ConfigService::new(
+            self.path.clone(),
+            (*self.config).clone(),
+        ));
+        ctx.provide_key(KEY_CONFIG, Arc::new(ConfigHandle(svc as Arc<dyn ConfigApi>)));
         Ok(())
     }
 }
@@ -471,7 +280,6 @@ max_iterations = 3
         let cfg = AppConfig::from_toml(RAW, "test").unwrap();
         assert_eq!(cfg.llm.model, "test-model");
         assert_eq!(cfg.agent.max_iterations, 3);
-        assert_eq!(cfg.session.backend, "memory");
     }
 
     #[test]
@@ -485,7 +293,6 @@ user_agent = "a"
 "#;
         let cfg = AppConfig::from_toml(raw, "test").unwrap();
         assert_eq!(cfg.agent.max_iterations, 8);
-        assert_eq!(cfg.session.backend, "memory");
     }
 
     #[test]
@@ -669,15 +476,17 @@ denied_patterns = ["CUSTOM_*"]
 
     #[test]
     fn plugin_provides_snapshot_and_service() {
-        use harness_contracts::{KEY_CONFIG, KEY_CONFIG_SERVICE};
+        use harness_contracts::{ConfigHandle, KEY_CONFIG};
 
         let ctx = harness_core::Context::root();
         ctx.load(ConfigPlugin::from_toml(RAW).unwrap()).unwrap();
-        let snap: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG).unwrap();
-        assert_eq!(snap.llm.model, "test-model");
-        let svc: Arc<ConfigService> = ctx.inject_key(KEY_CONFIG_SERVICE).unwrap();
-        assert!(svc.path().is_none());
-        assert_eq!(svc.get().llm.model, "test-model");
+        let handle: Arc<ConfigHandle> = ctx.inject_key(KEY_CONFIG).unwrap();
+        assert_eq!(handle.get().llm.model, "test-model");
+        assert_eq!(handle.max_iterations(), 3);
+        // Back-compat: the handle exposes `set_llm_model` via `ConfigApi`
+        // but the test's embedded config is not file-backed, so mutation
+        // fails -- the important bit is that the service is reachable.
+        assert!(handle.set_llm_model("m2").is_err());
     }
 
     #[test]

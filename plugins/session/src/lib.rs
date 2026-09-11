@@ -4,9 +4,11 @@ use std::{
 };
 
 use harness_contracts::{
-    CH_SESSION_ENTRY_APPENDED, CH_SESSION_TURN_CLOSED, CH_SESSION_TURN_OPENED, CH_TOOL_EXECUTED,
-    Entry, KEY_SESSIONS, SessionEntryAppended, SessionId, SessionTurnClosed, SessionTurnOpened,
-    ToolExecuted,
+    CH_SESSION_APPEND_REQUESTED, CH_SESSION_ENTRY_APPENDED, CH_SESSION_TURN_CLOSED,
+    CH_SESSION_TURN_CLOSE_REQUESTED, CH_SESSION_TURN_OPENED, CH_SESSION_TURN_OPEN_REQUESTED,
+    CH_TOOL_EXECUTED, Entry, KEY_SESSIONS, KEY_SESSION_STORE, SessionAppendRequested,
+    SessionEntryAppended, SessionId, SessionStoreApi, SessionStoreHandle, SessionTurnCloseRequested,
+    SessionTurnClosed, SessionTurnOpenRequested, SessionTurnOpened, ToolExecuted,
 };
 use harness_core::{Context, Result};
 
@@ -19,10 +21,14 @@ struct Session {
 
 /// Append-only conversation log.
 ///
-/// Entries are appended by the loop (user/assistant) and by this plugin's own
-/// sync listeners (tool results, state markers) — the listeners run inline on
-/// the emitting thread, so a log append is guaranteed once the loop's call
-/// returns.
+/// This plugin is the sole persistence owner. All mutations arrive via its
+/// own bus handlers — turn open via `session.turn_open_requested` waterfall
+/// (returns the assigned turn), appends via `session.append_requested`
+/// sync listener, turn close via `session.turn_close_requested` sync
+/// listener, and tool results via `tool.executed` sync listener — all
+/// running inline on the emitting thread so the mutation is guaranteed once
+/// the emitter resumes. Direct `begin_turn`/`end_turn`/`append` calls exist
+/// for tests and bootstrap but loop producers must use the bus.
 pub struct SessionLog {
     ctx: Context,
     sessions: Mutex<HashMap<SessionId, Session>>,
@@ -45,25 +51,29 @@ impl SessionLog {
             session.turn += 1;
             session.turn
         };
-        let _ = self.ctx.emit_key(
+        if let Err(e) = self.ctx.emit_key(
             CH_SESSION_TURN_OPENED,
             SessionTurnOpened {
                 session_id: session_id.to_owned(),
                 turn,
             },
-        );
+        ) {
+            eprintln!("session: emit {} failed: {e}", CH_SESSION_TURN_OPENED);
+        }
         turn
     }
 
     /// Closes the current turn. Emits `session.turn_closed`.
     pub fn end_turn(&self, session_id: &str, turn: u64) {
-        let _ = self.ctx.emit_key(
+        if let Err(e) = self.ctx.emit_key(
             CH_SESSION_TURN_CLOSED,
             SessionTurnClosed {
                 session_id: session_id.to_owned(),
                 turn,
             },
-        );
+        ) {
+            eprintln!("session: emit {} failed: {e}", CH_SESSION_TURN_CLOSED);
+        }
     }
 
     /// Appends an entry. Emits `session.entry_appended`.
@@ -76,14 +86,16 @@ impl SessionLog {
                 .entries
                 .push(entry.clone());
         }
-        let _ = self.ctx.emit_key(
+        if let Err(e) = self.ctx.emit_key(
             CH_SESSION_ENTRY_APPENDED,
             SessionEntryAppended {
                 session_id: session_id.to_owned(),
                 turn,
                 entry,
             },
-        );
+        ) {
+            eprintln!("session: emit {} failed: {e}", CH_SESSION_ENTRY_APPENDED);
+        }
     }
 
     /// Snapshot of a session's entries.
@@ -100,7 +112,23 @@ impl SessionLog {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Session>> {
-        self.sessions.lock().expect("session log poisoned")
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl SessionStoreApi for SessionLog {
+    fn begin_turn(&self, session_id: &str) -> u64 {
+        SessionLog::begin_turn(self, session_id)
+    }
+
+    fn end_turn(&self, session_id: &str, turn: u64) {
+        SessionLog::end_turn(self, session_id, turn)
+    }
+
+    fn history(&self, session_id: &str) -> Vec<Entry> {
+        SessionLog::history(self, session_id)
     }
 }
 
@@ -110,19 +138,62 @@ impl harness_core::Plugin for SessionPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("session")
             .provides(KEY_SESSIONS)
+            .provides(KEY_SESSION_STORE)
             .emits::<SessionTurnOpened>(CH_SESSION_TURN_OPENED)
             .emits::<SessionEntryAppended>(CH_SESSION_ENTRY_APPENDED)
             .emits::<SessionTurnClosed>(CH_SESSION_TURN_CLOSED)
+            .waterfalls::<SessionTurnOpenRequested>(CH_SESSION_TURN_OPEN_REQUESTED)
+            .listens::<SessionTurnCloseRequested>(CH_SESSION_TURN_CLOSE_REQUESTED)
+            .listens::<SessionAppendRequested>(CH_SESSION_APPEND_REQUESTED)
             .listens::<ToolExecuted>(CH_TOOL_EXECUTED)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         let log = Arc::new(SessionLog::new(ctx.clone()));
         ctx.provide_key(KEY_SESSIONS, log.clone());
+        ctx.provide_key(
+            KEY_SESSION_STORE,
+            Arc::new(SessionStoreHandle(log.clone() as Arc<dyn SessionStoreApi>)),
+        );
 
-        // Tool results are appended inline as the tools plugin executes:
-        // sync listeners run on the emitting thread, so the result is already
-        // logged when `Tools::execute` returns to the loop.
+        // Canonical bus paths, all inline: turn open via waterfall
+        // (returns assigned turn, fail-closed when no handler), appends via
+        // `session.append_requested`, turn close via
+        // `session.turn_close_requested`, and tool results via
+        // `tool.executed`. Sync/waterfall handlers run on the emitting
+        // thread, so the mutation is guaranteed once the emitter resumes.
+        {
+            let log = log.clone();
+            ctx.on_waterfall_key::<SessionTurnOpenRequested, _, _>(
+                CH_SESSION_TURN_OPEN_REQUESTED,
+                move |req| {
+                    let log = log.clone();
+                    async move {
+                        let mut next = (*req).clone();
+                        next.turn = log.begin_turn(&req.session_id);
+                        next
+                    }
+                },
+            )?;
+        }
+        {
+            let log = log.clone();
+            ctx.on_sync_key::<SessionTurnCloseRequested, _>(
+                CH_SESSION_TURN_CLOSE_REQUESTED,
+                move |ev| {
+                    log.end_turn(&ev.session_id, ev.turn);
+                },
+            )?;
+        }
+        {
+            let log = log.clone();
+            ctx.on_sync_key::<SessionAppendRequested, _>(
+                CH_SESSION_APPEND_REQUESTED,
+                move |ev| {
+                    log.append(&ev.session_id, ev.turn, ev.entry.clone());
+                },
+            )?;
+        }
         ctx.on_sync_key::<ToolExecuted, _>(CH_TOOL_EXECUTED, move |ev| {
             let entry = match &ev.result {
                 Ok(output) => Entry::tool(&ev.call.id, output),
@@ -219,6 +290,30 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, Role::Tool);
         assert!(history[0].content.contains("boom"));
+    }
+
+    #[test]
+    fn append_requests_are_appended_inline() {
+        use harness_contracts::{
+            CH_SESSION_APPEND_REQUESTED, Message, SessionAppendRequested,
+        };
+
+        let ctx = Context::root();
+        ctx.load(SessionPlugin).unwrap();
+        let log: Arc<SessionLog> = ctx.inject_key(KEY_SESSIONS).unwrap();
+
+        let turn = log.begin_turn("s");
+        let ev = SessionAppendRequested {
+            session_id: "s".into(),
+            turn,
+            entry: Entry::from_message(&Message::user("hello")),
+        };
+        let _ = ctx.emit_key(CH_SESSION_APPEND_REQUESTED, ev).unwrap();
+
+        let history = log.history("s");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[0].content, "hello");
     }
 
     #[test]

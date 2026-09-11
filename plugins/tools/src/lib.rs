@@ -4,15 +4,15 @@ use std::{
 };
 
 use harness_contracts::{
-    CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOLS, ToolApproval, ToolCall,
-    ToolError, ToolExecuted, ToolRegistered, ToolSpec,
+    BoxFuture, CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOLS,
+    KEY_TOOL_EXECUTOR, KEY_TOOL_REGISTRY, ToolApproval, ToolCall, ToolError, ToolExecuted,
+    ToolExecutorApi, ToolExecutorHandle, ToolRegistered, ToolRegistryApi, ToolRegistryHandle,
+    ToolSpec,
 };
 use harness_core::{Context, Result};
 
 /// A tool implementation: raw arguments JSON in, string result out.
 pub type ToolHandler = Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
-
-type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
 
 /// Registry and executor of tools.
 ///
@@ -149,7 +149,58 @@ impl Tools {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (ToolSpec, ToolHandler)>> {
-        self.tools.lock().expect("tools registry poisoned")
+        self.tools.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ToolExecutorApi for Tools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Tools::specs(self)
+    }
+
+    fn execute(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        turn: u64,
+        call: ToolCall,
+    ) -> BoxFuture<Result<String, ToolError>> {
+        // Snapshot the full registry + context so the returned future is
+        // `'static` for the object-safe trait. Registrations happen at
+        // startup, so a call-time snapshot (including every handler, so
+        // waterfall rewrites to another tool still resolve) is equivalent
+        // to a live lookup.
+        let snapshot: HashMap<String, (ToolSpec, ToolHandler)> = self
+            .lock()
+            .iter()
+            .map(|(k, (spec, h))| (k.clone(), (spec.clone(), Arc::clone(h))))
+            .collect();
+        let ctx = self.ctx.clone();
+        let agent_id = agent_id.to_owned();
+        let session_id = session_id.to_owned();
+        Box::pin(async move {
+            // Reuse the shared approval + emission path via a short-lived
+            // `Tools` carrying the snapshot. The waterfall and
+            // `tool.executed` emit behave identically; the session listener
+            // still appends inline before this returns.
+            let scoped = Tools {
+                ctx,
+                tools: Mutex::new(snapshot),
+            };
+            scoped.execute(&agent_id, &session_id, turn, call).await
+        })
+    }
+}
+
+impl ToolRegistryApi for Tools {
+    fn register(
+        &self,
+        spec: ToolSpec,
+        handler: Box<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>,
+    ) -> Result<(), String> {
+        // Adapt the boxed handler to the concrete `register` generic.
+        self.register(spec, move |args| handler(args))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -159,6 +210,8 @@ impl harness_core::Plugin for ToolsPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("tools")
             .provides(KEY_TOOLS)
+            .provides(KEY_TOOL_EXECUTOR)
+            .provides(KEY_TOOL_REGISTRY)
             .emits::<ToolRegistered>(CH_TOOL_REGISTERED)
             .emits::<ToolExecuted>(CH_TOOL_EXECUTED)
             .waterfalls::<ToolApproval>(CH_TOOL_APPROVAL)
@@ -166,7 +219,15 @@ impl harness_core::Plugin for ToolsPlugin {
 
     fn build(&self, ctx: Context) -> Result<()> {
         let tools = Arc::new(Tools::new(ctx.clone()));
-        ctx.provide_key(KEY_TOOLS, tools);
+        ctx.provide_key(KEY_TOOLS, tools.clone());
+        ctx.provide_key(
+            KEY_TOOL_EXECUTOR,
+            Arc::new(ToolExecutorHandle(tools.clone() as Arc<dyn ToolExecutorApi>)),
+        );
+        ctx.provide_key(
+            KEY_TOOL_REGISTRY,
+            Arc::new(ToolRegistryHandle(tools as Arc<dyn ToolRegistryApi>)),
+        );
         Ok(())
     }
 }
