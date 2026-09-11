@@ -21,7 +21,7 @@ use harness_tui_state::{
     render::RendererHandle,
 };
 
-use crate::view;
+use crate::view::{self, LayoutCache};
 
 /// How often to redraw even without input, so the busy hint and
 /// late-arriving stream events are always fresh.
@@ -99,6 +99,7 @@ struct EventLoop {
     model_popup: Arc<ModelPopup>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
+    layout_cache: LayoutCache,
 }
 
 impl EventLoop {
@@ -126,6 +127,7 @@ impl EventLoop {
             model_popup,
             tx,
             rx,
+            layout_cache: LayoutCache::new(),
         }
     }
 
@@ -137,11 +139,12 @@ impl EventLoop {
             let snapshot = self.popup.snapshot();
             terminal
                 .draw(|f| {
-                    view::draw_with_popup(
+                    view::draw_with_popup_cached(
                         f,
                         &mut self.app,
                         self.renderer.as_renderer(),
                         snapshot.as_ref(),
+                        &mut self.layout_cache,
                     )
                 })
                 .map_err(|e| e.to_string())?;
@@ -184,9 +187,17 @@ impl EventLoop {
     }
 
     /// Spawns a task that runs one agent turn and forwards its stream
-    /// into the app channel. Fully concurrent: submitting again while a
-    /// turn streams simply starts another one.
+    /// into the app channel. Reject-while-busy: if a turn is already
+    /// streaming, new submits are rejected in [`App::submit`] with an
+    /// inline error and never reach here, so turns never interleave on
+    /// one session.
     fn spawn_turn(&mut self, input: String) {
+        if self.app.is_busy() {
+            // Defense-in-depth: `App::submit` already rejected, but release
+            // builds skip `debug_assert` — fail closed rather than
+            // interleaving two turns on one session.
+            return;
+        }
         self.app.turn_started();
         let agent_loop = self.agent_loop.clone();
         let agent_id = self.agent_id.clone();

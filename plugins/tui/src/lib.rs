@@ -1,7 +1,12 @@
 //! TUI front-end: a ratatui-based chat interface over the agent loop.
 //!
-//! Thin shell crate: terminal I/O and DI wiring only. Pure state lives in
-//! [`harness_tui_state`], markdown rendering in [`harness_tui_markdown`].
+//! Thin DI shell crate (documented exception to the `contracts`-only rule):
+//! leaf UI crates may depend directly on provider crates (`harness-agent-loop`,
+//! `harness-tui-state`, …); domain plugins must never depend on TUI. Pure
+//! state lives in [`harness_tui_state`], markdown rendering in
+//! [`harness_tui_markdown`]. The TUI observes the loop via its
+//! `AgentLoop::run() -> Receiver<TurnEvent>` mpsc stream (backpressure-aware
+//! delivery); the bus `turn.*` channels are telemetry-only.
 //!
 //! Layout of concerns:
 //! - [`input`]: crossterm key/mouse reading task.

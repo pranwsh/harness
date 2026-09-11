@@ -336,6 +336,11 @@ impl App {
         }
     }
 
+    /// Whether a turn is currently streaming.
+    pub fn is_busy(&self) -> bool {
+        self.live_turns > 0
+    }
+
     /// Called by the runtime once a turn task is actually spawned for a
     /// submitted message, to show a busy indicator while it streams.
     pub fn turn_started(&mut self) {
@@ -452,6 +457,13 @@ impl App {
                 return Effect::redraw();
             }
             _ => {}
+        }
+        if self.is_busy() {
+            self.push(ChatItem::new(
+                "busy: wait for the current turn to finish before sending another message",
+                ItemKind::Error,
+            ));
+            return Effect::redraw();
         }
         self.push(ChatItem::new(trimmed.clone(), ItemKind::User));
         Effect {
@@ -973,5 +985,30 @@ mod tests {
         app.clear_input();
         assert_eq!(app.input(), "");
         assert_eq!(app.input_scroll(), 0);
+    }
+
+    #[test]
+    fn submit_while_busy_is_rejected_with_notice() {
+        let mut app = App::new();
+        app.turn_started();
+        assert!(app.is_busy());
+        type_text(&mut app, "hello");
+        let eff = app.reduce(key(KeyEvent::Enter));
+        assert!(eff.redraw);
+        assert!(eff.submitted.is_none(), "busy submit must not produce an effect");
+        assert_eq!(app.input(), "");
+        let last = app.items().last().expect("notice pushed");
+        assert_eq!(last.kind, ItemKind::Error);
+        assert!(last.text.contains("busy"), "got: {}", last.text);
+        // No user item was appended.
+        assert!(!app.items().iter().any(|i| i.kind == ItemKind::User));
+
+        // After turn finishes, submit works again.
+        app.turn_finished();
+        assert!(!app.is_busy());
+        type_text(&mut app, "hello again");
+        let eff = app.reduce(key(KeyEvent::Enter));
+        assert_eq!(eff.submitted.as_deref(), Some("hello again"));
+        assert_eq!(app.items().last().unwrap().kind, ItemKind::User);
     }
 }

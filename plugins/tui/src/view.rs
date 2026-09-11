@@ -28,6 +28,70 @@ const MAX_POPUP_HEIGHT: u16 = 10;
 /// and the input box (`Block`) both use rounded corners from here.
 const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 
+/// Per-frame layout cache owned by the TUI `EventLoop` (not `App` — keeps
+/// `tui-state` pure and `Tui`'s shared `Arc` API untouched). Caches the
+/// laid-out `MsgLayout` per chat item keyed by `(kind, text hash, width)`;
+/// only the trailing mutated item (streaming delta) and width changes miss.
+/// Append-only `items` (except `/clear`) makes invalidation trivial.
+pub(crate) struct LayoutCache {
+    width: u16,
+    hashes: Vec<u64>,
+    layouts: Vec<MsgLayout>,
+}
+
+impl LayoutCache {
+    pub(crate) fn new() -> Self {
+        LayoutCache {
+            width: 0,
+            hashes: Vec::new(),
+            layouts: Vec::new(),
+        }
+    }
+
+    fn key_for(item: &ChatItem) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        (item.kind as u8).hash(&mut h);
+        item.text.hash(&mut h);
+        h.finish()
+    }
+
+    /// Returns the laid-out chat rows, reusing cached entries where the
+    /// item's text/kind and width are unchanged.
+    pub(crate) fn layouts_for(
+        &mut self,
+        items: &[ChatItem],
+        width: u16,
+        renderer: &dyn MessageRenderer,
+    ) -> &[MsgLayout] {
+        if self.width != width {
+            self.width = width;
+            self.hashes.clear();
+            self.layouts.clear();
+        }
+        if self.hashes.len() > items.len() {
+            self.hashes.truncate(items.len());
+            self.layouts.truncate(items.len());
+        }
+        for (idx, item) in items.iter().enumerate() {
+            let key = Self::key_for(item);
+            if idx < self.hashes.len() && self.hashes[idx] == key {
+                continue;
+            }
+            let lay = layout_item(item, width, renderer);
+            if idx < self.hashes.len() {
+                self.hashes[idx] = key;
+                self.layouts[idx] = lay;
+            } else {
+                self.hashes.push(key);
+                self.layouts.push(lay);
+            }
+        }
+        &self.layouts
+    }
+}
+
 /// Draws the whole UI: chat pane (fills remaining space) above the
 /// input box, which grows from 1 up to `INPUT_VISIBLE_ROWS` text rows
 /// as the input wraps. Takes `&mut App` to record the measured input
@@ -49,13 +113,27 @@ pub fn draw_with_popup(
     renderer: &dyn MessageRenderer,
     popup: Option<&ActivePopup>,
 ) {
+    let mut cache = LayoutCache::new();
+    draw_with_popup_cached(f, app, renderer, popup, &mut cache);
+}
+
+/// Cached variant used by the `EventLoop` — `cache` is owned by the loop
+/// (not `App`) so `tui-state` stays pure and `Tui`'s shared `Arc` API is
+/// untouched. Reuses laid-out rows for unchanged items across frames.
+pub(crate) fn draw_with_popup_cached(
+    f: &mut Frame,
+    app: &mut App,
+    renderer: &dyn MessageRenderer,
+    popup: Option<&ActivePopup>,
+    cache: &mut LayoutCache,
+) {
     let area = f.area();
     app.set_input_width(area.width.saturating_sub(2).max(1) as usize);
     let input_height = app.input_rows().min(INPUT_VISIBLE_ROWS) as u16 + 2;
     let [chat_area, input_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_height)]).areas(area);
 
-    draw_chat(f, app, chat_area, renderer);
+    draw_chat_cached(f, app, chat_area, renderer, cache);
     draw_input(f, app, input_area);
     if let Some(popup) = popup {
         draw_popup(f, chat_area, input_area, popup);
@@ -64,8 +142,8 @@ pub fn draw_with_popup(
 
 /// One chat item laid out for the current chat-area width: position,
 /// size, and wrapped content rows.
-#[derive(Debug)]
-struct MsgLayout {
+#[derive(Debug, Clone)]
+pub(crate) struct MsgLayout {
     x: u16,
     width: u16,
     lines: Vec<Line<'static>>,
@@ -73,15 +151,17 @@ struct MsgLayout {
     height: usize,
 }
 
-fn draw_chat(f: &mut Frame, app: &mut App, area: Rect, renderer: &dyn MessageRenderer) {
+fn draw_chat_cached(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    renderer: &dyn MessageRenderer,
+    cache: &mut LayoutCache,
+) {
     if area.width < 2 || area.height == 0 {
         return;
     }
-    let layouts: Vec<MsgLayout> = app
-        .items()
-        .iter()
-        .map(|item| layout_item(item, area.width, renderer))
-        .collect();
+    let layouts = cache.layouts_for(app.items(), area.width, renderer);
     let total: usize = layouts.iter().map(|l| l.height).sum();
     let viewport = area.height as usize;
     // Report the measured geometry so the stored offset is clamped to
@@ -94,7 +174,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect, renderer: &dyn MessageRen
     let mut y = area.y + (viewport - used) as u16;
     let mut remaining = used;
     let mut to_skip = skip;
-    for lay in &layouts {
+    for lay in layouts {
         if to_skip >= lay.height {
             to_skip -= lay.height;
             continue;
