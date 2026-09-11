@@ -9,26 +9,30 @@ mod render;
 
 use std::sync::Arc;
 
-use harness_contracts::{KEY_HASH_STORE, KEY_TOOLS, ToolError, ToolSpec};
+use harness_contracts::{ToolRegistryHandle, KEY_HASH_STORE, KEY_TOOL_REGISTRY, ToolError, ToolSpec};
 use harness_core::{Context, Result};
 use harness_hash_base::HashStore;
-use harness_tools::Tools;
 
 pub struct HashlineReadPlugin;
 
 impl harness_core::Plugin for HashlineReadPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("hashline-read")
-            .injects(KEY_TOOLS)
+            .injects(KEY_TOOL_REGISTRY)
             .injects(KEY_HASH_STORE)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS)?;
+        let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
         let store: Arc<HashStore> = ctx.inject_key(KEY_HASH_STORE)?;
-        tools.register(hashline_read_spec(), move |args| {
-            render::hashline_read_handler(Arc::clone(&store), args)
-        })?;
+        registry
+            .register(hashline_read_spec(), Box::new(move |args| {
+                render::hashline_read_handler(Arc::clone(&store), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "hashline_read".into(),
+                provider: e,
+            })?;
         Ok(())
     }
 }
@@ -60,6 +64,7 @@ pub fn hashline_read_spec() -> ToolSpec {
 mod tests {
     use super::*;
     use harness_contracts::{KEY_TOOLS, ToolCall};
+    use harness_tools::Tools;
     use std::io::Write;
 
     fn ctx_with_plugins() -> Context {

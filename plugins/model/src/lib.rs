@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
 use harness_contracts::{
-    CH_LLM_REQUEST_HEADERS, CH_LLM_RESPONSE_HEADERS, KEY_CONFIG, KEY_MODEL_CLIENT,
-    LlmRequestHeaders, LlmResponseHeaders, Message, Role, ToolCall, ToolSpec,
+    CH_LLM_REQUEST_HEADERS, CH_LLM_RESPONSE_HEADERS, KEY_CONFIG, KEY_MODEL_STREAMER,
+    LlmRequestHeaders, LlmResponseHeaders, Message, ModelStreamerApi, ModelStreamerHandle, Role,
+    ToolCall, ToolSpec,
 };
+// `StreamEvent` lives in contracts (decoupled streaming surface); re-export
+// here so existing `harness_model::StreamEvent` paths keep working.
+pub use harness_contracts::StreamEvent;
 use harness_core::{Context, Plugin, PluginMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use harness_config::AppConfig;
+use harness_contracts::AppConfig;
 
 mod responses;
 
@@ -21,21 +25,6 @@ use responses::{
 /// Boxed completion future returned by [`ModelClient`].
 pub type CompletionFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<Message, ModelError>> + Send + 'a>>;
-
-/// One item of a streaming completion.
-///
-/// The loop forwards `Content` slices for immediate display and resolves the
-/// turn from the terminal event; `Failed` preserves already-shown text and
-/// surfaces through the normal turn-failure path.
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    /// A slice of assistant text, to display immediately.
-    Content(String),
-    /// The stream ended; the fully assembled message (content + tool calls).
-    Done(Message),
-    /// The stream failed after `Content` may already have been emitted.
-    Failed(String),
-}
 
 /// Client abstraction over a chat-completion backend.
 ///
@@ -113,6 +102,12 @@ pub enum ModelError {
 /// ids route to Responses. Both modes share the `llm.request_headers`
 /// waterfall (pre-send hook) and the `llm.response_headers` emit (post
 /// hook); with no listeners both hooks are no-ops.
+///
+/// Endpoint/auth is snapshotted at build from `AppConfig` (base_url,
+/// api_key, user_agent, responses_models) and intentionally requires a
+/// restart to change — live prompt and iteration caps are pulled per-turn,
+/// but rebuilding the HTTP client mid-turn would race in-flight streams.
+/// Only the model *id* is per-call live.
 pub struct HttpModelClient {
     ctx: Context,
     client: reqwest::Client,
@@ -846,24 +841,37 @@ impl ModelClient for ModelClientHandle {
     }
 }
 
+impl ModelStreamerApi for ModelClientHandle {
+    fn stream(
+        self: Arc<Self>,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+        <Self as ModelClient>::stream(self, model, messages, tools)
+    }
+}
+
 pub struct ModelPlugin;
 
 impl Plugin for ModelPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta::new("model")
-            .provides(KEY_MODEL_CLIENT)
+            .provides(KEY_MODEL_STREAMER)
             .injects(KEY_CONFIG)
             .waterfalls::<LlmRequestHeaders>(CH_LLM_REQUEST_HEADERS)
             .emits::<LlmResponseHeaders>(CH_LLM_RESPONSE_HEADERS)
     }
 
     fn build(&self, ctx: Context) -> harness_core::Result<()> {
-        let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
+        let handle: Arc<harness_contracts::ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
+        let config = handle.get();
         let client = HttpModelClient::new(ctx.clone(), &config)
             .map_err(|e| harness_core::Error::PluginPanicked("model".to_owned(), e.to_string()))?;
+        let handle = Arc::new(ModelClientHandle(Arc::new(client)));
         ctx.provide_key(
-            KEY_MODEL_CLIENT,
-            Arc::new(ModelClientHandle(Arc::new(client))),
+            KEY_MODEL_STREAMER,
+            Arc::new(ModelStreamerHandle(handle as Arc<dyn ModelStreamerApi>)),
         );
         Ok(())
     }

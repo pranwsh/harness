@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-agent-default-model = { path = "../agent-default-model" }
-harness-config = { path = "../config" }
 harness-tui-popup = { path = "../tui-popup" }
 harness-tui-state = { path = "../tui-state" }
 tokio.workspace = true
+
+[dev-dependencies]
+harness-agent-default-model = { path = "../agent-default-model" }
+harness-config = { path = "../config" }

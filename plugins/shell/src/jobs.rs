@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::env::apply_env;
 use crate::exec::{Ring, drain_into, resolve_workdir};
 use crate::output::tail_truncate;
-use harness_config::ShellConfig;
+use harness_contracts::ShellConfig;
 
 /// Limits snapshot copied out of `ShellConfig` at build.
 #[derive(Debug, Clone, Copy)]

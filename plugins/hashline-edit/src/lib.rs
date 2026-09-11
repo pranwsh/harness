@@ -10,26 +10,30 @@ mod ops;
 
 use std::sync::Arc;
 
-use harness_contracts::{KEY_HASH_STORE, KEY_TOOLS, ToolError, ToolSpec};
+use harness_contracts::{ToolRegistryHandle, KEY_HASH_STORE, KEY_TOOL_REGISTRY, ToolError, ToolSpec};
 use harness_core::{Context, Result};
 use harness_hash_base::HashStore;
-use harness_tools::Tools;
 
 pub struct HashlineEditPlugin;
 
 impl harness_core::Plugin for HashlineEditPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("hashline-edit")
-            .injects(KEY_TOOLS)
+            .injects(KEY_TOOL_REGISTRY)
             .injects(KEY_HASH_STORE)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS)?;
+        let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
         let store: Arc<HashStore> = ctx.inject_key(KEY_HASH_STORE)?;
-        tools.register(hashline_edit_spec(), move |args| {
-            apply::hashline_edit_handler(Arc::clone(&store), args)
-        })?;
+        registry
+            .register(hashline_edit_spec(), Box::new(move |args| {
+                apply::hashline_edit_handler(Arc::clone(&store), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "hashline_edit".into(),
+                provider: e,
+            })?;
         Ok(())
     }
 }
@@ -77,7 +81,7 @@ mod tests {
     use super::*;
     use harness_contracts::{KEY_HASH_STORE, KEY_TOOLS, ToolCall};
     use harness_hash_base::{HashBasePlugin, short_str};
-    use harness_tools::ToolsPlugin;
+    use harness_tools::{Tools, ToolsPlugin};
     use std::path::{Path, PathBuf};
 
     fn ctx_with_plugins() -> Context {

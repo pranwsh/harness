@@ -1,9 +1,11 @@
 use std::sync::{Arc, RwLock};
 
-use harness_contracts::{CH_MODEL_SELECTED, KEY_CONFIG, KEY_MODEL_SELECTOR, ModelSelected};
+use harness_contracts::{
+    AppConfig, BoxFuture, CH_MODEL_SELECTED, KEY_CONFIG, KEY_MODEL_CATALOG, KEY_MODEL_SELECTOR,
+    KEY_MODEL_SELECTOR_API, ModelCatalogApi, ModelCatalogHandle, ModelSelected, ModelSelectorApi,
+    ModelSelectorHandle,
+};
 use harness_core::{Context, Result};
-
-use harness_config::AppConfig;
 
 /// Chooses which model an agent uses.
 ///
@@ -12,6 +14,10 @@ use harness_config::AppConfig;
 /// so the popup opens instantly; refreshed from `GET {base_url}/models` in
 /// the background). Knows nothing about popups or the TUI — the tui-model
 /// plugin is the only bridge between this and the generic popup service.
+///
+/// Endpoint is snapshotted from `AppConfig` at build (base_url, api_key)
+/// and requires a restart to change; the active model id and catalog are
+/// live (the `/model` popup updates `current`/`catalog` in-place).
 pub struct ModelSelector {
     ctx: Context,
     default: RwLock<String>,
@@ -176,20 +182,67 @@ fn parse_model_ids(value: &serde_json::Value) -> Vec<String> {
     ids
 }
 
+impl ModelSelectorApi for ModelSelector {
+    fn select(&self, agent_id: &str) -> String {
+        ModelSelector::select(self, agent_id)
+    }
+}
+
+impl ModelCatalogApi for ModelSelector {
+    fn current(&self) -> String {
+        ModelSelector::current(self)
+    }
+    fn default_model(&self) -> String {
+        ModelSelector::default_model(self)
+    }
+    fn models(&self) -> Vec<String> {
+        ModelSelector::models(self)
+    }
+    fn set_current(&self, model: &str) {
+        ModelSelector::set_current(self, model)
+    }
+    fn set_catalog(&self, models: Vec<String>) {
+        ModelSelector::set_catalog(self, models)
+    }
+    fn snapshot(&self) -> (String, Vec<String>) {
+        ModelSelector::snapshot(self)
+    }
+    fn restore(&self, current: String, catalog: Vec<String>) {
+        ModelSelector::restore(self, current, catalog)
+    }
+    fn sync_default(&self, model: &str) {
+        ModelSelector::sync_default(self, model)
+    }
+    fn refresh(self: Arc<Self>) -> BoxFuture<Option<Vec<String>>> {
+        Box::pin(async move { ModelSelector::refresh(&*self).await })
+    }
+}
+
 pub struct AgentDefaultModelPlugin;
 
 impl harness_core::Plugin for AgentDefaultModelPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("agent-default-model")
             .provides(KEY_MODEL_SELECTOR)
+            .provides(KEY_MODEL_SELECTOR_API)
+            .provides(KEY_MODEL_CATALOG)
             .injects(KEY_CONFIG)
             .emits::<ModelSelected>(CH_MODEL_SELECTED)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
-        let selector = ModelSelector::from_config(ctx.clone(), &config);
-        ctx.provide_key(KEY_MODEL_SELECTOR, Arc::new(selector));
+        let handle: Arc<harness_contracts::ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
+        let config = handle.get();
+        let selector = Arc::new(ModelSelector::from_config(ctx.clone(), &config));
+        ctx.provide_key(KEY_MODEL_SELECTOR, selector.clone());
+        ctx.provide_key(
+            KEY_MODEL_SELECTOR_API,
+            Arc::new(ModelSelectorHandle(selector.clone() as Arc<dyn ModelSelectorApi>)),
+        );
+        ctx.provide_key(
+            KEY_MODEL_CATALOG,
+            Arc::new(ModelCatalogHandle(selector as Arc<dyn ModelCatalogApi>)),
+        );
         Ok(())
     }
 }

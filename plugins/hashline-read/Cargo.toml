@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-tools = { path = "../tools" }
 harness-hash-base = { path = "../hash-base" }
 futures.workspace = true
 serde.workspace = true
@@ -17,4 +16,5 @@ memchr = "2"
 fs2 = "0.4"
 
 [dev-dependencies]
+harness-tools = { path = "../tools" }
 tokio.workspace = true

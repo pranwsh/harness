@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::env::apply_env;
 use crate::output::format_shell_result;
-use harness_config::ShellConfig;
+use harness_contracts::ShellConfig;
 
 /// Validated request for one synchronous run.
 pub struct ExecRequest {

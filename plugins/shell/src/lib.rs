@@ -29,8 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use harness_config::{AppConfig, ShellConfig};
-use harness_contracts::{KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOLS, ToolError, ToolSpec};
+use harness_contracts::{ShellConfig, ToolRegistryHandle, KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOL_REGISTRY, ToolError, ToolSpec};
 use harness_core::{Context, Result};
 
 pub use jobs::{DEFAULT_POLL_WAIT_MS, JobLimits, MAX_POLL_WAIT_MS};
@@ -380,31 +379,51 @@ impl harness_core::Plugin for ShellPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("shell")
             .provides(KEY_SHELL_SERVICE)
-            .injects(KEY_TOOLS)
+            .injects(KEY_TOOL_REGISTRY)
             .injects(KEY_CONFIG)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        use harness_tools::Tools;
-        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS)?;
-        let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
+        let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
+        let handle: Arc<harness_contracts::ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
+        let config = handle.get();
         let svc = Arc::new(ShellService::new(config.shell.clone()));
-        tools.register(shell_exec_spec(), {
-            let svc = Arc::clone(&svc);
-            move |args| shell_exec_handler(Arc::clone(&svc), args)
-        })?;
-        tools.register(shell_start_spec(), {
-            let svc = Arc::clone(&svc);
-            move |args| shell_start_handler(Arc::clone(&svc), args)
-        })?;
-        tools.register(shell_poll_spec(), {
-            let svc = Arc::clone(&svc);
-            move |args| shell_poll_handler(Arc::clone(&svc), args)
-        })?;
-        tools.register(shell_stop_spec(), {
-            let svc = Arc::clone(&svc);
-            move |args| shell_stop_handler(Arc::clone(&svc), args)
-        })?;
+        registry
+            .register(shell_exec_spec(), Box::new({
+                let svc = Arc::clone(&svc);
+                move |args| shell_exec_handler(Arc::clone(&svc), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "shell_exec".into(),
+                provider: e,
+            })?;
+        registry
+            .register(shell_start_spec(), Box::new({
+                let svc = Arc::clone(&svc);
+                move |args| shell_start_handler(Arc::clone(&svc), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "shell_start".into(),
+                provider: e,
+            })?;
+        registry
+            .register(shell_poll_spec(), Box::new({
+                let svc = Arc::clone(&svc);
+                move |args| shell_poll_handler(Arc::clone(&svc), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "shell_poll".into(),
+                provider: e,
+            })?;
+        registry
+            .register(shell_stop_spec(), Box::new({
+                let svc = Arc::clone(&svc);
+                move |args| shell_stop_handler(Arc::clone(&svc), args)
+            }))
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "shell_stop".into(),
+                provider: e,
+            })?;
         // Keep the service alive for the plugin lifetime; dropping it aborts
         // background jobs via JobManager::drop. Stored under `KEY_SHELL_SERVICE`
         // owned by this plugin so unload cleans it up.

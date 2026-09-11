@@ -10,16 +10,17 @@
 //! (auth validation still applies), and omitting this plugin from the
 //! harness changes nothing — the waterfall is a no-op without handlers.
 //!
-//! The post-hook log line is opt-in via `HARNESS_LOG_LLM_HEADERS`: anything
+//! Headers are snapshotted from `AppConfig` at build and require a restart
+//! to change (intentionally — live header mutation would race in-flight
+//! requests). The post-hook log line is opt-in via `HARNESS_LOG_LLM_HEADERS`: anything
 //! written to stderr while the TUI owns the screen corrupts the display
 //! (it shows up as ghost text in the input box), so observation stays silent
 //! by default.
 
 use std::sync::Arc;
 
-use harness_config::AppConfig;
 use harness_contracts::{
-    CH_LLM_REQUEST_HEADERS, CH_LLM_RESPONSE_HEADERS, KEY_CONFIG, LlmRequestHeaders,
+    AppConfig, CH_LLM_REQUEST_HEADERS, CH_LLM_RESPONSE_HEADERS, KEY_CONFIG, LlmRequestHeaders,
     LlmResponseHeaders,
 };
 use harness_core::{Context, Result};
@@ -105,7 +106,8 @@ impl harness_core::Plugin for ModelHeadersPlugin {
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
-        let config: Arc<AppConfig> = ctx.inject_key(KEY_CONFIG)?;
+        let handle: Arc<harness_contracts::ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
+        let config = handle.get();
         // One session id per plugin load, reused for every request.
         let session_id = new_session_id();
         ctx.on_waterfall_key::<LlmRequestHeaders, _, _>(CH_LLM_REQUEST_HEADERS, move |req| {

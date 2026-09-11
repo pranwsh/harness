@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
-harness-config = { path = "../config" }
 uuid.workspace = true
 
 [dev-dependencies]
+harness-config = { path = "../config" }
 tokio.workspace = true

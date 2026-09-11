@@ -411,7 +411,9 @@ fn atomic_write(
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| crate::tool_err(format!("cannot stage write: {e}")))?;
     if let Some(p) = perm {
-        let _ = tmp.as_file().set_permissions(p);
+        if let Err(e) = tmp.as_file().set_permissions(p) {
+            eprintln!("hashline-edit: set_permissions failed (best-effort, mode may be wrong): {e}");
+        }
     }
     use std::io::Write as _;
     tmp.write_all(buf)

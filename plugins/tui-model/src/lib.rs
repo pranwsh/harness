@@ -16,9 +16,7 @@
 
 use std::sync::Arc;
 
-use harness_agent_default_model::ModelSelector;
-use harness_config::ConfigService;
-use harness_contracts::{KEY_MODEL_POPUP, KEY_MODEL_SELECTOR, KEY_POPUP};
+use harness_contracts::{ConfigHandle, ModelCatalogHandle, KEY_CONFIG, KEY_MODEL_CATALOG, KEY_MODEL_POPUP, KEY_POPUP};
 use harness_core::{Context, Result};
 use harness_tui_popup::{ActivePopup, Popup};
 use harness_tui_state::app::{App, AppMsg, KeyEvent};
@@ -32,15 +30,15 @@ pub const TITLE: &str = " model ";
 
 pub struct ModelPopup {
     popup: Arc<Popup>,
-    selector: Arc<ModelSelector>,
-    config_service: Option<Arc<ConfigService>>,
+    selector: Arc<ModelCatalogHandle>,
+    config_service: Option<Arc<ConfigHandle>>,
 }
 
 impl ModelPopup {
     pub fn new(
         popup: Arc<Popup>,
-        selector: Arc<ModelSelector>,
-        config_service: Option<Arc<ConfigService>>,
+        selector: Arc<ModelCatalogHandle>,
+        config_service: Option<Arc<ConfigHandle>>,
     ) -> Self {
         ModelPopup {
             popup,
@@ -75,7 +73,7 @@ impl ModelPopup {
         let selector = self.selector.clone();
         let popup = self.popup.clone();
         tokio::spawn(async move {
-            if let Some(ids) = selector.refresh().await {
+            if let Some(ids) = std::sync::Arc::clone(&selector.0).refresh().await {
                 popup.refresh_items(ids, Some(selector.current()));
             }
         });
@@ -154,17 +152,16 @@ impl harness_core::Plugin for TuiModelPlugin {
         harness_core::PluginMeta::new("tui-model")
             .provides(KEY_MODEL_POPUP)
             .injects(KEY_POPUP)
-            .injects(KEY_MODEL_SELECTOR)
+            .injects(KEY_MODEL_CATALOG)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
         let popup: Arc<Popup> = ctx.inject_key(KEY_POPUP)?;
-        let selector: Arc<ModelSelector> = ctx.inject_key(KEY_MODEL_SELECTOR)?;
+        let selector: Arc<ModelCatalogHandle> = ctx.inject_key(KEY_MODEL_CATALOG)?;
         // Optional on purpose (no `injects` declaration, so parking behavior
         // is unchanged): embedded/test contexts without a file-backed config
         // degrade to session-only model switches.
-        let config_service: Option<Arc<ConfigService>> =
-            ctx.try_inject_key(harness_contracts::KEY_CONFIG_SERVICE);
+        let config_service: Option<Arc<ConfigHandle>> = ctx.try_inject_key(KEY_CONFIG);
         ctx.provide_key(
             KEY_MODEL_POPUP,
             Arc::new(ModelPopup::new(popup, selector, config_service)),
@@ -176,10 +173,12 @@ impl harness_core::Plugin for TuiModelPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_config::ConfigService;
+    use harness_contracts::{ConfigHandle, ModelCatalogHandle};
     use harness_tui_state::app::AppMsg;
 
-    fn test_config(model: &str) -> harness_config::AppConfig {
-        harness_config::AppConfig::from_toml(
+    fn test_config(model: &str) -> harness_contracts::AppConfig {
+        harness_contracts::AppConfig::from_toml(
             &format!(
                 "[llm]\nbase_url = \"u\"\nmodel = \"{model}\"\napi_key = \"k\"\nuser_agent = \"a\"\n"
             ),
@@ -188,15 +187,20 @@ mod tests {
         .unwrap()
     }
 
-    fn test_selector(model: &str) -> Arc<ModelSelector> {
-        Arc::new(ModelSelector::new(harness_core::Context::root(), model))
+    fn test_selector(model: &str) -> Arc<ModelCatalogHandle> {
+        use harness_agent_default_model::ModelSelector;
+        use harness_contracts::ModelCatalogApi;
+        let sel = Arc::new(ModelSelector::new(harness_core::Context::root(), model));
+        Arc::new(ModelCatalogHandle(sel as Arc<dyn ModelCatalogApi>))
     }
 
     fn test_popup(
-        selector: Arc<ModelSelector>,
+        selector: Arc<ModelCatalogHandle>,
         config_service: Option<Arc<ConfigService>>,
     ) -> ModelPopup {
-        ModelPopup::new(Arc::new(Popup::new()), selector, config_service)
+        let wrapped = config_service
+            .map(|svc| Arc::new(ConfigHandle(svc as Arc<dyn harness_contracts::ConfigApi>)));
+        ModelPopup::new(Arc::new(Popup::new()), selector, wrapped)
     }
 
     fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
