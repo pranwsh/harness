@@ -747,8 +747,12 @@ dependencies = [
 name = "harness-contracts"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -813,7 +817,6 @@ name = "harness-model"
 version = "0.1.0"
 dependencies = [
  "futures",
- "harness-config",
  "harness-contracts",
  "harness-core",
  "reqwest",

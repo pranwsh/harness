@@ -164,7 +164,7 @@ impl BashSession {
             || state.stdin.write_all(b"\n").await.is_err()
             || state.stdin.flush().await.is_err()
         {
-            let _ = std::fs::remove_file(tmp);
+            let _ = tokio::fs::remove_file(tmp).await;
             return Attempt::Broken;
         }
         let marker = format!("__HARNESS_DONE_{nonce}");
@@ -176,8 +176,8 @@ impl BashSession {
                 out_omit,
                 exit,
             }) => {
-                let (err, err_omit) = read_capped_tail(tmp, cap);
-                let _ = std::fs::remove_file(tmp);
+                let (err, err_omit) = read_capped_tail(tmp, cap).await;
+                let _ = tokio::fs::remove_file(tmp).await;
                 Attempt::Done(SessionOutput {
                     exit_code: exit,
                     timed_out: false,
@@ -200,8 +200,8 @@ impl BashSession {
                 let code = state.child.wait().await.ok().and_then(|s| s.code());
                 // Reap so no zombie lingers; the slot is dropped by the
                 // caller path (respawn happens on the next run).
-                let (err, err_omit) = read_capped_tail(tmp, cap);
-                let _ = std::fs::remove_file(tmp);
+                let (err, err_omit) = read_capped_tail(tmp, cap).await;
+                let _ = tokio::fs::remove_file(tmp).await;
                 match code {
                     Some(c) => Attempt::Done(SessionOutput {
                         exit_code: Some(c),
@@ -217,15 +217,15 @@ impl BashSession {
                 }
             }
             Ok(ReadOutcome::Broken) => {
-                let _ = std::fs::remove_file(tmp);
+                let _ = tokio::fs::remove_file(tmp).await;
                 Attempt::Broken
             }
             Err(_) => {
                 // Timeout: partial stdout tail survives; stderr tail too.
                 // The shell is killed by the caller (`kill_slot`).
                 let (out, out_omit) = take_partial_stdout(&mut state.stdout, cap).await;
-                let (err, err_omit) = read_capped_tail(tmp, cap);
-                let _ = std::fs::remove_file(tmp);
+                let (err, err_omit) = read_capped_tail(tmp, cap).await;
+                let _ = tokio::fs::remove_file(tmp).await;
                 Attempt::TimedOut(SessionOutput {
                     exit_code: None,
                     timed_out: true,
@@ -314,24 +314,28 @@ async fn take_partial_stdout(stdout: &mut BufReader<ChildStdout>, cap: usize) ->
     ring.snapshot_with_omitted()
 }
 
-/// Reads the per-call stderr file's tail, bounded by `cap`.
-fn read_capped_tail(path: &Path, cap: usize) -> (Vec<u8>, u64) {
-    let cap = cap.max(1024);
-    let Ok(file) = std::fs::File::open(path) else {
-        return (Vec::new(), 0);
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    // Over-read slightly so the UTF-8 boundary fixup never eats content.
-    let start = len.saturating_sub(cap as u64 + 4);
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = file;
-    let mut buf = Vec::new();
-    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut buf).is_err() {
-        return (Vec::new(), 0);
+    /// Reads the per-call stderr file's tail, bounded by `cap`.
+    async fn read_capped_tail(path: &Path, cap: usize) -> (Vec<u8>, u64) {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let cap = cap.max(1024);
+        let Ok(mut file) = tokio::fs::File::open(path).await else {
+            return (Vec::new(), 0);
+        };
+        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        // Over-read slightly so the UTF-8 boundary fixup never eats content.
+        let start = len.saturating_sub(cap as u64 + 4);
+        let mut buf = Vec::new();
+        if file
+            .seek(std::io::SeekFrom::Start(start))
+            .await
+            .is_err()
+            || file.read_to_end(&mut buf).await.is_err()
+        {
+            return (Vec::new(), 0);
+        }
+        let tail = crate::output::tail_truncate(&buf, cap);
+        (tail.text.into_bytes(), start + tail.omitted_bytes)
     }
-    let tail = crate::output::tail_truncate(&buf, cap);
-    (tail.text.into_bytes(), start + tail.omitted_bytes)
-}
 
 /// Builds the wrapper sent to the session shell. Grouped in `{ }` so the
 /// redirections cover multi-command scripts; subshelled only for an
