@@ -195,6 +195,45 @@ pub struct SessionTurnClosed {
     pub turn: u64,
 }
 
+/// `CH_SESSION_TURN_OPEN_REQUESTED` — waterfall request for a new turn.
+///
+/// The loop sends `{session_id, turn: 0}`; the session plugin's waterfall
+/// handler assigns the monotonic turn and returns it. `turn == 0` in the
+/// response means no session handler was present — the turn must fail
+/// closed so the loop never appends against a phantom turn. `turn` is the
+/// only mutable field so the payload stays `Clone` for waterfall chaining.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnOpenRequested {
+    pub session_id: SessionId,
+    pub turn: u64,
+}
+
+/// `CH_SESSION_TURN_CLOSE_REQUESTED` — one-way request to close a turn.
+///
+/// Emitted by the loop when a turn ends (success or failure). The session
+/// plugin handles it with a sync listener and emits `session.turn_closed`.
+/// No response needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnCloseRequested {
+    pub session_id: SessionId,
+    pub turn: u64,
+}
+
+/// `CH_SESSION_APPEND_REQUESTED` — canonical write path for conversation
+/// entries owned by the session plugin.
+///
+/// The loop emits this for user and assistant entries instead of calling
+/// the log directly, so every persistence path (user/assistant via this
+/// channel, tool results via `tool.executed`) funnels through the session
+/// plugin's sync listeners. Sync listeners run inline on the emitting
+/// thread, so the append is guaranteed once `emit_key` returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAppendRequested {
+    pub session_id: SessionId,
+    pub turn: u64,
+    pub entry: Entry,
+}
+
 /// `CH_TOOL_REGISTERED`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRegistered {

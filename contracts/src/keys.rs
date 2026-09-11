@@ -5,14 +5,12 @@
 
 // ---- services ---------------------------------------------------------------
 
-/// `Arc<AppConfig>` — provided by the config plugin.
+/// `Arc<ConfigHandle>` (`Arc<dyn ConfigApi>`) — single source of truth for
+/// configuration. Provided by the config plugin; consumers derive snapshots
+/// (`get()`), bounds (`max_iterations()`), or mutations (`set_llm_model()`)
+/// from it so live updates never fork across keys.
 pub const KEY_CONFIG: &str = "config.app";
-/// `Arc<ConfigService>` — provided by the config plugin. General,
-/// domain-agnostic read/modify/persist access to `config.toml`; consumers
-/// (e.g. the `/model` bridge) mutate through it instead of touching files.
-pub const KEY_CONFIG_SERVICE: &str = "config.service";
-/// `Arc<dyn ModelClient>` — provided by the model plugin.
-pub const KEY_MODEL_CLIENT: &str = "model.chat";
+
 /// `Arc<AgentRegistry>` — provided by the agent plugin.
 pub const KEY_AGENTS: &str = "agents.registry";
 /// `Arc<SessionLog>` — provided by the session plugin.
@@ -43,8 +41,8 @@ pub const KEY_INPUT: &str = "ui.input";
 pub const KEY_POPUP: &str = "ui.popup";
 /// `Arc<ModelPopup>` — provided by the tui-model plugin, injected by the
 /// tui shell to route `/model` keys and input triggers. Injects
-/// [`KEY_POPUP`](KEY_POPUP) for content plus [`KEY_MODEL_SELECTOR`] and an
-/// optional [`KEY_CONFIG_SERVICE`] for persistence.
+/// [`KEY_POPUP`](KEY_POPUP) for content plus [`KEY_MODEL_CATALOG`] and an
+/// optional [`KEY_CONFIG`] (via `ConfigApi`) for persistence.
 pub const KEY_MODEL_POPUP: &str = "ui.model_popup";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
@@ -52,6 +50,28 @@ pub const KEY_HASH_STORE: &str = "hash.store";
 /// `Arc<ShellService>` — provided by the shell plugin. Kept alive for the
 /// plugin lifetime so background jobs are aborted on unload via `JobManager::drop`.
 pub const KEY_SHELL_SERVICE: &str = "shell.service";
+
+// ---- service-trait handles (decoupled DI) -----------------------------------
+// Each provider publishes `Arc<Handle>` here alongside its legacy concrete
+// service. New consumers inject the handle and never name the provider
+// crate; legacy concrete keys remain for pre-migration consumers.
+
+/// `Arc<AgentRegistryHandle>` — trait view over the agent registry.
+pub const KEY_AGENTS_API: &str = "agents.api";
+/// `Arc<SessionStoreHandle>` — read + turn-bookkeeping view over sessions.
+pub const KEY_SESSION_STORE: &str = "sessions.store";
+/// `Arc<ToolExecutorHandle>` — specs + execute view over tools.
+pub const KEY_TOOL_EXECUTOR: &str = "tools.executor_api";
+/// `Arc<ToolRegistryHandle>` — registration view over tools.
+pub const KEY_TOOL_REGISTRY: &str = "tools.registry";
+/// `Arc<PromptAssemblerHandle>` — pure assembly view over system-prompt.
+pub const KEY_PROMPT_ASSEMBLER: &str = "prompt.assembler_api";
+/// `Arc<ModelSelectorHandle>` — per-iteration model choice view.
+pub const KEY_MODEL_SELECTOR_API: &str = "model.selector_api";
+/// `Arc<ModelCatalogHandle>` — rich catalog view for the `/model` popup.
+pub const KEY_MODEL_CATALOG: &str = "model.catalog";
+/// `Arc<ModelStreamerHandle>` — streaming view over the model client.
+pub const KEY_MODEL_STREAMER: &str = "model.streamer";
 
 // ---- channels ---------------------------------------------------------------
 
@@ -62,10 +82,20 @@ pub const CH_AGENT_STATE_CHANGED: &str = "agent.state_changed";
 
 /// `SessionTurnOpened` — a session turn was opened.
 pub const CH_SESSION_TURN_OPENED: &str = "session.turn_opened";
+/// `SessionTurnOpenRequested` — waterfall request for a new turn.
+pub const CH_SESSION_TURN_OPEN_REQUESTED: &str = "session.turn_open_requested";
+/// `SessionTurnCloseRequested` — one-way request to close a turn.
+pub const CH_SESSION_TURN_CLOSE_REQUESTED: &str = "session.turn_close_requested";
 /// `SessionEntryAppended` — an entry was appended to a session.
 pub const CH_SESSION_ENTRY_APPENDED: &str = "session.entry_appended";
 /// `SessionTurnClosed` — a session turn was closed.
 pub const CH_SESSION_TURN_CLOSED: &str = "session.turn_closed";
+/// `SessionAppendRequested` — a producer (e.g. the agent loop) asks the
+/// session plugin to append one entry. The session plugin owns all
+/// persistence and handles this with a sync listener, so the entry is
+/// durable before the emitter resumes. User/assistant entries travel here;
+/// tool results travel via `tool.executed` for the same guarantee.
+pub const CH_SESSION_APPEND_REQUESTED: &str = "session.append_requested";
 
 /// `ToolRegistered` — a tool was registered with the executor.
 pub const CH_TOOL_REGISTERED: &str = "tool.registered";
