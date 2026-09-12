@@ -13,9 +13,9 @@ use crossterm::{
 use tokio::sync::mpsc;
 
 use harness_agent_loop::{AgentLoop, TurnEvent};
+use harness_tui_commands::CommandPopup;
 use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
-use harness_tui_popup::Popup;
 use harness_tui_state::{
     app::{App, AppMsg, KeyEvent},
     render::RendererHandle,
@@ -31,10 +31,12 @@ const RENDER_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 /// including on panic (hooks below). Services come from DI so alternative
 /// renderers or input sources plug in without touching this loop.
 ///
-/// The popup surface (`popup`) is the generic render state; the model
-/// provider (`model_popup`) owns all `/model` behavior (trigger, key
-/// routing, catalog refresh, persistence). The loop itself stays
-/// domain-free and never touches the selector or config directly.
+/// Each provider owns its own popup surface and all domain behavior.
+/// The slash-commands provider (`command_popup`) filters `/`-prefixes
+/// non-modally (cursor stays in the entry bar); the model provider
+/// (`model_popup`) owns the modal `/model` selector. The loop draws at
+/// most one snapshot (model first, else commands) and itself stays
+/// domain-free, never touching catalogs or config directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     agent_loop: Arc<AgentLoop>,
@@ -42,8 +44,8 @@ pub async fn run(
     session_id: String,
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
-    popup: Arc<Popup>,
     model_popup: Arc<ModelPopup>,
+    command_popup: Arc<CommandPopup>,
 ) {
     let terminal = ratatui::init();
     enable_terminal_features();
@@ -53,8 +55,8 @@ pub async fn run(
         session_id,
         renderer,
         input,
-        popup,
         model_popup,
+        command_popup,
     )
     .run(terminal)
     .await;
@@ -95,8 +97,8 @@ struct EventLoop {
     session_id: String,
     app: App,
     renderer: Arc<RendererHandle>,
-    popup: Arc<Popup>,
     model_popup: Arc<ModelPopup>,
+    command_popup: Arc<CommandPopup>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
     layout_cache: LayoutCache,
@@ -110,8 +112,8 @@ impl EventLoop {
         session_id: String,
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
-        popup: Arc<Popup>,
         model_popup: Arc<ModelPopup>,
+        command_popup: Arc<CommandPopup>,
     ) -> Self {
         // Bound generous enough to absorb bursts of stream events; the
         // input task bails out if the loop ever stops draining.
@@ -123,8 +125,8 @@ impl EventLoop {
             session_id,
             app: App::new(),
             renderer,
-            popup,
             model_popup,
+            command_popup,
             tx,
             rx,
             layout_cache: LayoutCache::new(),
@@ -136,7 +138,12 @@ impl EventLoop {
         mut terminal: ratatui::DefaultTerminal,
     ) -> std::result::Result<(), String> {
         loop {
-            let snapshot = self.popup.snapshot();
+            // Each provider owns its surface; draw at most one, model
+            // first so the modal selector wins over autocomplete.
+            let snapshot = self
+                .model_popup
+                .snapshot()
+                .or_else(|| self.command_popup.snapshot());
             terminal
                 .draw(|f| {
                     view::draw_with_popup_cached(
@@ -157,25 +164,65 @@ impl EventLoop {
                 _ = tokio::time::sleep(RENDER_TICK) => continue,
             };
 
-            // Popup-first key routing: while open, arrows/Enter/Esc belong
-            // to the popup provider and never reach the editor; a `/model`
-            // Enter opens it instead of submitting as chat. Both decisions
-            // live in the model plugin; this loop stays domain-free.
+            // Non-modal filter popups, each provider owning its decisions
+            // and its surface; this loop stays domain-free:
+            // - Model search active: nav/completion keys belong to it;
+            //   editing keys fall through so the entry bar stays live, then
+            //   `sync` re-filters the catalog.
+            // - Else slash open + nav/completion key: Up/Down/Esc/Tab move,
+            //   dismiss, or complete via `set_input`. Exact-`Enter` falls
+            //   through to execute.
+            // - Else exact `/model` Enter: opens model search and closes
+            //   the slash list (the staged `/model ` line still matches a
+            //   slash candidate, so it cannot self-close).
+            // - Else: normal edit; post-reduce syncs the eligible provider.
             if let AppMsg::Key(key) = &msg {
-                if self.model_popup.is_open() {
+                if self.model_popup.is_active() {
                     if self.model_popup.handle_key(*key, &mut self.app) {
                         if self.app.should_quit() {
                             break;
                         }
                         continue;
                     }
-                } else if *key == KeyEvent::Enter && self.model_popup.wants_input(self.app.input()) {
-                    self.model_popup.open(&mut self.app);
-                    continue;
+                } else {
+                    if self.command_popup.is_open()
+                        && matches!(
+                            *key,
+                            KeyEvent::Up
+                                | KeyEvent::Down
+                                | KeyEvent::Esc
+                                | KeyEvent::Tab
+                                | KeyEvent::Enter
+                        )
+                        && self.command_popup.handle_key(*key, &mut self.app)
+                    {
+                        if self.app.should_quit() {
+                            break;
+                        }
+                        continue;
+                    }
+                    if *key == KeyEvent::Enter && self.model_popup.wants_input(self.app.input()) {
+                        self.model_popup.open(&mut self.app);
+                        self.command_popup.close();
+                        continue;
+                    }
                 }
             }
 
+            let is_key = matches!(msg, AppMsg::Key(_));
             let effect = self.app.reduce(msg);
+            if is_key {
+                // Only the eligible provider re-filters: an active search
+                // suppresses slash completion, and a session ended by
+                // editing (e.g. backspaced to `/mode`) falls straight
+                // through to slash on the same keystroke.
+                if self.model_popup.is_active() {
+                    self.model_popup.sync(&self.app);
+                }
+                if !self.model_popup.is_active() {
+                    self.command_popup.sync(&self.app);
+                }
+            }
             if let Some(input) = effect.submitted {
                 self.spawn_turn(input);
             }
