@@ -90,6 +90,7 @@ fn map_key(key: TermKeyEvent) -> Option<KeyEvent> {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Some(KeyEvent::Newline),
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => Some(KeyEvent::Newline),
         KeyCode::Enter => Some(KeyEvent::Enter),
+        KeyCode::Tab => Some(KeyEvent::Tab),
         KeyCode::Backspace => Some(KeyEvent::Backspace),
         KeyCode::Delete => Some(KeyEvent::Delete),
         KeyCode::Left => Some(KeyEvent::Left),
