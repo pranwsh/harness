@@ -96,6 +96,10 @@ pub enum KeyEvent {
     Enter,
     /// Shift+Enter (or Alt+Enter): insert a newline without submitting.
     Newline,
+    /// Tab: autocomplete key for provider popups (e.g. slash commands).
+    /// The app itself ignores it so the cursor never moves; providers
+    /// intercept it before it reaches here when their popup is open.
+    Tab,
     Backspace,
     Delete,
     Left,
@@ -183,6 +187,15 @@ impl App {
     /// open the popup instead of submitting as chat).
     pub fn clear_input(&mut self) {
         let _ = self.editor.take();
+        self.input_scroll = 0;
+        self.follow_input_cursor();
+    }
+
+    /// Replaces the input line (used by autocomplete providers such as
+    /// slash commands to fill the selected value). Generic on purpose:
+    /// no command knowledge lives here. Cursor lands at the end.
+    pub fn set_input(&mut self, text: &str) {
+        self.editor.set_text(text);
         self.input_scroll = 0;
         self.follow_input_cursor();
     }
@@ -419,12 +432,13 @@ impl App {
                 Effect::redraw()
             }
             // Ctrl+C interrupts the app; Esc alone is a no-op (quitting
-            // is `/quit` only).
+            // is `/quit` only). Tab is provider-owned (autocomplete) and
+            // never touches the editor.
             KeyEvent::Interrupt => {
                 self.quit = true;
                 Effect::redraw()
             }
-            KeyEvent::Esc => Effect::default(),
+            KeyEvent::Tab | KeyEvent::Esc => Effect::default(),
         }
     }
 
