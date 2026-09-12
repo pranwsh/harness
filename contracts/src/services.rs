@@ -7,8 +7,8 @@
 //! publish `Arc<Handle>` under the corresponding `KEY_*_API` key alongside
 //! any legacy concrete service.
 //!
-//! Exceptions: the TUI leaf shell (`tui`/`tui-model`/`tui-input`/
-//! `tui-markdown`/`tui-popup`/`tui-state`) and the shared hashing infra
+//! Exceptions: the TUI leaf shell (`tui`/`tui-model`/`tui-commands`/
+//! `tui-filter`/`tui-input`/`tui-markdown`/`tui-popup`/`tui-state`) and the shared hashing infra
 //! (`hashline-read`/`hashline-edit` → `hash-base`) are the only allowed
 //! direct plugin→plugin edges. Both are downward into leaves/bases, never
 //! domain→domain, and keep the graph acyclic. See `contracts/src/lib.rs`
