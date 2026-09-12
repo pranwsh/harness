@@ -1,0 +1,11 @@
+[package]
+name = "harness-tui-commands"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+harness-tui-filter = { path = "../tui-filter" }
+harness-tui-popup = { path = "../tui-popup" }
+harness-tui-state = { path = "../tui-state" }
