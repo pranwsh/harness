@@ -218,6 +218,15 @@ impl Editor {
         self.cursor = 0;
         std::mem::take(&mut self.text)
     }
+
+    /// Replaces the whole buffer, pinning the cursor at the end on a
+    /// `char` boundary (end is always one). Generic primitive for
+    /// autocomplete providers; no domain knowledge here.
+    pub fn set_text(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.cursor = self.text.len();
+    }
 }
 
 #[cfg(test)]
