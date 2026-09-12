@@ -8,6 +8,7 @@ harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
 harness-agent-loop = { path = "../agent-loop" }
 harness-tui-model = { path = "../tui-model" }
+harness-tui-commands = { path = "../tui-commands" }
 harness-tui-state = { path = "../tui-state" }
 harness-tui-input = { path = "../tui-input" }
 harness-tui-popup = { path = "../tui-popup" }
