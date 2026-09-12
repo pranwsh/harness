@@ -12,16 +12,18 @@
 //!
 //! Exceptions (both acyclic, downward-only, documented as intentional
 //! coupling):
-//! - TUI leaf shell (`tui`, `tui-model`, `tui-input`, `tui-markdown`,
-//!   `tui-popup`, `tui-state`): the shell composes concrete TUI/loop crates
+//! - TUI leaf shell (`tui`, `tui-model`, `tui-commands`, `tui-filter`,
+//!   `tui-input`, `tui-markdown`, `tui-popup`, `tui-state`): the shell composes concrete TUI/loop crates
 //!   it owns; e.g. `tui` → `harness-agent-loop` + `harness-tui-state`.
 //! - Hash hashing infra (`hashline-read`/`hashline-edit` → `hash-base`):
 //!   shared file-hashing library (pure line hashing + in-memory `HashStore`),
 //!   reused the way `tui-state` is reused. Prefer a `HashStoreApi` trait
 //!   handle if this surface ever widens.
+//!
 //! Domain plugins must never depend on TUI, and TUI never feeds domain
 //! services back into providers.
 
+pub mod commands;
 pub mod config;
 pub mod keys;
 pub mod services;
