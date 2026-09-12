@@ -1,10 +1,11 @@
 //! Generic floating list popup: single-select state only.
 //!
 //! Fully decoupled by design: this crate knows nothing about models,
-//! autocomplete, or any other domain. Providers push plain `String` items
-//! (plus a title and which item is "current"); provider plugins such as
-//! `tui-model` own the bridge that fills those in, while the TUI shell
-//! renders the snapshot above the input bar.
+//! autocomplete, or any other domain. Each provider plugin owns its own
+//! `Popup` surface and pushes plain `String` items (plus a title and
+//! which item is "current"); bridges such as `tui-model` and
+//! `tui-commands` fill those in, while the TUI shell draws at most one
+//! snapshot above the input bar.
 //!
 //! Provided as `Arc<Popup>` under [`KEY_POPUP`](harness_contracts::KEY_POPUP).
 //! All methods lock briefly and clone, so `draw` never holds the lock and
