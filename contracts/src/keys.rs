@@ -44,6 +44,12 @@ pub const KEY_POPUP: &str = "ui.popup";
 /// [`KEY_POPUP`](KEY_POPUP) for content plus [`KEY_MODEL_CATALOG`] and an
 /// optional [`KEY_CONFIG`] (via `ConfigApi`) for persistence.
 pub const KEY_MODEL_POPUP: &str = "ui.model_popup";
+/// `Arc<CommandPopup>` — provided by the tui-commands plugin, injected by
+/// the tui shell to route slash-command autocomplete keys. Owns its own
+/// popup surface (injects nothing), so it can never observe or clobber
+/// another provider's list; the shell draws at most one snapshot with the
+/// model selector taking precedence.
+pub const KEY_COMMAND_POPUP: &str = "ui.command_popup";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
 pub const KEY_HASH_STORE: &str = "hash.store";
