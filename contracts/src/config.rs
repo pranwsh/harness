@@ -60,8 +60,6 @@ pub fn default_max_iterations() -> u32 {
     8
 }
 
-
-
 /// `[shell]` section: resource bounds only. No policy guardrails live here:
 /// policy (allowlist/denylist/workdir/env filtering) is enforced by a future
 /// guardrail plugin via the `tool.approval` waterfall, not by the shell.
