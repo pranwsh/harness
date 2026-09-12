@@ -54,4 +54,4 @@ harness/src/main.rs (composition root)
   - infra: `config` (toml loading), `session` (in-memory log)
   - llm/agent: `model` (HTTP transport), `model-headers` (header waterfall), `agent`, `agent-default-model`, `agent-loop`, `system-prompt`
   - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `hash-base`, `hashline-read`, `hashline-edit`
-  - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-model`
+  - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-filter` (shared filter-popup behavior), `tui-commands` (slash completion), `tui-model` (model search)
