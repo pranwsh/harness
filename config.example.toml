@@ -36,6 +36,16 @@ X-Title = "opencode"
 # Hard cap on model iterations per turn.
 max_iterations = 128
 
+# Conversation persistence. On by default: every session journals to one
+# JSONL file under the session directory, and `/sessions` lists past
+# sessions (select one to resume it). Each launch still starts a fresh
+# session. `enabled = false` keeps everything in memory for the process
+# lifetime. `dir` overrides the default `$XDG_DATA_HOME/harness/sessions`
+# (`$HOME/.local/share/harness/sessions` when `XDG_DATA_HOME` is unset).
+# [session]
+# enabled = true
+# dir = "/home/you/.local/share/harness/sessions"
+
 # Headless shell tools (shell_exec / shell_start / shell_poll / shell_stop).
 # No policy guardrails: any executable runs. Resource bounds only (timeouts,
 # output caps, max jobs). Policy belongs in a future guardrail plugin via

@@ -52,8 +52,8 @@ pub fn model_query(input: &str) -> Option<String> {
 }
 
 /// Model source for the shared driver: `/model <query>` candidate,
-/// case-insensitive substring matches, `Enter` applies the highlighted
-/// model immediately.
+/// case-insensitive substring matches, shared complete-unless-exact
+/// `Enter`, and exact-`Enter` applies the highlight immediately.
 #[derive(Clone)]
 struct ModelSource {
     selector: Arc<ModelCatalogHandle>,
@@ -95,9 +95,10 @@ impl FilterSource for ModelSource {
         app.clear_input();
     }
 
-    fn on_enter(&self, selected: &str, app: &mut App) -> bool {
-        // A highlighted row outside the catalog (unreachable on the owned
-        // surface) is rejected without touching selector or `config.toml`.
+    fn on_exact(&self, selected: &str, app: &mut App) -> bool {
+        // Exact `Enter` applies the highlight: a row outside the catalog
+        // (unreachable on the owned surface) is rejected without touching
+        // selector or `config.toml`.
         if self.selector.models().iter().any(|m| m == selected) {
             let notice = self.apply_selection(selected);
             app.update(AppMsg::Notice(notice));
@@ -443,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arrows_move_and_enter_applies_with_notice() {
+    async fn arrows_move_and_enter_completes_then_applies() {
         let selector = test_selector("m1");
         selector.set_catalog(vec!["m1".into(), "m2".into()]);
         let model_popup = test_popup(selector.clone(), None);
@@ -456,15 +457,42 @@ mod tests {
         // Ctrl+C still quits via the app.
         assert!(!model_popup.handle_key(KeyEvent::Interrupt, &mut app));
 
+        // First Enter completes the highlight into the input bar (no apply).
         assert!(model_popup.handle_key(KeyEvent::Down, &mut app));
+        assert!(model_popup.handle_key(KeyEvent::Enter, &mut app));
+        assert_eq!(app.input(), "/model m2");
+        assert_eq!(selector.current(), "m1");
+        assert!(model_popup.is_active());
+        assert_eq!(
+            model_popup.snapshot().expect("open").items,
+            vec!["m2".to_owned()]
+        );
+
+        // Second Enter is exact: applies with a notice and clears.
         assert!(model_popup.handle_key(KeyEvent::Enter, &mut app));
         assert!(!model_popup.is_active());
         assert!(!model_popup.is_open());
-        // Search line cleared, choice applied with a notice.
         assert_eq!(app.input(), "");
         assert_eq!(selector.current(), "m2");
         let last = app.items().last().expect("notice pushed");
         assert_eq!(last.text, "model → m2 (session only)");
+    }
+
+    #[tokio::test]
+    async fn enter_on_partial_query_completes_without_applying() {
+        let selector = test_selector("m1");
+        selector.set_catalog(vec!["m1".into(), "m2".into()]);
+        let model_popup = test_popup(selector.clone(), None);
+        let mut app = App::new();
+        model_popup.open(&mut app);
+        press(&model_popup, &mut app, KeyEvent::Char('2'));
+        assert_eq!(app.input(), "/model 2");
+
+        assert!(model_popup.handle_key(KeyEvent::Enter, &mut app));
+
+        assert_eq!(app.input(), "/model m2");
+        assert_eq!(selector.current(), "m1");
+        assert!(app.items().is_empty(), "no notice pushed");
     }
 
     #[tokio::test]

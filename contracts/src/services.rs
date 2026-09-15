@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::{AgentState, Entry, Message, ToolCall, ToolError, ToolSpec};
+use crate::{AgentState, Entry, Message, SessionSummary, ToolCall, ToolError, ToolSpec};
 
 /// Boxed future for object-safe async service methods.
 pub type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
@@ -105,6 +105,27 @@ pub struct SessionStoreHandle(pub Arc<dyn SessionStoreApi>);
 
 impl std::ops::Deref for SessionStoreHandle {
     type Target = dyn SessionStoreApi;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+/// Catalog surface the `/sessions` picker needs: which sessions exist and
+/// their display metadata. History loading stays on [`SessionStoreApi`]
+/// (the session plugin lazily hydrates resumed sessions from disk, so the
+/// picker never touches journals directly). Read-only by design: session
+/// creation and all writes stay inside the session plugin.
+pub trait SessionCatalogApi: Send + Sync + 'static {
+    /// All known sessions, newest activity first. Empty when persistence
+    /// is disabled and nothing happened yet in-process.
+    fn list(&self) -> Vec<SessionSummary>;
+}
+
+#[derive(Clone)]
+pub struct SessionCatalogHandle(pub Arc<dyn SessionCatalogApi>);
+
+impl std::ops::Deref for SessionCatalogHandle {
+    type Target = dyn SessionCatalogApi;
     fn deref(&self) -> &Self::Target {
         &*self.0
     }
@@ -238,6 +259,13 @@ pub trait ConfigApi: Send + Sync + 'static {
         self.get().agent.max_iterations
     }
     fn set_llm_model(&self, model: &str) -> Result<crate::config::AppConfig, String>;
+    /// File backing this config, if any. `None` for embedded/test configs.
+    /// Consumers deciding default filesystem side effects (e.g. session
+    /// journals) anchor to file-backed configs and stay in-memory for
+    /// embedded ones, so library/test use never invents disk state.
+    fn config_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 #[derive(Clone)]

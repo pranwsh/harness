@@ -143,6 +143,23 @@ impl Entry {
     }
 }
 
+/// Catalog view of one persisted session, for the `/sessions` picker.
+///
+/// Timestamps are seconds since the Unix epoch (`std::time` only, no date
+/// crate in the contract layer); display formatting ("3h ago") is the
+/// picker's job. Derived by the session plugin from its journal — never
+/// hand-written by consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    /// First user message, truncated to one line, for display.
+    pub title: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub turns: u64,
+    pub entries: usize,
+}
+
 // ---- errors -----------------------------------------------------------------
 
 /// Failure of a tool execution, carried in-band on `ToolExecuted`.

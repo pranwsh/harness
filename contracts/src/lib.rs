@@ -12,9 +12,9 @@
 //!
 //! Exceptions (both acyclic, downward-only, documented as intentional
 //! coupling):
-//! - TUI leaf shell (`tui`, `tui-model`, `tui-commands`, `tui-filter`,
-//!   `tui-input`, `tui-markdown`, `tui-popup`, `tui-state`): the shell composes concrete TUI/loop crates
-//!   it owns; e.g. `tui` → `harness-agent-loop` + `harness-tui-state`.
+//! - TUI leaf shell (`tui`, `tui-model`, `tui-commands`, `tui-sessions`,
+//!   `tui-filter`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-state`):
+//!   the shell composes concrete TUI/loop crates it owns; e.g. `tui` → `harness-agent-loop` + `harness-tui-state`.
 //! - Hash hashing infra (`hashline-read`/`hashline-edit` → `hash-base`):
 //!   shared file-hashing library (pure line hashing + in-memory `HashStore`),
 //!   reused the way `tui-state` is reused. Prefer a `HashStoreApi` trait
@@ -30,7 +30,8 @@ pub mod services;
 pub mod types;
 
 pub use config::{
-    AgentConfig, AppConfig, ConfigError, LlmConfig, ShellConfig, default_max_iterations,
+    AgentConfig, AppConfig, ConfigError, LlmConfig, SessionConfig, ShellConfig,
+    default_max_iterations,
 };
 pub use keys::*;
 pub use services::*;

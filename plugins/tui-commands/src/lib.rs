@@ -9,8 +9,8 @@
 //! complete-unless-exact `Enter`). The TUI shell draws at most one
 //! provider snapshot (model first, else commands), keeps the terminal
 //! cursor in the input box, and routes keys slash-first; execution always
-//! falls through to the existing paths (`App::submit` for `/quit` etc,
-//! `ModelPopup` for `/model`).
+//! falls through to the existing paths (unknown-command error in
+//! `App::submit`, model search in `ModelPopup`).
 //!
 //! Provided as `Arc<CommandPopup>` under
 //! [`KEY_COMMAND_POPUP`](harness_contracts::KEY_COMMAND_POPUP). Injects
@@ -27,10 +27,10 @@ use harness_tui_filter::{FilterPopup, FilterSource};
 use harness_tui_popup::ActivePopup;
 use harness_tui_state::app::{App, KeyEvent};
 
-/// Command source for the shared driver: `/`-prefix candidate, prefix
-/// matches over [`ALL_COMMANDS`](harness_contracts::commands::ALL_COMMANDS),
-/// `Enter` completes into the input unless already exact (falling through
-/// to execution then).
+/// Command source for the shared driver: `/`-prefix candidate and prefix
+/// matches over [`ALL_COMMANDS`](harness_contracts::commands::ALL_COMMANDS).
+/// `Enter` is the shared complete-unless-exact default (exact falls
+/// through to execution).
 struct CommandSource;
 
 impl FilterSource for CommandSource {
@@ -44,15 +44,6 @@ impl FilterSource for CommandSource {
 
     fn items(&self, query: &str) -> Vec<String> {
         filter_commands(query)
-    }
-
-    fn on_enter(&self, selected: &str, app: &mut App) -> bool {
-        if app.input().trim() != selected {
-            app.set_input(selected);
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -152,7 +143,7 @@ mod tests {
         bridge.sync(&app);
         assert!(bridge.is_open());
         let snap = bridge.snapshot().expect("open");
-        assert_eq!(snap.items.len(), 4);
+        assert_eq!(snap.items, vec!["/model".to_owned(), "/sessions".to_owned()]);
         assert_eq!(snap.selected, 0);
         assert_eq!(snap.current, None);
     }
@@ -163,14 +154,18 @@ mod tests {
         let mut app = App::new();
         type_text(&mut app, "/");
         bridge.sync(&app);
-        type_text(&mut app, "c");
+        assert!(bridge.is_open());
+        type_text(&mut app, "m");
         bridge.sync(&app);
         let snap = bridge.snapshot().expect("open");
-        assert_eq!(snap.items, vec!["/clear".to_owned()]);
+        assert_eq!(snap.items, vec!["/model".to_owned()]);
 
         app.update(AppMsg::Key(KeyEvent::Backspace));
         bridge.sync(&app);
-        assert_eq!(bridge.snapshot().expect("open").items.len(), 4);
+        assert_eq!(
+            bridge.snapshot().expect("open").items,
+            vec!["/model".to_owned(), "/sessions".to_owned()]
+        );
     }
 
     #[test]
@@ -190,9 +185,10 @@ mod tests {
         bridge.sync(&app);
         assert!(!bridge.is_open());
 
-        // Trailing args disqualify: commands take no args.
+        // Trailing args disqualify (`/model <query>` belongs to search,
+        // which suppresses this list via the shell).
         let mut app = App::new();
-        app.set_input("/clear x");
+        app.set_input("/model x");
         bridge.sync(&app);
         assert!(!bridge.is_open());
     }
@@ -203,10 +199,13 @@ mod tests {
         let mut app = App::new();
         type_text(&mut app, "/");
         bridge.sync(&app);
+        // Two rows: moving steps through them and wraps around.
         assert!(bridge.handle_key(KeyEvent::Down, &mut app));
         assert_eq!(bridge.snapshot().expect("open").selected, 1);
-        assert!(bridge.handle_key(KeyEvent::Up, &mut app));
+        assert!(bridge.handle_key(KeyEvent::Down, &mut app));
         assert_eq!(bridge.snapshot().expect("open").selected, 0);
+        assert!(bridge.handle_key(KeyEvent::Up, &mut app));
+        assert_eq!(bridge.snapshot().expect("open").selected, 1);
         // Cursor never left the entry bar.
         assert_eq!(app.input(), "/");
     }
@@ -215,14 +214,14 @@ mod tests {
     fn tab_completes_selection_and_keeps_popup() {
         let bridge = popup();
         let mut app = App::new();
-        type_text(&mut app, "/c");
+        type_text(&mut app, "/m");
         bridge.sync(&app);
         assert!(bridge.handle_key(KeyEvent::Tab, &mut app));
-        assert_eq!(app.input(), "/clear");
+        assert_eq!(app.input(), "/model");
         assert!(bridge.is_open());
         assert_eq!(
             bridge.snapshot().expect("open").items,
-            vec!["/clear".to_owned()]
+            vec!["/model".to_owned()]
         );
     }
 
@@ -230,11 +229,11 @@ mod tests {
     fn enter_completes_first_then_falls_through_when_exact() {
         let bridge = popup();
         let mut app = App::new();
-        type_text(&mut app, "/c");
+        type_text(&mut app, "/m");
         bridge.sync(&app);
         // First Enter: completes, consumes.
         assert!(bridge.handle_key(KeyEvent::Enter, &mut app));
-        assert_eq!(app.input(), "/clear");
+        assert_eq!(app.input(), "/model");
         assert!(bridge.is_open());
         // Second Enter: already exact, falls through to execute.
         assert!(!bridge.handle_key(KeyEvent::Enter, &mut app));
@@ -244,7 +243,7 @@ mod tests {
     fn enter_on_fully_typed_command_falls_through_immediately() {
         let bridge = popup();
         let mut app = App::new();
-        type_text(&mut app, "/quit");
+        type_text(&mut app, "/model");
         bridge.sync(&app);
         assert!(bridge.is_open());
         assert!(!bridge.handle_key(KeyEvent::Enter, &mut app));
@@ -254,11 +253,11 @@ mod tests {
     fn esc_dismisses_without_touching_input() {
         let bridge = popup();
         let mut app = App::new();
-        type_text(&mut app, "/c");
+        type_text(&mut app, "/m");
         bridge.sync(&app);
         assert!(bridge.handle_key(KeyEvent::Esc, &mut app));
         assert!(!bridge.is_open());
-        assert_eq!(app.input(), "/c");
+        assert_eq!(app.input(), "/m");
     }
 
     #[test]

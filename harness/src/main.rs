@@ -101,7 +101,20 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "tui-popup", harness_tui_popup::TuiPopupPlugin);
     load!(ctx, "tui-model", harness_tui_model::TuiModelPlugin);
     load!(ctx, "tui-commands", harness_tui_commands::TuiCommandsPlugin);
-    load!(ctx, "tui", harness_tui::TuiPlugin::new(done_tx));
+    load!(
+        ctx,
+        "tui-sessions",
+        harness_tui_sessions::TuiSessionsPlugin
+    );
+    // Fresh session every launch; past sessions resume via `/sessions`.
+    // The id is minted at the composition root so the TUI and any future
+    // headless front-ends share one generation point.
+    let session_id = harness_session::SessionLog::fresh_id();
+    load!(
+        ctx,
+        "tui",
+        harness_tui::TuiPlugin::new(done_tx, session_id)
+    );
 
     let tui: Arc<harness_tui::Tui> = ctx.inject_key(KEY_TUI)?;
 

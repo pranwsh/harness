@@ -22,9 +22,10 @@ members = [
     "plugins/tui-input",
     "plugins/tui-popup",
     "plugins/tui-filter",
-    "plugins/tui-model",
-    "plugins/tui-commands",
-    "plugins/tui",
+        "plugins/tui-model",
+        "plugins/tui-commands",
+        "plugins/tui-sessions",
+        "plugins/tui",
 ]
 
 [workspace.dependencies]

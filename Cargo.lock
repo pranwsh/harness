@@ -693,6 +693,7 @@ dependencies = [
  "harness-tui-markdown",
  "harness-tui-model",
  "harness-tui-popup",
+ "harness-tui-sessions",
  "tokio",
 ]
 
@@ -842,8 +843,12 @@ dependencies = [
 name = "harness-session"
 version = "0.1.0"
 dependencies = [
+ "harness-config",
  "harness-contracts",
  "harness-core",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -887,11 +892,13 @@ dependencies = [
  "harness-agent-loop",
  "harness-contracts",
  "harness-core",
+ "harness-session",
  "harness-tui-commands",
  "harness-tui-input",
  "harness-tui-markdown",
  "harness-tui-model",
  "harness-tui-popup",
+ "harness-tui-sessions",
  "harness-tui-state",
  "ratatui",
  "tokio",
@@ -961,6 +968,17 @@ version = "0.1.0"
 dependencies = [
  "harness-contracts",
  "harness-core",
+]
+
+[[package]]
+name = "harness-tui-sessions"
+version = "0.1.0"
+dependencies = [
+ "harness-contracts",
+ "harness-core",
+ "harness-tui-filter",
+ "harness-tui-popup",
+ "harness-tui-state",
 ]
 
 [[package]]

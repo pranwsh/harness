@@ -32,7 +32,7 @@ const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 /// `tui-state` pure and `Tui`'s shared `Arc` API untouched). Caches the
 /// laid-out `MsgLayout` per chat item keyed by `(kind, text hash, width)`;
 /// only the trailing mutated item (streaming delta) and width changes miss.
-/// Append-only `items` (except `/clear`) makes invalidation trivial.
+/// Append-only `items` makes invalidation trivial.
 pub(crate) struct LayoutCache {
     width: u16,
     hashes: Vec<u64>,

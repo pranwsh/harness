@@ -51,7 +51,7 @@ harness/src/main.rs (composition root)
 - **contracts (`harness-contracts`):** shared vocabulary only (keys, domain/event types, `*_API` trait handles). Domain plugins depend on `contracts` + `core`, never on each other; sibling `Plugin` deps live only in `[dev-dependencies]` for wiring tests. All runtime cross-plugin comms go through trait handles under `KEY_*_API` / store keys or the core bus — the crate graph stays acyclic. Two intentional direct edges are documented in `contracts/src/lib.rs`: the TUI leaf shell (`tui` → `agent-loop` / `tui-*`) and the shared hashing infra (`hashline-*` → `hash-base`).
 - **harness:** thin `load!` list (config → model → agent → tools → shell → agent-loop → tui-*). Order is convenience — core reorders/parks as needed.
 - **plugins:**
-  - infra: `config` (toml loading), `session` (in-memory log)
+  - infra: `config` (toml loading), `session` (conversation log, journaled to `$XDG_DATA_HOME/harness/sessions` — see `[session]` in `config.example.toml`)
   - llm/agent: `model` (HTTP transport), `model-headers` (header waterfall), `agent`, `agent-default-model`, `agent-loop`, `system-prompt`
   - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `hash-base`, `hashline-read`, `hashline-edit`
-  - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-filter` (shared filter-popup behavior), `tui-commands` (slash completion), `tui-model` (model search)
+  - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-filter` (shared filter-popup behavior), `tui-commands` (slash completion), `tui-model` (model search), `tui-sessions` (`/sessions` picker: list past sessions, resume on select)

@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     #[serde(default)]
     pub shell: ShellConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -128,6 +130,36 @@ fn default_shell_max_job_time_ms() -> u64 {
 
 fn default_shell_max_job_output_bytes() -> usize {
     262_144
+}
+
+/// `[session]` section: conversation persistence. On by default; sessions
+/// journal to one JSONL file each under the resolved session directory so
+/// past conversations survive binary upgrades. The session plugin owns all
+/// file I/O; this section only carries the toggle and an optional override.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionConfig {
+    /// Write session journals to disk. `false` keeps everything in memory
+    /// for the process lifetime (the pre-persistence behavior).
+    #[serde(default = "default_session_enabled")]
+    pub enabled: bool,
+    /// Override for the session directory. Absent means the XDG data dir
+    /// (`$XDG_DATA_HOME/harness/sessions`, else
+    /// `$HOME/.local/share/harness/sessions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            enabled: default_session_enabled(),
+            dir: None,
+        }
+    }
+}
+
+fn default_session_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -50,6 +50,11 @@ pub const KEY_MODEL_POPUP: &str = "ui.model_popup";
 /// another provider's list; the shell draws at most one snapshot with the
 /// model selector taking precedence.
 pub const KEY_COMMAND_POPUP: &str = "ui.command_popup";
+/// `Arc<SessionPopup>` — provided by the tui-sessions plugin, injected by
+/// the tui shell to route `/sessions` picker keys and session switches.
+/// Owns its own popup surface (injects only the session catalog), so it
+/// can never observe or clobber another provider's list.
+pub const KEY_SESSION_POPUP: &str = "ui.session_popup";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
 pub const KEY_HASH_STORE: &str = "hash.store";
@@ -66,6 +71,9 @@ pub const KEY_SHELL_SERVICE: &str = "shell.service";
 pub const KEY_AGENTS_API: &str = "agents.api";
 /// `Arc<SessionStoreHandle>` — read + turn-bookkeeping view over sessions.
 pub const KEY_SESSION_STORE: &str = "sessions.store";
+/// `Arc<SessionCatalogHandle>` — catalog view over past sessions for the
+/// `/sessions` picker. Provided alongside the store by the session plugin.
+pub const KEY_SESSION_CATALOG: &str = "sessions.catalog";
 /// `Arc<ToolExecutorHandle>` — specs + execute view over tools.
 pub const KEY_TOOL_EXECUTOR: &str = "tools.executor_api";
 /// `Arc<ToolRegistryHandle>` — registration view over tools.

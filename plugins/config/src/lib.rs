@@ -243,6 +243,9 @@ impl ConfigApi for ConfigService {
     fn set_llm_model(&self, model: &str) -> Result<AppConfig, String> {
         ConfigService::set_llm_model(self, model).map_err(|e| e.to_string())
     }
+    fn config_path(&self) -> Option<PathBuf> {
+        ConfigService::path(self)
+    }
 }
 
 impl Plugin for ConfigPlugin {

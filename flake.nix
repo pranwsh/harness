@@ -48,7 +48,7 @@
           // {
             inherit cargoArtifacts;
             # Only binary in the workspace is `harness` (harness/src/main.rs).
-            # All 19 plugins are rlibs statically linked into it.
+            # All 20 plugins are rlibs statically linked into it.
             cargoExtraArgs = "-p harness";
 
             postInstall = ''

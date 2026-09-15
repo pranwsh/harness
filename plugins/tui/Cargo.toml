@@ -9,6 +9,7 @@ harness-core = { path = "../../core" }
 harness-agent-loop = { path = "../agent-loop" }
 harness-tui-model = { path = "../tui-model" }
 harness-tui-commands = { path = "../tui-commands" }
+harness-tui-sessions = { path = "../tui-sessions" }
 harness-tui-state = { path = "../tui-state" }
 harness-tui-input = { path = "../tui-input" }
 harness-tui-popup = { path = "../tui-popup" }
@@ -18,3 +19,4 @@ tokio.workspace = true
 
 [dev-dependencies]
 harness-tui-markdown = { path = "../tui-markdown" }
+harness-session = { path = "../session" }

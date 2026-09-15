@@ -23,8 +23,9 @@ use harness_tui_popup::{ActivePopup, Popup};
 use harness_tui_state::app::{App, KeyEvent};
 
 /// Domain logic a filter popup needs. Required methods are the query
-/// extraction, the match listing, and the `Enter` action; everything else
-/// has a default so providers only override what differs.
+/// extraction and the match listing; `Enter` already completes the
+/// highlight into the input unless exact (see [`FilterSource::on_enter`]),
+/// so providers typically only override what differs.
 pub trait FilterSource: Send + Sync {
     /// Popup title, with the surrounding spaces the border title expects.
     fn title(&self) -> &str;
@@ -36,10 +37,29 @@ pub trait FilterSource: Send + Sync {
     /// Lists matches for a query, in display order.
     fn items(&self, query: &str) -> Vec<String>;
 
-    /// Applies the highlighted row. Returns `true` when consumed (the
-    /// driver re-syncs afterwards); `false` falls through to the shell
-    /// (e.g. an already-exact command left for normal execution).
-    fn on_enter(&self, selected: &str, app: &mut App) -> bool;
+    /// Handles `Enter` on a highlighted row. The default completes the
+    /// row into the input (via [`FilterSource::render_completion`]) unless
+    /// the line already renders exactly that, in which case it delegates
+    /// to [`FilterSource::on_exact`]. Returns `true` when consumed (the
+    /// driver re-syncs afterwards); `false` falls through to the shell.
+    fn on_enter(&self, selected: &str, app: &mut App) -> bool {
+        if app.input().trim() != self.render_completion(selected) {
+            app.set_input(&self.render_completion(selected));
+            true
+        } else {
+            self.on_exact(selected, app)
+        }
+    }
+
+    /// Handles `Enter` when the input line already holds the highlighted
+    /// row. Defaults to falling through (e.g. an exact command left for
+    /// normal execution); providers that execute on selection — model
+    /// search applying the highlight — override this to act and return
+    /// `true`.
+    fn on_exact(&self, selected: &str, app: &mut App) -> bool {
+        let _ = (selected, app);
+        false
+    }
 
     /// Active value marked with `●`, distinct from the arrow-key cursor.
     /// `None` shows no marker.
@@ -200,8 +220,9 @@ mod tests {
     use super::*;
     use harness_tui_state::app::AppMsg;
 
-    /// Mirrors the slash-command provider: `/`-prefix candidate,
-    /// prefix matches, complete-unless-exact `Enter`.
+    /// Mirrors the slash-command provider: `/`-prefix candidate and
+    /// prefix matches. Uses the default complete-unless-exact `Enter`,
+    /// so these tests pin the shared default itself.
     struct FakeSource;
 
     impl FilterSource for FakeSource {
@@ -222,14 +243,30 @@ mod tests {
                 .map(|cmd| cmd.to_string())
                 .collect()
         }
+    }
 
-        fn on_enter(&self, selected: &str, app: &mut App) -> bool {
-            if app.input().trim() != selected {
-                app.set_input(selected);
-                true
-            } else {
-                false
-            }
+    /// A source that executes on exact `Enter`, like model search: records
+    /// applications instead of falling through.
+    struct ApplyingSource {
+        applied: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FilterSource for ApplyingSource {
+        fn title(&self) -> &str {
+            " applying "
+        }
+
+        fn candidate(&self, input: &str) -> Option<String> {
+            FakeSource.candidate(input)
+        }
+
+        fn items(&self, query: &str) -> Vec<String> {
+            FakeSource.items(query)
+        }
+
+        fn on_exact(&self, selected: &str, _app: &mut App) -> bool {
+            self.applied.lock().unwrap().push(selected.to_owned());
+            true
         }
     }
 
@@ -316,6 +353,25 @@ mod tests {
         assert!(filter.handle_key(KeyEvent::Enter, &mut app));
         assert_eq!(app.input(), "/clear");
         assert!(!filter.handle_key(KeyEvent::Enter, &mut app));
+    }
+
+    #[test]
+    fn exact_enter_delegates_to_on_exact_hook() {
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let filter = FilterPopup::new(ApplyingSource {
+            applied: applied.clone(),
+        });
+        let mut app = App::new();
+        type_text(&mut app, "/c");
+        filter.sync(&app);
+        // First Enter completes (shared default), applying nothing.
+        assert!(filter.handle_key(KeyEvent::Enter, &mut app));
+        assert_eq!(app.input(), "/clear");
+        assert!(applied.lock().unwrap().is_empty());
+        // Second Enter is exact: the hook runs instead of falling through.
+        assert!(filter.handle_key(KeyEvent::Enter, &mut app));
+        assert_eq!(*applied.lock().unwrap(), vec!["/clear".to_owned()]);
+        assert!(filter.is_active());
     }
 
     #[test]

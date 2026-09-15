@@ -1,7 +1,7 @@
 //! Pure application state: the chat transcript, input editor, scroll
 //! position, and quit flag. Knows nothing about terminals or ratatui.
 
-use harness_contracts::{ToolCall, ToolError};
+use harness_contracts::{Entry, Role, ToolCall, ToolError};
 
 use crate::editor::Editor;
 
@@ -189,6 +189,49 @@ impl App {
         let _ = self.editor.take();
         self.input_scroll = 0;
         self.follow_input_cursor();
+    }
+
+    /// Replaces the transcript with persisted session entries (used when
+    /// resuming a past session via `/sessions`). Scroll resets to follow
+    /// so the view pins to the newest restored content. Pure mapping, no
+    /// I/O: user/assistant entries become their item kinds, assistant tool
+    /// calls replay as `→` rows (live `ToolStarted` events are never
+    /// persisted), tool entries as truncated `←` rows (the tool name isn't
+    /// stored, only the call id), system entries as notices.
+    pub fn set_transcript(&mut self, entries: &[Entry]) {
+        self.items.clear();
+        self.scroll_rows = 0;
+        for entry in entries {
+            match entry.role {
+                Role::User => {
+                    self.push(ChatItem::new(entry.content.clone(), ItemKind::User));
+                }
+                Role::Assistant => {
+                    if !entry.content.is_empty() {
+                        self.push(ChatItem::new(
+                            entry.content.clone(),
+                            ItemKind::Assistant,
+                        ));
+                    }
+                    for call in &entry.tool_calls {
+                        self.push(ChatItem::new(
+                            format!("→ {} ({})", call.name, call.arguments),
+                            ItemKind::ToolStarted,
+                        ));
+                    }
+                }
+                Role::Tool => {
+                    let call = entry.call_id.as_deref().unwrap_or("?");
+                    self.push(ChatItem::new(
+                        format!("← {call} ok: {}", truncate(&entry.content, 200)),
+                        ItemKind::ToolOk,
+                    ));
+                }
+                Role::System => {
+                    self.push(ChatItem::new(entry.content.clone(), ItemKind::Notice));
+                }
+            }
+        }
     }
 
     /// Replaces the input line (used by autocomplete providers such as
@@ -431,9 +474,9 @@ impl App {
                 self.scroll_page_down();
                 Effect::redraw()
             }
-            // Ctrl+C interrupts the app; Esc alone is a no-op (quitting
-            // is `/quit` only). Tab is provider-owned (autocomplete) and
-            // never touches the editor.
+            // Ctrl+C interrupts the app (the only way to quit); Esc alone
+            // is a no-op. Tab is provider-owned (autocomplete) and never
+            // touches the editor.
             KeyEvent::Interrupt => {
                 self.quit = true;
                 Effect::redraw()
@@ -453,24 +496,15 @@ impl App {
             // Whitespace-only submit: still clear the editor.
             return Effect::redraw();
         }
-        match trimmed.as_str() {
-            "/quit" | "/exit" => {
-                self.quit = true;
-                return Effect::redraw();
-            }
-            "/clear" => {
-                self.items.clear();
-                self.scroll_rows = 0;
-                return Effect::redraw();
-            }
-            cmd if cmd.starts_with('/') => {
-                self.push(ChatItem::new(
-                    format!("unknown command: {cmd}"),
-                    ItemKind::Error,
-                ));
-                return Effect::redraw();
-            }
-            _ => {}
+        // `/model` is hijacked by the shell before it reaches here; any
+        // other slash line is an inline error, never a chat message.
+        // Quitting is Ctrl+C only.
+        if trimmed.starts_with('/') {
+            self.push(ChatItem::new(
+                format!("unknown command: {trimmed}"),
+                ItemKind::Error,
+            ));
+            return Effect::redraw();
         }
         if self.is_busy() {
             self.push(ChatItem::new(
@@ -595,48 +629,19 @@ mod tests {
     }
 
     #[test]
-    fn quit_command_sets_flag() {
-        let mut app = App::new();
-        for c in "/quit".chars() {
-            app.update(key(KeyEvent::Char(c)));
+    fn removed_commands_are_unknown_errors() {
+        // `/quit`, `/exit`, `/clear` no longer exist: slash lines other
+        // than `/model` (hijacked by the shell) are inline errors.
+        for cmd in ["/quit", "/exit", "/clear", "/bogus"] {
+            let mut app = App::new();
+            for c in cmd.chars() {
+                app.update(key(KeyEvent::Char(c)));
+            }
+            assert!(app.update(key(KeyEvent::Enter)), "submit {cmd:?}");
+            assert_eq!(last(&app).kind, ItemKind::Error);
+            assert_eq!(last(&app).text, format!("unknown command: {cmd}"));
+            assert!(!app.should_quit());
         }
-        app.update(key(KeyEvent::Enter));
-        assert!(app.should_quit());
-
-        let mut app = App::new();
-        for c in "/exit".chars() {
-            app.update(key(KeyEvent::Char(c)));
-        }
-        app.update(key(KeyEvent::Enter));
-        assert!(app.should_quit());
-    }
-
-    #[test]
-    fn clear_command_empties_transcript() {
-        let mut app = App::new();
-        app.update(AppMsg::Assistant("x".into()));
-        app.update(AppMsg::Failed("y".into()));
-        assert_eq!(app.items().len(), 2);
-        for c in "/clear".chars() {
-            app.update(key(KeyEvent::Char(c)));
-        }
-        assert!(app.update(key(KeyEvent::Enter)));
-        assert!(app.items().is_empty());
-        assert_eq!(app.scroll_rows(), 0);
-        assert!(app.follows());
-        assert!(!app.should_quit());
-    }
-
-    #[test]
-    fn unknown_command_is_an_inline_error() {
-        let mut app = App::new();
-        for c in "/bogus".chars() {
-            app.update(key(KeyEvent::Char(c)));
-        }
-        assert!(app.update(key(KeyEvent::Enter)));
-        assert_eq!(last(&app).kind, ItemKind::Error);
-        assert_eq!(last(&app).text, "unknown command: /bogus");
-        assert!(!app.should_quit());
     }
 
     #[test]
@@ -1009,7 +1014,10 @@ mod tests {
         type_text(&mut app, "hello");
         let eff = app.reduce(key(KeyEvent::Enter));
         assert!(eff.redraw);
-        assert!(eff.submitted.is_none(), "busy submit must not produce an effect");
+        assert!(
+            eff.submitted.is_none(),
+            "busy submit must not produce an effect"
+        );
         assert_eq!(app.input(), "");
         let last = app.items().last().expect("notice pushed");
         assert_eq!(last.kind, ItemKind::Error);
@@ -1024,5 +1032,69 @@ mod tests {
         let eff = app.reduce(key(KeyEvent::Enter));
         assert_eq!(eff.submitted.as_deref(), Some("hello again"));
         assert_eq!(app.items().last().unwrap().kind, ItemKind::User);
+    }
+
+    #[test]
+    fn set_transcript_replays_entries_as_items() {
+        use harness_contracts::{Entry, Message, Role};
+
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("stale".into()));
+        // Scroll away, then restore: transcript replaces and re-pins.
+        app.update(key(KeyEvent::PageUp));
+        assert!(!app.follows());
+
+        let entries = vec![
+            Entry::from_message(&Message::user("what is 2+2?")),
+            Entry {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell_exec".into(),
+                    arguments: "{\"cmd\":\"echo 4\"}".into(),
+                }],
+                call_id: None,
+            },
+            Entry::tool("c1", "4"),
+            Entry::from_message(&Message::assistant("4")),
+        ];
+        app.set_transcript(&entries);
+
+        assert!(app.follows());
+        let kinds: Vec<ItemKind> = app.items().iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ItemKind::User,
+                ItemKind::ToolStarted,
+                ItemKind::ToolOk,
+                ItemKind::Assistant
+            ]
+        );
+        assert_eq!(app.items()[0].text, "what is 2+2?");
+        assert_eq!(app.items()[1].text, "→ shell_exec ({\"cmd\":\"echo 4\"})");
+        assert_eq!(app.items()[2].text, "← c1 ok: 4");
+        assert_eq!(app.items()[3].text, "4");
+    }
+
+    #[test]
+    fn set_transcript_truncates_long_tool_output() {
+        let mut app = App::new();
+        app.set_transcript(&[harness_contracts::Entry::tool("c9", "y".repeat(500))]);
+        assert_eq!(app.items().len(), 1);
+        assert_eq!(app.items()[0].kind, ItemKind::ToolOk);
+        assert!(app.items()[0].text.starts_with("← c9 ok: "));
+        // "← c9 ok: " is 9 chars; content truncates to 200 chars.
+        assert_eq!(app.items()[0].text.chars().count(), 9 + 200);
+    }
+
+    #[test]
+    fn set_transcript_empty_clears() {
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("stale".into()));
+        app.set_transcript(&[]);
+        assert!(app.items().is_empty());
+        assert!(app.follows());
     }
 }
