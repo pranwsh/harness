@@ -6,7 +6,7 @@
 //! Visual operations take the current wrap `width` explicitly, so the
 //! editor never needs to know the terminal size.
 
-use crate::wrap::{ch_width, display_width, wrap_spans};
+use crate::wrap::{display_width, grapheme_width, wrap_spans};
 
 /// A cursor edit that either mutated the buffer or was a no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,13 +198,13 @@ impl Editor {
         let (start, end) = rows[target];
         let mut byte = start;
         let mut taken = 0usize;
-        for (i, ch) in self.text[start..end].char_indices() {
-            let cw = ch_width(ch);
-            if taken + cw > col {
+        for (i, g) in crate::wrap::grapheme_clusters(&self.text[start..end]) {
+            let gw = grapheme_width(g);
+            if taken + gw > col {
                 break;
             }
-            taken += cw;
-            byte = start + i + ch.len_utf8();
+            taken += gw;
+            byte = start + i + g.len();
         }
         if byte == self.cursor {
             return Edit::Unchanged;

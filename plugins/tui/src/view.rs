@@ -161,6 +161,11 @@ fn draw_chat_cached(
     if area.width < 2 || area.height == 0 {
         return;
     }
+    // Fully paint the chat pane every frame (margins, top gap from
+    // bottom-anchoring, short rows): the render callback must cover the
+    // whole frame so diffing never leaves a stale cell behind as a
+    // "column" while scrolling.
+    f.render_widget(Clear, area);
     let layouts = cache.layouts_for(app.items(), area.width, renderer);
     let total: usize = layouts.iter().map(|l| l.height).sum();
     let viewport = area.height as usize;
@@ -411,6 +416,15 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
             .map(|s| Line::styled(s, style))
             .collect::<Vec<_>>()
     };
+    // Defensive clamp: no content row may exceed its column, no matter
+    // what a renderer measured (e.g. a grapheme whose width the wrapper
+    // undercounted would otherwise spill one cell into the right margin
+    // and smear into a column while scrolling). Runs once per layout
+    // (cached), never per frame.
+    let lines = lines
+        .into_iter()
+        .map(|l| truncate_line(l, width as usize))
+        .collect::<Vec<_>>();
     let height = lines.len().max(1);
     MsgLayout {
         x,
@@ -418,6 +432,41 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
         lines,
         height,
     }
+}
+
+/// Truncates one content row to `max_width` display columns without
+/// splitting grapheme clusters, preserving each span's style. Rows
+/// that already fit are returned untouched.
+fn truncate_line(line: Line<'static>, max_width: usize) -> Line<'static> {
+    use harness_tui_state::wrap::grapheme_width;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let current: usize = line
+        .spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    if current <= max_width {
+        return line;
+    }
+    let mut kept = Vec::with_capacity(line.spans.len());
+    let mut used = 0usize;
+    for span in line.spans {
+        if used >= max_width {
+            break;
+        }
+        let mut text = String::with_capacity(span.content.len());
+        for g in span.content.as_ref().graphemes(true) {
+            let gw = grapheme_width(g);
+            if used + gw > max_width {
+                break;
+            }
+            used += gw;
+            text.push_str(g);
+        }
+        kept.push(Span::styled(text, span.style));
+    }
+    Line::from(kept)
 }
 
 fn item_style(kind: ItemKind) -> Style {
@@ -822,5 +871,88 @@ mod tests {
         let plain_rows = render(&mut app, &plain(), 30, 12);
         let popup_rows = render_popup(&mut app, &plain(), None, 30, 12);
         assert_eq!(plain_rows, popup_rows);
+    }
+
+    #[test]
+    fn truncate_line_clamps_without_splitting_graphemes() {
+        // Over-wide single-span row: cut at the width boundary.
+        let line = Line::styled("abcdef", Style::new());
+        let got = truncate_line(line, 4);
+        let text: String = got.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "abcd");
+
+        // The VS16 cluster counts as 2 and is never split: "ab⬇️cd"
+        // at 4 keeps "ab⬇️" (2+2), not "ab⬇".
+        let line = Line::styled("ab⬇️cd", Style::new());
+        let got = truncate_line(line, 4);
+        let text: String = got.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "ab⬇️", "got {text:?}");
+        assert_eq!(display_width(&text), 4);
+
+        // Fitting rows are untouched (same spans back).
+        let line = Line::styled("hi", Style::new().fg(Color::Red));
+        let got = truncate_line(line, 22);
+        let text: String = got.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn toolcall_with_wide_emoji_never_touches_margins() {
+        // Session regression at ~70 cols: `⬇️`/`〰️` rows spilled one
+        // cell into the right margin, smearing into a column while
+        // scrolling. Persistent terminal across scrolls: the old
+        // per-fresh-backend `render` helper cannot catch margin ghosts.
+        use harness_contracts::ToolCall;
+
+        for width in [30u16, 70, 80] {
+            let height = 12u16;
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let mut app = App::new();
+            app.update(AppMsg::ToolStarted(ToolCall {
+                id: "c1".into(),
+                name: "shell_exec".into(),
+                arguments: format!(
+                    "{}⬇️{}〰️{}",
+                    "x".repeat(50),
+                    "y".repeat(50),
+                    "z".repeat(50)
+                ),
+            }));
+            terminal
+                .draw(|f| draw(f, &mut app, &plain()))
+                .expect("draw");
+            assert_margins_blank(&terminal, width, height, "first");
+            for _ in 0..6 {
+                app.update(AppMsg::ScrollUp);
+                terminal
+                    .draw(|f| draw(f, &mut app, &plain()))
+                    .expect("draw scrolled");
+                assert_margins_blank(&terminal, width, height, "scrolled");
+            }
+        }
+    }
+
+    fn assert_margins_blank(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        width: u16,
+        height: u16,
+        ctx: &str,
+    ) {
+        let buf = terminal.backend().buffer().clone();
+        // Single-row input => 3-row input box; the rest is chat.
+        let chat_h = (height as usize).saturating_sub(3);
+        for y in 0..chat_h {
+            for x in (width.saturating_sub(4))..width {
+                assert_eq!(
+                    buf[(x, y as u16)].symbol(),
+                    " ",
+                    "{ctx} right margin at ({x},{y}) width {width}: {:?}",
+                    (0..width)
+                        .map(|xx| buf[(xx, y as u16)].symbol().to_owned())
+                        .collect::<String>()
+                );
+            }
+        }
     }
 }

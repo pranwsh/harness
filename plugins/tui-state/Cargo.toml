@@ -7,3 +7,4 @@ edition = "2024"
 harness-contracts = { path = "../../contracts" }
 ratatui.workspace = true
 unicode-width.workspace = true
+unicode-segmentation = "1"

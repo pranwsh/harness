@@ -16,6 +16,7 @@ harness-tui-popup = { path = "../tui-popup" }
 crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
+unicode-segmentation = "1"
 
 [dev-dependencies]
 harness-tui-markdown = { path = "../tui-markdown" }
