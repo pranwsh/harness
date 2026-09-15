@@ -902,7 +902,6 @@ dependencies = [
  "harness-tui-state",
  "ratatui",
  "tokio",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -988,7 +987,6 @@ version = "0.1.0"
 dependencies = [
  "harness-contracts",
  "ratatui",
- "unicode-segmentation",
  "unicode-width",
 ]
 
