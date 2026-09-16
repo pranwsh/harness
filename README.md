@@ -2,16 +2,69 @@
 
 Single-binary agent harness TUI (Rust workspace, statically linked). All plugins are rlibs compiled into one `harness` binary.
 
-## Install (Nix)
+## Install (NixOS, declarative)
 
-Requires Nix with flakes. Supports `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`.
+Supports `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`.
+
+Add `harness` as a flake input in your system flake:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    harness = {
+      url = "github:pranwsh/harness";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+}
+```
+
+Make sure your `nixosSystem` passes `inputs` through:
+
+```nix
+outputs = { nixpkgs, ... }@inputs: {
+  nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
+    system = "x86_64-linux";
+    specialArgs = { inherit inputs; };
+    modules = [ ./configuration.nix ];
+  };
+};
+```
+
+Then install it in `configuration.nix`:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    inputs.harness.packages.${pkgs.system}.default
+  ];
+}
+```
+
+Rebuild:
 
 ```sh
-# run directly
-nix run
+sudo nixos-rebuild switch --flake /etc/nixos#nixos
+```
 
-# build binary -> ./result/bin/harness
-nix build
+Home Manager alternative (`home.nix`):
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  home.packages = [
+    inputs.harness.packages.${pkgs.system}.default
+  ];
+}
+```
+
+## Develop
+
+```sh
+# run directly (no install)
+nix run github:pranwsh/harness
 
 # dev shell (rustc, cargo, clippy, rustfmt)
 nix develop
