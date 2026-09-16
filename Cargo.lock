@@ -987,6 +987,7 @@ version = "0.1.0"
 dependencies = [
  "harness-contracts",
  "ratatui",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

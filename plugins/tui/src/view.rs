@@ -823,4 +823,60 @@ mod tests {
         let popup_rows = render_popup(&mut app, &plain(), None, 30, 12);
         assert_eq!(plain_rows, popup_rows);
     }
+
+    #[test]
+    fn toolcall_with_wide_emoji_never_touches_margins() {
+        // A toolcall row with VS16 emoji (`⬇️` renders as 2) must stay
+        // inside its column: the old per-char measuring packed one
+        // cell too many per wrapped row, spilling into the right
+        // margin. A persistent terminal across scrolls catches margin
+        // ghosts that a fresh backend per render would miss.
+        use harness_contracts::ToolCall;
+
+        for width in [30u16, 70, 80] {
+            let height = 12u16;
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let mut app = App::new();
+            app.update(AppMsg::ToolStarted(ToolCall {
+                id: "c1".into(),
+                name: "shell_exec".into(),
+                arguments: format!("{}⬇️{}〰️{}", "x".repeat(50), "y".repeat(50), "z".repeat(50)),
+            }));
+            terminal
+                .draw(|f| draw(f, &mut app, &plain()))
+                .expect("draw");
+            assert_margins_blank(&terminal, width, height, "first");
+            for _ in 0..6 {
+                app.update(AppMsg::ScrollUp);
+                terminal
+                    .draw(|f| draw(f, &mut app, &plain()))
+                    .expect("draw scrolled");
+                assert_margins_blank(&terminal, width, height, "scrolled");
+            }
+        }
+    }
+
+    fn assert_margins_blank(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        width: u16,
+        height: u16,
+        ctx: &str,
+    ) {
+        let buf = terminal.backend().buffer().clone();
+        // Single-row input => 3-row input box; the rest is chat.
+        let chat_h = (height as usize).saturating_sub(3);
+        for y in 0..chat_h {
+            for x in (width.saturating_sub(4))..width {
+                assert_eq!(
+                    buf[(x, y as u16)].symbol(),
+                    " ",
+                    "{ctx} right margin at ({x},{y}) width {width}: {:?}",
+                    (0..width)
+                        .map(|xx| buf[(xx, y as u16)].symbol().to_owned())
+                        .collect::<String>()
+                );
+            }
+        }
+    }
 }

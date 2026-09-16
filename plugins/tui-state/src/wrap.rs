@@ -8,7 +8,9 @@
 
 /// Byte-offset spans `(start, end)` of each visual row of `text`
 /// wrapped at `width` display columns. Always returns at least one
-/// span; offsets are always `char` boundaries.
+/// span; offsets are always grapheme (hence `char`) boundaries, so
+/// multi-codepoint sequences such as `⬇️` (`U+2B07 U+FE0F`) are never
+/// split across rows.
 pub fn wrap_spans(text: &str, width: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     if width == 0 {
@@ -42,20 +44,34 @@ pub fn wrap_spans(text: &str, width: usize) -> Vec<(usize, usize)> {
                 line_end = word_end;
                 line_width += gap + word_width;
             } else if word_width > width {
-                // Hard-break the oversized word across lines.
+                // Hard-break the oversized word across lines, one
+                // grapheme cluster at a time. Per-`char` measuring
+                // undercounts sequences such as `⬇️` (`U+2B07` is 1,
+                // `U+FE0F` is 0, the cluster renders as 2), packing one
+                // cell too many per row and spilling into the right
+                // margin; it also splits the base char off its
+                // variation selector. Clusters are never split.
                 if let Some(start) = line_start.take() {
                     out.push((base + start, base + line_end));
                 }
                 let mut chunk_start = word_start;
                 let mut chunk_width = 0usize;
-                for (i, ch) in word.char_indices() {
-                    let cw = ch_width(ch);
-                    if chunk_width + cw > width {
+                for (i, g) in grapheme_clusters(word) {
+                    let gw = grapheme_width(g);
+                    if chunk_width + gw > width && chunk_width > 0 {
                         out.push((base + chunk_start, base + word_start + i));
                         chunk_start = word_start + i;
                         chunk_width = 0;
                     }
-                    chunk_width += cw;
+                    // A lone grapheme wider than `width` still takes its
+                    // own row (the renderer truncates what cannot fit)
+                    // instead of emitting an empty span and stalling.
+                    if gw > width && chunk_width == 0 {
+                        out.push((base + word_start + i, base + word_start + i + g.len()));
+                        chunk_start = word_start + i + g.len();
+                        continue;
+                    }
+                    chunk_width += gw;
                 }
                 line_start = Some(chunk_start);
                 line_end = word_end;
@@ -93,14 +109,49 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
 }
 
 /// Display width of one character: 0 for control chars, 2 for
-/// wide (CJK) chars, 1 otherwise.
+/// wide (CJK) chars, 1 otherwise. Prefer [`grapheme_width`] /
+/// [`display_width`] for measuring rendered text: per-`char` widths
+/// undercount sequences such as `⬇️` (`U+2B07 U+FE0F`, chars sum to
+/// 1, the cluster renders as 2).
 pub fn ch_width(ch: char) -> usize {
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-/// Display width of a string in terminal columns.
+/// Width of one extended grapheme cluster as ratatui renders it:
+/// `UnicodeWidthStr` over the whole cluster (so VS16/ZWJ/keycap
+/// sequences measure as the ligature, not the sum of their parts),
+/// plus one cell per halfwidth katakana voiced/semi-voiced sound
+/// mark (`U+FF9E`/`U+FF9F`), matching
+/// `ratatui_core::buffer::CellWidth`. Clusters containing control
+/// characters measure 0: ratatui's `styled_graphemes` filters them
+/// out before rendering.
+pub fn grapheme_width(g: &str) -> usize {
+    if g.chars().any(|c| c.is_control()) {
+        return 0;
+    }
+    let w = unicode_width::UnicodeWidthStr::width(g);
+    w + g
+        .chars()
+        .filter(|c| *c == '\u{FF9E}' || *c == '\u{FF9F}')
+        .count()
+}
+
+/// Ordered `(byte_offset, grapheme cluster)` pairs of `s`, using
+/// extended grapheme segmentation — the same clusters ratatui
+/// renders as one cell run.
+pub fn grapheme_clusters(s: &str) -> Vec<(usize, &str)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    UnicodeSegmentation::grapheme_indices(s, true).collect()
+}
+
+/// Display width of a string in terminal columns, measured per
+/// grapheme cluster exactly as ratatui's `CellWidth` measures it.
+/// In particular `display_width("⬇️") == 2`, not 1.
 pub fn display_width(s: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(s)
+    use unicode_segmentation::UnicodeSegmentation;
+    UnicodeSegmentation::graphemes(s, true)
+        .map(grapheme_width)
+        .sum()
 }
 
 #[cfg(test)]
@@ -185,5 +236,80 @@ mod tests {
         assert_eq!(wrap_text("éé éé", 5), vec!["éé éé"]);
         assert_eq!(wrap_text("éé éé", 4), vec!["éé", "éé"]);
         assert_eq!(wrap_text("éé éé", 2), vec!["éé", "éé"]);
+    }
+
+    #[test]
+    fn display_width_counts_vs16_emoji_as_two() {
+        // "⬇️" is U+2B07 + U+FE0F: per-char widths sum to 1, but the
+        // cluster renders as 2 (ratatui's CellWidth agrees). The old
+        // per-char measuring spilled one column into the right margin.
+        assert_eq!(display_width("⬇️"), 2);
+        assert_eq!(grapheme_width("⬇️"), 2);
+        assert_eq!(display_width("🎨"), 2);
+        assert_eq!(display_width("ｶﾞ"), 2);
+    }
+
+    #[test]
+    fn wrap_never_splits_grapheme_or_exceeds_width() {
+        // The toolcall overflow: an over-long word containing `⬇️`
+        // packed one cell too many per row (measuring the cluster as
+        // 1), spilling into the margin.
+        assert_eq!(
+            wrap_text("id=\"dlBtn\">⬇️", 12),
+            vec!["id=\"dlBtn\">", "⬇️"]
+        );
+        for width in [1usize, 2, 4, 6, 12, 22, 62] {
+            for text in [
+                "id=\"dlBtn\">⬇️ end",
+                "🎨✨⬇️🌊 done 〰️ tail",
+                "ｶﾞｷﾞｸﾞ done",
+                "→ shell_exec ({\"command\":\"cat ⬇️🎨\"})",
+            ] {
+                for row in wrap_text(text, width) {
+                    // A single grapheme wider than the column (e.g. ⬇️
+                    // at width 1) cannot fit unsplit; the renderer
+                    // truncates it. Everything else must fit.
+                    let single = grapheme_clusters(&row).len() == 1;
+                    assert!(
+                        display_width(&row) <= width || single,
+                        "row {row:?} exceeds {width} in {text:?}"
+                    );
+                }
+                // No span boundary may split a VS16 cluster.
+                for (a, b) in wrap_spans(text, width) {
+                    let raw = &text.as_bytes()[a..b];
+                    assert!(
+                        !raw.ends_with("⬇".as_bytes()) && !raw.ends_with("〰".as_bytes()),
+                        "split VS16 cluster in {text:?} at {a}..{b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_before_emoji_at_column_width() {
+        // 62-col text column: a long no-space word containing emoji
+        // must hard-break so no row exceeds 62; previously one row
+        // measured 62 but rendered 63, spilling into the margin.
+        let word = format!("{}⬇️{}〰️{}", "x".repeat(40), "y".repeat(40), "z".repeat(40));
+        let text = format!("→ shell_exec ({word})");
+        let rows = wrap_text(&text, 62);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(display_width(row) <= 62, "row exceeds 62: {row:?}");
+        }
+        // The emoji stays glued to its variation selector: no row
+        // ends with a bare base char split off from its selector.
+        for row in &rows {
+            assert!(
+                !row.ends_with('⬇') && !row.ends_with('〰'),
+                "split cluster: {row:?}"
+            );
+        }
+        // No content lost: rows rejoin to the source modulo spaces.
+        let joined: String = rows.join("");
+        let keep = |s: &str| s.chars().filter(|c| *c != ' ').collect::<String>();
+        assert_eq!(keep(&joined), keep(&text));
     }
 }
