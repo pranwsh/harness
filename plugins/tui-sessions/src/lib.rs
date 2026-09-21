@@ -62,33 +62,35 @@ pub fn sessions_query(input: &str) -> Option<String> {
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Absolute UTC date/time ("2026-09-21 14:05") from epoch seconds. The
+/// contract layer carries epoch secs precisely so no date crate is needed
+/// anywhere; the picker formats with a small civil-from-days conversion.
+/// Absolute (not relative) so a rendered row is stable: re-opening the
+/// picker later never changes the label, and the `/sessions <row>`
+/// completion keeps matching.
+fn format_time(updated_at: u64) -> String {
+    const DAY: u64 = 86_400;
+    let days = (updated_at / DAY) as i64;
+    let rem = updated_at % DAY;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", hour, min)
 }
 
-/// Human age ("12m ago") from epoch seconds. The contract layer carries
-/// epoch secs precisely so no date crate is needed anywhere; coarse
-/// buckets are all a picker needs.
-fn age(updated_at: u64, now: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    const MONTH: u64 = 30 * DAY;
-    let secs = now.saturating_sub(updated_at);
-    if secs < MINUTE {
-        "just now".to_owned()
-    } else if secs < HOUR {
-        format!("{}m ago", secs / MINUTE)
-    } else if secs < DAY {
-        format!("{}h ago", secs / HOUR)
-    } else if secs < MONTH {
-        format!("{}d ago", secs / DAY)
-    } else {
-        format!("{}mo ago", secs / MONTH)
-    }
+/// Days since the Unix epoch to civil (year, month, day): Howard Hinnant's
+/// algorithm, valid for the full `u64` epoch range without a date crate.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// One picker row: display label plus the session id it resumes. Labels
@@ -99,7 +101,7 @@ struct SessionRow {
     label: String,
 }
 
-fn render_row(summary: &SessionSummary, now: u64) -> SessionRow {
+fn render_row(summary: &SessionSummary) -> SessionRow {
     let short: String = summary.id.chars().take(SHORT_ID_CHARS).collect();
     let title = if summary.title.is_empty() {
         UNTITLED
@@ -108,7 +110,7 @@ fn render_row(summary: &SessionSummary, now: u64) -> SessionRow {
     };
     SessionRow {
         id: summary.id.clone(),
-        label: format!("{title} · {} · {short}", age(summary.updated_at, now)),
+        label: format!("{title} · {} · {short}", format_time(summary.updated_at)),
     }
 }
 
@@ -245,13 +247,12 @@ impl SessionPopup {
     /// the (still live) entry bar, and shows the list with the cursor on
     /// the current session.
     pub fn open(&self, app: &mut App) {
-        let now = now_secs();
         let rows: Vec<SessionRow> = self
             .source
             .catalog
             .list()
             .iter()
-            .map(|summary| render_row(summary, now))
+            .map(render_row)
             .collect();
         self.source.lock().rows = rows;
         app.set_input(&format!("{TRIGGER} "));
@@ -397,18 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn age_buckets_are_coarse() {
-        assert_eq!(age(1000, 1000), "just now");
-        assert_eq!(age(1000, 1059), "just now");
-        assert_eq!(age(1000, 1060), "1m ago");
-        assert_eq!(age(0, 3599), "59m ago");
-        assert_eq!(age(0, 3600), "1h ago");
-        assert_eq!(age(0, 86399), "23h ago");
-        assert_eq!(age(0, 86400), "1d ago");
-        assert_eq!(age(0, 29 * 86400), "29d ago");
-        assert_eq!(age(0, 30 * 86400), "1mo ago");
-        // Future timestamps (clock skew) clamp instead of underflowing.
-        assert_eq!(age(2000, 1000), "just now");
+    fn format_time_is_absolute_utc_and_stable() {
+        assert_eq!(format_time(0), "1970-01-01 00:00");
+        assert_eq!(format_time(1000), "1970-01-01 00:16");
+        assert_eq!(format_time(1_704_067_200), "2024-01-01 00:00");
+        // Leap day renders (civil conversion, not day-count division).
+        assert_eq!(format_time(1_709_164_800), "2024-02-29 00:00");
+        // Same instant, any "now": the label never drifts, so a pasted
+        // `/sessions <row>` completion keeps matching across re-opens.
+        assert_eq!(format_time(2000), format_time(2000));
     }
 
     #[test]

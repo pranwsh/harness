@@ -7,10 +7,10 @@ use std::{
 };
 
 use harness_contracts::{
-    CH_SESSION_APPEND_REQUESTED, CH_SESSION_ENTRY_APPENDED, CH_SESSION_TURN_CLOSED,
-    CH_SESSION_TURN_CLOSE_REQUESTED, CH_SESSION_TURN_OPENED, CH_SESSION_TURN_OPEN_REQUESTED,
-    CH_TOOL_EXECUTED, ConfigHandle, Entry, KEY_CONFIG, KEY_SESSIONS, KEY_SESSION_CATALOG,
-    KEY_SESSION_STORE, Role, SessionAppendRequested, SessionCatalogApi, SessionCatalogHandle,
+    CH_SESSION_APPEND_REQUESTED, CH_SESSION_ENTRY_APPENDED, CH_SESSION_TURN_CLOSE_REQUESTED,
+    CH_SESSION_TURN_CLOSED, CH_SESSION_TURN_OPEN_REQUESTED, CH_SESSION_TURN_OPENED,
+    CH_TOOL_EXECUTED, ConfigHandle, Entry, KEY_CONFIG, KEY_SESSION_CATALOG, KEY_SESSION_STORE,
+    KEY_SESSIONS, Role, SessionAppendRequested, SessionCatalogApi, SessionCatalogHandle,
     SessionEntryAppended, SessionId, SessionStoreApi, SessionStoreHandle, SessionSummary,
     SessionTurnCloseRequested, SessionTurnClosed, SessionTurnOpenRequested, SessionTurnOpened,
     ToolExecuted,
@@ -124,7 +124,18 @@ fn summary_of(id: &str, session: &Session) -> SessionSummary {
 fn read_journal(path: &Path) -> Option<(SessionId, Session)> {
     let raw = std::fs::read_to_string(path).ok()?;
     let mut id: Option<SessionId> = None;
-    let mut session = Session::default();
+    let mut session = Session {
+        turn: 0,
+        entries: Vec::new(),
+        title: String::new(),
+        // Zeroed on purpose (not `Session::default()`): `updated_at` is
+        // folded with `max(record.ts)`, so seeding `now` here would clamp
+        // every reloaded journal to startup time and all past sessions
+        // would look freshly active. `created_at` falls back to
+        // the newest record ts below for headerless journals.
+        created_at: 0,
+        updated_at: 0,
+    };
     let mut records = 0u32;
     for line in raw.lines() {
         let line = line.trim();
@@ -363,9 +374,7 @@ impl SessionLog {
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<SessionId, Session>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock_index(&self) -> MutexGuard<'_, HashMap<SessionId, SessionSummary>> {
@@ -373,9 +382,9 @@ impl SessionLog {
     }
 
     fn journal_path(&self, session_id: &str) -> Option<PathBuf> {
-        self.persist.as_ref().map(|dir| {
-            dir.join(format!("{}.jsonl", sanitize_filename(session_id)))
-        })
+        self.persist
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.jsonl", sanitize_filename(session_id))))
     }
 
     /// Hydrates one session from its journal unless already resident. Fast
@@ -425,21 +434,11 @@ impl SessionLog {
     /// new or empty, which also self-heals headerless files). No-op without
     /// persistence. Failures log and continue in-memory — a full disk must
     /// never break the live turn.
-    fn journal_append(
-        &self,
-        session_id: &str,
-        turn: u64,
-        ts: u64,
-        created_at: u64,
-        entry: &Entry,
-    ) {
+    fn journal_append(&self, session_id: &str, turn: u64, ts: u64, created_at: u64, entry: &Entry) {
         let Some(path) = self.journal_path(session_id) else {
             return;
         };
-        let fresh = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0)
-            == 0;
+        let fresh = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0;
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -498,8 +497,7 @@ impl SessionStoreApi for SessionLog {
 
 impl SessionCatalogApi for SessionLog {
     fn list(&self) -> Vec<SessionSummary> {
-        let mut summaries: Vec<SessionSummary> =
-            self.lock_index().values().cloned().collect();
+        let mut summaries: Vec<SessionSummary> = self.lock_index().values().cloned().collect();
         // Newest activity first; id tie-break keeps the order deterministic
         // within one-second timestamp granularity.
         summaries.sort_by(|a, b| {
@@ -553,7 +551,9 @@ impl harness_core::Plugin for SessionPlugin {
         );
         ctx.provide_key(
             KEY_SESSION_CATALOG,
-            Arc::new(SessionCatalogHandle(log.clone() as Arc<dyn SessionCatalogApi>)),
+            Arc::new(SessionCatalogHandle(
+                log.clone() as Arc<dyn SessionCatalogApi>
+            )),
         );
 
         // Canonical bus paths, all inline: turn open via waterfall
@@ -588,12 +588,9 @@ impl harness_core::Plugin for SessionPlugin {
         }
         {
             let log = log.clone();
-            ctx.on_sync_key::<SessionAppendRequested, _>(
-                CH_SESSION_APPEND_REQUESTED,
-                move |ev| {
-                    log.append(&ev.session_id, ev.turn, ev.entry.clone());
-                },
-            )?;
+            ctx.on_sync_key::<SessionAppendRequested, _>(CH_SESSION_APPEND_REQUESTED, move |ev| {
+                log.append(&ev.session_id, ev.turn, ev.entry.clone());
+            })?;
         }
         ctx.on_sync_key::<ToolExecuted, _>(CH_TOOL_EXECUTED, move |ev| {
             let entry = match &ev.result {
@@ -745,7 +742,11 @@ mod tests {
 
         let turn = log.begin_turn("s1");
         assert_eq!(turn, 1);
-        log.append("s1", turn, Entry::from_message(&Message::user("hello world")));
+        log.append(
+            "s1",
+            turn,
+            Entry::from_message(&Message::user("hello world")),
+        );
         log.append(
             "s1",
             turn,
@@ -859,6 +860,28 @@ mod tests {
         assert_eq!(catalog[1].id, "old");
         // Non-journal files are ignored, and nothing was hydrated yet.
         assert!(log.lock().is_empty());
+    }
+
+    #[test]
+    fn reloaded_catalog_preserves_record_timestamps() {
+        let dir = unique_tmp_dir("timestamps");
+        // Old timestamps: a reload must keep them, not clamp to startup
+        // time (which made every past session read as freshly active).
+        std::fs::write(
+            dir.join("old.jsonl"),
+            "{\"v\":1,\"id\":\"old\",\"created_at\":100}\n{\"turn\":1,\"ts\":200,\"entry\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let log = SessionLog::with_persistence(Context::root(), dir);
+        let catalog = log.list();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].updated_at, 200);
+        assert_eq!(catalog[0].created_at, 100);
+        // Lazy hydration preserves them too, not just the startup scan.
+        assert_eq!(log.history("old").len(), 1);
+        let catalog = log.list();
+        assert_eq!(catalog[0].updated_at, 200);
     }
 
     #[test]
