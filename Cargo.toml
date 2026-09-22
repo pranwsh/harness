@@ -17,6 +17,7 @@ members = [
     "plugins/agent-default-model",
     "plugins/agent-loop",
     "plugins/shell",
+    "plugins/mcp",
     "plugins/tui-state",
     "plugins/tui-markdown",
     "plugins/tui-input",

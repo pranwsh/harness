@@ -53,5 +53,5 @@ harness/src/main.rs (composition root)
 - **plugins:**
   - infra: `config` (toml loading), `session` (conversation log, journaled to `$XDG_DATA_HOME/harness/sessions` — see `[session]` in `config.example.toml`)
   - llm/agent: `model` (HTTP transport), `model-headers` (header waterfall), `agent`, `agent-default-model`, `agent-loop`, `system-prompt`
-  - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `hash-base`, `hashline-read`, `hashline-edit`
+  - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `mcp` (MCP stdio bridge: `mcp__<server>__<tool>`), `hash-base`, `hashline-read`, `hashline-edit`
   - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-filter` (shared filter-popup behavior), `tui-commands` (slash completion), `tui-model` (model search), `tui-sessions` (`/sessions` picker: list past sessions, resume on select)

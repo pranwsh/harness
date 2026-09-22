@@ -83,6 +83,11 @@ async fn run() -> Result<ExitCode> {
         // until both are ready; no ctor wiring needed.
         load!(ctx, "shell", harness_shell::ShellPlugin);
     }
+    {
+        // MCP bridge injects `config.app` + `tools.registry` via DI and
+        // parks until both are ready; no ctor wiring needed.
+        load!(ctx, "mcp", harness_mcp::McpPlugin);
+    }
     load!(
         ctx,
         "system-prompt",

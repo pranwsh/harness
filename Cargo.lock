@@ -680,6 +680,7 @@ dependencies = [
  "harness-hash-base",
  "harness-hashline-edit",
  "harness-hashline-read",
+ "harness-mcp",
  "harness-model",
  "harness-model-headers",
  "harness-session",
@@ -808,6 +809,19 @@ dependencies = [
  "harness-tools",
  "memchr",
  "memmap2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harness-mcp"
+version = "0.1.0"
+dependencies = [
+ "harness-config",
+ "harness-contracts",
+ "harness-core",
+ "harness-tools",
  "serde",
  "serde_json",
  "tokio",
