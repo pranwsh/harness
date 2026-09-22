@@ -9,7 +9,7 @@ use harness_core::{Context, Plugin};
 // Re-export config types from contracts for backward compat: existing
 // `use harness_config::AppConfig` paths keep working, new code should
 // `use harness_contracts::AppConfig`.
-pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, ShellConfig};
+pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, ShellConfig};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
@@ -520,5 +520,21 @@ denied_patterns = ["CUSTOM_*"]
         let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\nresponses_models = [\"future-1\", \"future-2\"]\n";
         let cfg = AppConfig::from_toml(raw, "test").unwrap();
         assert_eq!(cfg.llm.responses_models, vec!["future-1", "future-2"]);
+    }
+
+    #[test]
+    fn mcp_defaults_to_empty_and_parses_servers() {
+        let cfg = AppConfig::from_toml(RAW, "test").unwrap();
+        assert!(cfg.mcp.servers.is_empty());
+
+        let raw = "[llm]\nbase_url = \"u\"\nmodel = \"m\"\napi_key = \"k\"\nuser_agent = \"a\"\n[mcp.servers.fetch]\ncommand = \"npx\"\nargs = [\"-y\", \"x\"]\ntimeout_ms = 5000\n[mcp.servers.off]\ncommand = \"y\"\ndisabled = true\n";
+        let cfg = AppConfig::from_toml(raw, "test").unwrap();
+        let fetch = &cfg.mcp.servers["fetch"];
+        assert_eq!(fetch.command, "npx");
+        assert_eq!(fetch.args, vec!["-y".to_owned(), "x".to_owned()]);
+        assert_eq!(fetch.effective_timeout_ms(), 5000);
+        assert!(!fetch.disabled);
+        assert!(cfg.mcp.servers["off"].disabled);
+        assert_eq!(cfg.mcp.servers["off"].effective_timeout_ms(), 30_000);
     }
 }
