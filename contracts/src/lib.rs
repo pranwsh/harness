@@ -30,8 +30,8 @@ pub mod services;
 pub mod types;
 
 pub use config::{
-    AgentConfig, AppConfig, ConfigError, LlmConfig, SessionConfig, ShellConfig,
-    default_max_iterations,
+    AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, SessionConfig,
+    ShellConfig, default_max_iterations,
 };
 pub use keys::*;
 pub use services::*;

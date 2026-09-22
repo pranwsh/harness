@@ -61,6 +61,9 @@ pub const KEY_HASH_STORE: &str = "hash.store";
 /// `Arc<ShellService>` — provided by the shell plugin. Kept alive for the
 /// plugin lifetime so background jobs are aborted on unload via `JobManager::drop`.
 pub const KEY_SHELL_SERVICE: &str = "shell.service";
+/// `Arc<McpService>` — provided by the mcp plugin. Kept alive for the
+/// plugin lifetime so server child processes are killed on unload via `Drop`.
+pub const KEY_MCP_SERVICE: &str = "mcp.service";
 
 // ---- service-trait handles (decoupled DI) -----------------------------------
 // Each provider publishes `Arc<Handle>` here alongside its legacy concrete

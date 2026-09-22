@@ -58,3 +58,11 @@ max_capture_bytes = 1048576
 max_jobs = 32
 max_job_time_ms = 600000
 max_job_output_bytes = 262144
+
+# MCP servers (stdio transport). Each `[mcp.servers.<name>]` spawns one
+# persistent child speaking JSON-RPC 2.0 over stdio; its tools appear as
+# `mcp__<server>__<tool>`. Absent means no MCP servers. One bad command
+# never blocks the others. No policy guardrails: any command runs.
+# [mcp.servers.fetch]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-fetch"]

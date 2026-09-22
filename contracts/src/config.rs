@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub shell: ShellConfig,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -160,6 +162,43 @@ impl Default for SessionConfig {
 
 fn default_session_enabled() -> bool {
     true
+}
+
+/// `[mcp]` section: Model Context Protocol servers (stdio transport).
+/// Each `[mcp.servers.<name>]` entry spawns one persistent child process
+/// speaking JSON-RPC 2.0 over stdio. Absent/empty means no MCP servers.
+/// Fail-closed per server: a bad command never blocks other servers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct McpConfig {
+    /// Server name -> server config (`[mcp.servers.<name>]`).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// One MCP stdio server: spawned as `command args...` with piped stdio.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct McpServerConfig {
+    /// Executable to spawn (e.g. `"npx"`).
+    pub command: String,
+    /// Extra argv (e.g. `["-y", "@modelcontextprotocol/server-github"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Extra env vars merged over the inherited environment.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// Per-call timeout for `tools/call`. Defaults to 30s when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// `disabled = true` skips this server without removing its config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+impl McpServerConfig {
+    /// Effective per-call timeout (default 30s, min 1ms).
+    pub fn effective_timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(30_000).max(1)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
