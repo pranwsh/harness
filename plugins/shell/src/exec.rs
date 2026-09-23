@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
-use crate::env::apply_env;
+use crate::env::{apply_env, detach_tty};
 use crate::output::format_shell_result;
 use harness_contracts::ShellConfig;
 
@@ -135,6 +135,7 @@ pub async fn run_once(cfg: &ShellConfig, req: ExecRequest) -> Result<String, Str
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_env(cmd.as_std_mut(), req.explicit_env.as_ref());
+    detach_tty(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -249,6 +250,34 @@ mod tests {
         .unwrap();
         let out = run_once(&cfg, req).await.unwrap();
         assert_eq!(out, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn oneshot_has_no_controlling_terminal() {
+        // Same setsid guarantee as the session, for the explicit-`env`
+        // one-shot path (`bash -c` direct spawn).
+        let cfg = ShellConfig::default();
+        let req = resolve_request(
+            &cfg,
+            "bash".to_owned(),
+            vec![
+                "bash".to_owned(),
+                "-c".to_owned(),
+                "ps -o sid= -p $$".to_owned(),
+            ],
+            None,
+            Some(5_000),
+            None,
+        )
+        .unwrap();
+        let out = run_once(&cfg, req).await.unwrap();
+        let child_sid: i32 = out.trim().parse().expect("ps must print the sid");
+        // SAFETY: getsid(0) queries our own session; cannot fail.
+        let parent_sid = unsafe { libc::getsid(0) };
+        assert_ne!(
+            child_sid, parent_sid,
+            "one-shot child must be setsid'd (child sid {child_sid} == parent sid {parent_sid})"
+        );
     }
 
     #[tokio::test]

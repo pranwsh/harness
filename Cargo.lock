@@ -873,6 +873,7 @@ dependencies = [
  "harness-contracts",
  "harness-core",
  "harness-tools",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

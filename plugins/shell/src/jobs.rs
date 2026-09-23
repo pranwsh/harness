@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify};
 
-use crate::env::apply_env;
+use crate::env::{apply_env, detach_tty};
 use crate::exec::{Ring, drain_into, resolve_workdir};
 use crate::output::tail_truncate;
 use harness_contracts::ShellConfig;
@@ -146,6 +146,7 @@ impl JobManager {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         apply_env(cmd.as_std_mut(), explicit_env.as_ref());
+        detach_tty(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("spawn `{exe}`: {e}"))?;
 
         let id = format!("sh-{}", self.next.fetch_add(1, Ordering::Relaxed));

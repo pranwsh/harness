@@ -21,6 +21,34 @@ pub fn apply_env(cmd: &mut Command, explicit: Option<&HashMap<String, String>>) 
     // Otherwise inherit everything; no denylist here.
 }
 
+
+/// Detach the child from our controlling terminal (no `/dev/tty`).
+///
+/// `stdin=null` + piped stdout/stderr is NOT enough: `sudo` (and
+/// `su`/`passwd`/`ssh`/pagers) re-opens `/dev/tty` directly, painting
+/// `Password:` over the TUI input box and stealing keystrokes from the
+/// input task. A `setsid` in the child (new session, no ctty) makes that
+/// open fail, so `sudo` exits fast with `no tty present` into captured
+/// stderr instead of corrupting the screen. Unix-only; no-op elsewhere.
+pub fn detach_tty(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `setsid` is async-signal-safe; closure does nothing else.
+        unsafe {
+            cmd.pre_exec(|| {
+                // Ignore errors: if already a session leader, parent keeps ctty,
+                // but stdio is still piped/null so no screen corruption.
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

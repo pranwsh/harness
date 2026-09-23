@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
+use crate::env::detach_tty;
 use crate::exec::Ring;
 
 /// Process-wide nonce counter: temp files and markers must be unique
@@ -78,6 +79,7 @@ impl BashSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        detach_tty(&mut cmd);
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
@@ -515,6 +517,30 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("probe=absent"));
+    }
+
+    #[tokio::test]
+    async fn session_has_no_controlling_terminal() {
+        // Fix A: the session shell runs setsid'd (new session, no ctty),
+        // so `sudo`/`su`/`passwd` cannot open `/dev/tty` and paint over
+        // the TUI input box. Prove it by comparing session ids: the child
+        // shell must live in a different session than this test process.
+        let session = BashSession::new();
+        let out = run(&session, "ps -o sid= -p $$").await;
+        assert_eq!(out.exit_code, Some(0));
+        let child_sid: i32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps must print the shell sid");
+        // SAFETY: getsid(0) queries our own session; cannot fail.
+        let parent_sid = unsafe { libc::getsid(0) };
+        assert_ne!(
+            child_sid, parent_sid,
+            "session shell must be setsid'd (child sid {child_sid} == parent sid {parent_sid})"
+        );
+        // And `/dev/tty` must not open from inside the session.
+        let out = run(&session, r#"python3 -c 'open("/dev/tty")'"#).await;
+        assert_ne!(out.exit_code, Some(0), "/dev/tty must not open in session");
     }
 
     #[tokio::test]
