@@ -17,7 +17,7 @@ use harness_tui_state::{
 };
 
 /// Margin, in columns, on each side of assistant/tool/notice output.
-const SIDE_MARGIN: u16 = 4;
+const SIDE_MARGIN: u16 = 2;
 
 /// Max popup rows including its border, so a huge `/models` catalog never
 /// eats the whole chat pane (the list itself is not scrollable in v1; the
@@ -28,6 +28,9 @@ const MAX_POPUP_HEIGHT: u16 = 10;
 /// and the input box (`Block`) both use rounded corners from here.
 const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 
+/// Columns consumed by the left + right border of a synthesized user box.
+const BORDER_COLS: usize = 2;
+
 /// Per-frame layout cache owned by the TUI `EventLoop` (not `App` — keeps
 /// `tui-state` pure and `Tui`'s shared `Arc` API untouched). Caches the
 /// laid-out `MsgLayout` per chat item keyed by `(kind, text hash, width)`;
@@ -35,26 +38,36 @@ const BOX_BORDER_TYPE: BorderType = BorderType::Rounded;
 /// Append-only `items` makes invalidation trivial.
 pub(crate) struct LayoutCache {
     width: u16,
-    hashes: Vec<u64>,
-    layouts: Vec<MsgLayout>,
+    /// Each entry is `(hash, layout)` kept in lockstep; a single `Vec` of
+    /// pairs is simpler than two parallel `Vec`s that must be manually
+    /// kept in sync.
+    entries: Vec<(u64, MsgLayout)>,
 }
 
 impl LayoutCache {
     pub(crate) fn new() -> Self {
         LayoutCache {
             width: 0,
-            hashes: Vec::new(),
-            layouts: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
     fn key_for(item: &ChatItem) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        (item.kind as u8).hash(&mut h);
-        item.text.hash(&mut h);
-        h.finish()
+        // A simple but stable 64-bit hash (FNV-1a) over the kind byte and
+        // text bytes. Unlike `DefaultHasher`, FNV is guaranteed-stable across
+        // Rust versions and runs (no randomisation), which is correct here
+        // because the cache only lives for the process lifetime and we never
+        // persist or compare keys across runs.
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = FNV_OFFSET;
+        h ^= item.kind as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+        for byte in item.text.as_bytes() {
+            h ^= *byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
     }
 
     /// Returns the laid-out chat rows, reusing cached entries where the
@@ -64,31 +77,24 @@ impl LayoutCache {
         items: &[ChatItem],
         width: u16,
         renderer: &dyn MessageRenderer,
-    ) -> &[MsgLayout] {
+    ) -> impl Iterator<Item = &MsgLayout> {
         if self.width != width {
             self.width = width;
-            self.hashes.clear();
-            self.layouts.clear();
+            self.entries.clear();
         }
-        if self.hashes.len() > items.len() {
-            self.hashes.truncate(items.len());
-            self.layouts.truncate(items.len());
-        }
+        self.entries.truncate(items.len());
         for (idx, item) in items.iter().enumerate() {
             let key = Self::key_for(item);
-            if idx < self.hashes.len() && self.hashes[idx] == key {
-                continue;
-            }
-            let lay = layout_item(item, width, renderer);
-            if idx < self.hashes.len() {
-                self.hashes[idx] = key;
-                self.layouts[idx] = lay;
+            if idx < self.entries.len() {
+                if self.entries[idx].0 == key {
+                    continue;
+                }
+                self.entries[idx] = (key, layout_item(item, width, renderer));
             } else {
-                self.hashes.push(key);
-                self.layouts.push(lay);
+                self.entries.push((key, layout_item(item, width, renderer)));
             }
         }
-        &self.layouts
+        self.entries.iter().map(|(_, lay)| lay)
     }
 }
 
@@ -107,6 +113,12 @@ pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer) {
 /// chat geometry is untouched, `Clear` erases the chat rows underneath, and
 /// the terminal cursor stays in the input box (set by `draw_input` before
 /// the popup renders; list widgets never move it).
+///
+/// # Note
+/// This is a **non-caching** shim (allocates a fresh `LayoutCache` that is
+/// discarded after the call). It exists for call sites that do not own a
+/// persistent cache (e.g. tests). Production rendering goes through
+/// [`draw_with_popup_cached`], which reuses the loop-owned cache across frames.
 pub fn draw_with_popup(
     f: &mut Frame,
     app: &mut App,
@@ -161,7 +173,9 @@ fn draw_chat_cached(
     if area.width < 2 || area.height == 0 {
         return;
     }
-    let layouts = cache.layouts_for(app.items(), area.width, renderer);
+    let layouts: Vec<&MsgLayout> = cache
+        .layouts_for(app.items(), area.width, renderer)
+        .collect();
     let total: usize = layouts.iter().map(|l| l.height).sum();
     let viewport = area.height as usize;
     // Report the measured geometry so the stored offset is clamped to
@@ -342,31 +356,28 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
 /// other content; the glyphs come from [`BOX_BORDER_TYPE`], matching
 /// the input box.
 fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer) -> MsgLayout {
-    let style = item_style(item.kind);
-    if item.kind == ItemKind::User {
+    if let ItemStyles::Bordered { content, border } = item_style(item.kind) {
         // The box's right edge sits on the 4-column right margin, and
         // its width leaves at least the left margin intact, so user
         // messages share the assistant text column.
         let avail = area_width.saturating_sub(SIDE_MARGIN) as usize;
-        let inner_cap = avail.saturating_sub(2 + SIDE_MARGIN as usize).max(1);
+        let inner_cap = avail
+            .saturating_sub(BORDER_COLS + SIDE_MARGIN as usize)
+            .max(1);
         let natural = item.text.split('\n').map(display_width).max().unwrap_or(0);
         let inner = natural.clamp(1, inner_cap);
         let strs = wrap_text(&item.text, inner);
         let content_width = strs.iter().map(|s| display_width(s)).max().unwrap_or(0);
-        let box_width = (content_width + 2)
+        let box_width = (content_width + BORDER_COLS)
             .min(area_width as usize)
             .min(avail.max(2));
-        // Chrome follows the User fg but never takes content modifiers
-        // (BOLD box glyphs look heavy / brighten on many terminals).
-        let border = Style::new()
-            .patch(style)
-            .remove_modifier(style.add_modifier);
         let set = BOX_BORDER_TYPE.to_border_set();
         let mut lines = Vec::with_capacity(strs.len() + 2);
         lines.push(Line::from(vec![
             Span::styled(set.top_left, border),
             Span::styled(
-                set.horizontal_top.repeat(box_width.saturating_sub(2)),
+                set.horizontal_top
+                    .repeat(box_width.saturating_sub(BORDER_COLS)),
                 border,
             ),
             Span::styled(set.top_right, border),
@@ -375,15 +386,16 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
             let pad = content_width.saturating_sub(display_width(&row));
             lines.push(Line::from(vec![
                 Span::styled(set.vertical_left, border),
-                Span::styled(row, style),
-                Span::styled(" ".repeat(pad), style),
+                Span::styled(row, content),
+                Span::styled(" ".repeat(pad), content),
                 Span::styled(set.vertical_right, border),
             ]));
         }
         lines.push(Line::from(vec![
             Span::styled(set.bottom_left, border),
             Span::styled(
-                set.horizontal_bottom.repeat(box_width.saturating_sub(2)),
+                set.horizontal_bottom
+                    .repeat(box_width.saturating_sub(BORDER_COLS)),
                 border,
             ),
             Span::styled(set.bottom_right, border),
@@ -397,6 +409,9 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
         };
     }
 
+    let ItemStyles::Unbordered { content } = item_style(item.kind) else {
+        unreachable!("only User items are Bordered");
+    };
     let x = SIDE_MARGIN.min(area_width);
     // Both margins come out of the text column so long lines wrap
     // before reaching the right edge. Assistant messages render through
@@ -408,7 +423,7 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
     } else {
         wrap_text(&item.text, width as usize)
             .into_iter()
-            .map(|s| Line::styled(s, style))
+            .map(|s| Line::styled(s, content))
             .collect::<Vec<_>>()
     };
     let height = lines.len().max(1);
@@ -420,15 +435,36 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
     }
 }
 
-fn item_style(kind: ItemKind) -> Style {
+/// Style description for a chat item.
+///
+/// `Bordered` carries both text and chrome styles so `layout_item` never
+/// hardcodes either color. Using a typed enum instead of `Option<Style>`
+/// makes the two cases structurally distinct — a `Bordered` item always
+/// has a border style and an `Unbordered` item never does, with no runtime
+/// `.expect()` needed.
+enum ItemStyles {
+    Bordered { content: Style, border: Style },
+    Unbordered { content: Style },
+}
+
+fn item_style(kind: ItemKind) -> ItemStyles {
     match kind {
-        ItemKind::User => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ItemKind::Assistant => ASSISTANT_BASE,
-        ItemKind::ToolStarted | ItemKind::ToolOk | ItemKind::Notice => {
-            Style::new().fg(Color::DarkGray)
-        }
-        ItemKind::ToolErr => Style::new().fg(Color::Red),
-        ItemKind::Error => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ItemKind::User => ItemStyles::Bordered {
+            content: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            border: Style::new().fg(Color::Green),
+        },
+        ItemKind::Assistant => ItemStyles::Unbordered {
+            content: ASSISTANT_BASE,
+        },
+        ItemKind::ToolStarted | ItemKind::ToolOk | ItemKind::Notice => ItemStyles::Unbordered {
+            content: Style::new().fg(Color::DarkGray),
+        },
+        ItemKind::ToolErr => ItemStyles::Unbordered {
+            content: Style::new().fg(Color::Red),
+        },
+        ItemKind::Error => ItemStyles::Unbordered {
+            content: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        },
     }
 }
 
@@ -557,7 +593,12 @@ mod tests {
         width: u16,
         height: u16,
     ) -> Vec<String> {
-        render(app, renderer, width, height)[..(height - 3) as usize].to_vec()
+        // The input box is `min(input_rows, INPUT_VISIBLE_ROWS) + 2` rows
+        // (border top + text rows + border bottom). With an empty input
+        // that collapses to `1 + 2 = 3`. Use the same expression the real
+        // draw uses so this stays correct if the minimum ever changes.
+        let input_height = (app.input_rows().min(INPUT_VISIBLE_ROWS) + 2).min(height as usize);
+        render(app, renderer, width, height)[..height as usize - input_height].to_vec()
     }
 
     fn submit(app: &mut App, text: &str) {
