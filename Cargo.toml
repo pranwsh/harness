@@ -26,6 +26,7 @@ members = [
         "plugins/tui-model",
         "plugins/tui-commands",
         "plugins/tui-sessions",
+        "plugins/tui-branch",
         "plugins/tui",
 ]
 

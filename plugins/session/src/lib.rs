@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -9,9 +9,10 @@ use std::{
 use harness_contracts::{
     CH_SESSION_APPEND_REQUESTED, CH_SESSION_ENTRY_APPENDED, CH_SESSION_TURN_CLOSE_REQUESTED,
     CH_SESSION_TURN_CLOSED, CH_SESSION_TURN_OPEN_REQUESTED, CH_SESSION_TURN_OPENED,
-    CH_TOOL_EXECUTED, ConfigHandle, Entry, KEY_CONFIG, KEY_SESSION_CATALOG, KEY_SESSION_STORE,
-    KEY_SESSIONS, Role, SessionAppendRequested, SessionCatalogApi, SessionCatalogHandle,
-    SessionEntryAppended, SessionId, SessionStoreApi, SessionStoreHandle, SessionSummary,
+    CH_TOOL_EXECUTED, BranchNode, ConfigHandle, Entry, KEY_CONFIG, KEY_SESSION_CATALOG,
+    KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_SESSIONS, Role, SessionAppendRequested,
+    SessionCatalogApi, SessionCatalogHandle, SessionEntryAppended, SessionId, SessionStoreApi,
+    SessionStoreHandle, SessionSummary, SessionTreeApi, SessionTreeHandle,
     SessionTurnCloseRequested, SessionTurnClosed, SessionTurnOpenRequested, SessionTurnOpened,
     ToolExecuted,
 };
@@ -34,6 +35,7 @@ struct JournalHeader {
 #[derive(Debug, Serialize)]
 struct JournalRecord<'a> {
     turn: u64,
+    parent: u64,
     ts: u64,
     entry: &'a Entry,
 }
@@ -41,8 +43,21 @@ struct JournalRecord<'a> {
 #[derive(Debug, Deserialize)]
 struct JournalRecordOwned {
     turn: u64,
+    /// Head this turn branched from (`0` for the first turn). Absent on
+    /// v1 lines, which are always linear and get linked at load.
+    #[serde(default)]
+    parent: u64,
     ts: u64,
     entry: Entry,
+}
+
+/// Journaled on every `begin_turn` and every `revert`: the new head plus
+/// the edge it hangs from. Lets a reload restore both without scanning
+/// entries; childless turns (opened, never appended) still resolve.
+#[derive(Debug, Serialize, Deserialize)]
+struct JournalHead {
+    head: u64,
+    parent: u64,
 }
 
 /// Display title budget, in characters.
@@ -82,11 +97,36 @@ fn sanitize_filename(id: &str) -> String {
     out
 }
 
-/// Monotonic turn/entry bookkeeping for one session.
+/// One turn node: the entries recorded under one turn id plus the head
+/// it branched from (`0` for the first turn). `title` is the turn's first
+/// user message for tree display, mirroring the session title.
+#[derive(Debug)]
+struct TurnNode {
+    parent: u64,
+    entries: Vec<Entry>,
+    title: String,
+}
+
+impl TurnNode {
+    fn new(parent: u64) -> Self {
+        TurnNode {
+            parent,
+            entries: Vec::new(),
+            title: String::new(),
+        }
+    }
+}
+
+/// Monotonic turn/entry bookkeeping for one session. Turns form a tree:
+/// each `begin_turn` parents onto the head, `revert` moves the head back,
+/// and nothing is ever deleted. The counter stays session-wide monotonic
+/// so turn ids are unique and reload restores via `max`.
 #[derive(Debug)]
 struct Session {
     turn: u64,
-    entries: Vec<Entry>,
+    head: u64,
+    turns: BTreeMap<u64, TurnNode>,
+    entries_total: usize,
     title: String,
     created_at: u64,
     updated_at: u64,
@@ -97,11 +137,35 @@ impl Default for Session {
         let now = now_secs();
         Session {
             turn: 0,
-            entries: Vec::new(),
+            head: 0,
+            turns: BTreeMap::new(),
+            entries_total: 0,
             title: String::new(),
             created_at: now,
             updated_at: now,
         }
+    }
+}
+
+impl Session {
+    /// Turn ids from the root to the head, oldest first. Stops at missing
+    /// ancestors and refuses to loop (bounded by the turn count), so a
+    /// corrupt journal degrades to a shorter history, never a hang.
+    fn path(&self) -> Vec<u64> {
+        let mut chain = Vec::new();
+        let mut next = self.head;
+        while next != 0 && chain.len() <= self.turns.len() {
+            let Some(node) = self.turns.get(&next) else {
+                break;
+            };
+            chain.push(next);
+            if node.parent == next {
+                break;
+            }
+            next = node.parent;
+        }
+        chain.reverse();
+        chain
     }
 }
 
@@ -112,7 +176,7 @@ fn summary_of(id: &str, session: &Session) -> SessionSummary {
         created_at: session.created_at,
         updated_at: session.updated_at,
         turns: session.turn,
-        entries: session.entries.len(),
+        entries: session.entries_total,
     }
 }
 
@@ -126,7 +190,9 @@ fn read_journal(path: &Path) -> Option<(SessionId, Session)> {
     let mut id: Option<SessionId> = None;
     let mut session = Session {
         turn: 0,
-        entries: Vec::new(),
+        head: 0,
+        turns: BTreeMap::new(),
+        entries_total: 0,
         title: String::new(),
         // Zeroed on purpose (not `Session::default()`): `updated_at` is
         // folded with `max(record.ts)`, so seeding `now` here would clamp
@@ -152,6 +218,20 @@ fn read_journal(path: &Path) -> Option<(SessionId, Session)> {
             }
             continue;
         }
+        if let Ok(head) = serde_json::from_str::<JournalHead>(line) {
+            // Journaled on `begin_turn`/`revert`: tracks the forward edge
+            // plus the current head, so reloads need no entry scan.
+            session.turn = session.turn.max(head.head).max(head.parent);
+            session.head = head.head;
+            if head.head != 0 && !session.turns.contains_key(&head.head) {
+                session
+                    .turns
+                    .entry(head.head)
+                    .or_insert_with(|| TurnNode::new(head.parent));
+            }
+            records += 1;
+            continue;
+        }
         let Ok(record) = serde_json::from_str::<JournalRecordOwned>(line) else {
             continue;
         };
@@ -160,7 +240,23 @@ fn read_journal(path: &Path) -> Option<(SessionId, Session)> {
         if session.title.is_empty() && record.entry.role == Role::User {
             session.title = title_of(&record.entry.content);
         }
-        session.entries.push(record.entry);
+        // v1 lines carry no parent: they are linear, so the previous max
+        // turn is the parent. Later (v2) lines carry it explicitly.
+        let parent = if record.parent != 0 || record.turn <= 1 {
+            record.parent
+        } else {
+            record.turn - 1
+        };
+        let node = session
+            .turns
+            .entry(record.turn)
+            .or_insert_with(|| TurnNode::new(parent));
+        if node.title.is_empty() && record.entry.role == Role::User {
+            node.title = title_of(&record.entry.content);
+        }
+        node.entries.push(record.entry);
+        session.entries_total += 1;
+        session.head = session.head.max(record.turn);
         records += 1;
     }
     if records == 0 {
@@ -279,20 +375,27 @@ impl SessionLog {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    /// Opens a new turn, incrementing the per-session turn counter.
-    /// Emits `session.turn_opened`.
+    /// Opens a new turn parented onto the head, incrementing the
+    /// per-session turn counter. Emits `session.turn_opened`.
     pub fn begin_turn(&self, session_id: &str) -> u64 {
         self.ensure_loaded(session_id);
-        let turn = {
+        let (turn, parent) = {
             let mut sessions = self.lock();
             let session = sessions.entry(session_id.to_owned()).or_default();
+            let parent = session.head;
             session.turn += 1;
-            session.updated_at = now_secs();
             let turn = session.turn;
+            session.head = turn;
+            session
+                .turns
+                .entry(turn)
+                .or_insert_with(|| TurnNode::new(parent));
+            session.updated_at = now_secs();
             self.lock_index()
                 .insert(session_id.to_owned(), summary_of(session_id, session));
-            turn
+            (turn, parent)
         };
+        self.journal_head(session_id, turn, parent);
         if let Err(e) = self.ctx.emit_key(
             CH_SESSION_TURN_OPENED,
             SessionTurnOpened {
@@ -329,24 +432,38 @@ impl SessionLog {
 
     /// Appends an entry: in-memory, index, journal line, then emits
     /// `session.entry_appended`. File I/O runs after the locks are
-    /// released so a slow disk never blocks other sessions.
+    /// released so a slow disk never blocks other sessions. The entry
+    /// lands in its turn's node (created parentless when the writer never
+    /// opened the turn, e.g. sparse journals); the parent edge travels on
+    /// the journal line so reloads rebuild the tree without a head scan.
     pub fn append(&self, session_id: &str, turn: u64, entry: Entry) {
         self.ensure_loaded(session_id);
         let ts = now_secs();
-        let created_at = {
+        let (parent, created_at) = {
             let mut sessions = self.lock();
             let session = sessions.entry(session_id.to_owned()).or_default();
+            session.turn = session.turn.max(turn);
+            session.head = session.head.max(turn);
             session.updated_at = ts;
             if session.title.is_empty() && entry.role == Role::User {
                 session.title = title_of(&entry.content);
             }
-            session.entries.push(entry.clone());
+            let node = session
+                .turns
+                .entry(turn)
+                .or_insert_with(|| TurnNode::new(turn.saturating_sub(1)));
+            if node.title.is_empty() && entry.role == Role::User {
+                node.title = title_of(&entry.content);
+            }
+            node.entries.push(entry.clone());
+            session.entries_total += 1;
+            let parent = node.parent;
             let created_at = session.created_at;
             self.lock_index()
                 .insert(session_id.to_owned(), summary_of(session_id, session));
-            created_at
+            (parent, created_at)
         };
-        self.journal_append(session_id, turn, ts, created_at, &entry);
+        self.journal_append(session_id, turn, parent, ts, created_at, &entry);
         if let Err(e) = self.ctx.emit_key(
             CH_SESSION_ENTRY_APPENDED,
             SessionEntryAppended {
@@ -359,13 +476,84 @@ impl SessionLog {
         }
     }
 
-    /// Snapshot of a session's entries, hydrating from disk on first touch.
+    /// Snapshot of the entries on the head's ancestry (root to head),
+    /// hydrating from disk on first touch. Branch entries off the path
+    /// stay stored but invisible — `tree` reveals them, `revert` revives
+    /// them. Single pass over the path, cloning only what is returned.
     pub fn history(&self, session_id: &str) -> Vec<Entry> {
         self.ensure_loaded(session_id);
-        self.lock()
-            .get(session_id)
-            .map(|s| s.entries.clone())
-            .unwrap_or_default()
+        let sessions = self.lock();
+        let Some(session) = sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let path = session.path();
+        let total: usize = path
+            .iter()
+            .filter_map(|t| session.turns.get(t))
+            .map(|n| n.entries.len())
+            .sum();
+        let mut out = Vec::with_capacity(total);
+        for turn in path {
+            if let Some(node) = session.turns.get(&turn) {
+                out.extend(node.entries.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// Current head turn (`0` when the session has no turns yet).
+    pub fn head(&self, session_id: &str) -> u64 {
+        self.ensure_loaded(session_id);
+        self.lock().get(session_id).map(|s| s.head).unwrap_or(0)
+    }
+
+    /// All turns of a session, ascending, with head-ancestry flags.
+    pub fn tree(&self, session_id: &str) -> Vec<BranchNode> {
+        self.ensure_loaded(session_id);
+        let sessions = self.lock();
+        let Some(session) = sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let path: std::collections::HashSet<u64> = session.path().into_iter().collect();
+        session
+            .turns
+            .iter()
+            .map(|(turn, node)| BranchNode {
+                turn: *turn,
+                parent: node.parent,
+                title: node.title.clone(),
+                entries: node.entries.len(),
+                active: path.contains(turn),
+            })
+            .collect()
+    }
+
+    /// Moves the head to `turn`: revert without deleting. New turns parent
+    /// onto the moved head, so the abandoned tail becomes a visible-but-dim
+    /// branch in the tree. Journals the move, so reloads restore it.
+    /// Returns `false` (no-op) for unknown turns.
+    pub fn revert(&self, session_id: &str, turn: u64) -> bool {
+        self.ensure_loaded(session_id);
+        let parent = {
+            let mut sessions = self.lock();
+            let Some(session) = sessions.get_mut(session_id) else {
+                return false;
+            };
+            let Some(node) = session.turns.get(&turn) else {
+                return false;
+            };
+            let parent = node.parent;
+            if session.head == turn {
+                return true;
+            }
+            session.head = turn;
+            session.updated_at = now_secs();
+            self.lock_index()
+                .insert(session_id.to_owned(), summary_of(session_id, session));
+            parent
+        };
+        self.journal_head(session_id, turn, parent);
+        true
     }
 
     /// Number of entries recorded for a session.
@@ -430,14 +618,27 @@ impl SessionLog {
         }
     }
 
-    /// Appends one journal line (writing the header first when the file is
-    /// new or empty, which also self-heals headerless files). No-op without
-    /// persistence. Failures log and continue in-memory — a full disk must
-    /// never break the live turn.
-    fn journal_append(&self, session_id: &str, turn: u64, ts: u64, created_at: u64, entry: &Entry) {
-        let Some(path) = self.journal_path(session_id) else {
+    /// Journals a head move (on `begin_turn` and `revert`): the new head
+    /// plus the edge it hangs from. Goes through the shared opener so
+    /// fresh journals still get their header first.
+    fn journal_head(&self, session_id: &str, head: u64, parent: u64) {
+        let created_at = {
+            let mut sessions = self.lock();
+            let session = sessions.entry(session_id.to_owned()).or_default();
+            session.created_at
+        };
+        let Some(mut file) = self.journal_open(session_id, created_at) else {
             return;
         };
+        self.journal_write(&mut file, session_id, &JournalHead { head, parent });
+    }
+
+    /// Opens the journal for appending, writing the header first when the
+    /// file is new or empty (which also self-heals headerless files).
+    /// Returns `None` without persistence or on open failure — callers log
+    /// and continue in-memory, so a full disk never breaks the live turn.
+    fn journal_open(&self, session_id: &str, created_at: u64) -> Option<std::fs::File> {
+        let path = self.journal_path(session_id)?;
         let fresh = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0;
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
@@ -447,7 +648,7 @@ impl SessionLog {
             Ok(file) => file,
             Err(e) => {
                 eprintln!("session: journal {} failed: {e}", path.display());
-                return;
+                return None;
             }
         };
         if fresh {
@@ -460,24 +661,56 @@ impl SessionLog {
                 Ok(line) => {
                     if writeln!(file, "{line}").is_err() {
                         eprintln!("session: journal {} failed", path.display());
-                        return;
+                        return None;
                     }
                 }
                 Err(e) => {
                     eprintln!("session: journal header encode failed: {e}");
-                    return;
+                    return None;
                 }
             }
         }
-        let record = JournalRecord { turn, ts, entry };
-        match serde_json::to_string(&record) {
+        Some(file)
+    }
+
+    /// Writes one serialized line to an opened journal.
+    fn journal_write<T: Serialize>(&self, file: &mut std::fs::File, session_id: &str, value: &T) {
+        match serde_json::to_string(value) {
             Ok(line) => {
                 if writeln!(file, "{line}").is_err() {
-                    eprintln!("session: journal {} failed", path.display());
+                    if let Some(path) = self.journal_path(session_id) {
+                        eprintln!("session: journal {} failed", path.display());
+                    }
                 }
             }
             Err(e) => eprintln!("session: journal record encode failed: {e}"),
         }
+    }
+
+    /// Appends one entry line (header first when the file is new or empty).
+    /// No-op without persistence.
+    fn journal_append(
+        &self,
+        session_id: &str,
+        turn: u64,
+        parent: u64,
+        ts: u64,
+        created_at: u64,
+        entry: &Entry,
+    ) {
+        let Some(mut file) = self.journal_open(session_id, created_at) else {
+            return;
+        };
+        self.journal_write(
+            &mut file,
+            session_id,
+            &JournalRecord {
+                turn,
+                parent,
+                ts,
+                entry,
+            },
+        );
     }
 }
 
@@ -492,6 +725,20 @@ impl SessionStoreApi for SessionLog {
 
     fn history(&self, session_id: &str) -> Vec<Entry> {
         SessionLog::history(self, session_id)
+    }
+}
+
+impl SessionTreeApi for SessionLog {
+    fn tree(&self, session_id: &str) -> Vec<BranchNode> {
+        SessionLog::tree(self, session_id)
+    }
+
+    fn head(&self, session_id: &str) -> u64 {
+        SessionLog::head(self, session_id)
+    }
+
+    fn revert(&self, session_id: &str, turn: u64) -> bool {
+        SessionLog::revert(self, session_id, turn)
     }
 }
 
@@ -516,6 +763,7 @@ impl harness_core::Plugin for SessionPlugin {
         harness_core::PluginMeta::new("session")
             .provides(KEY_SESSIONS)
             .provides(KEY_SESSION_STORE)
+            .provides(KEY_SESSION_TREE)
             .provides(KEY_SESSION_CATALOG)
             .emits::<SessionTurnOpened>(CH_SESSION_TURN_OPENED)
             .emits::<SessionEntryAppended>(CH_SESSION_ENTRY_APPENDED)
@@ -548,6 +796,10 @@ impl harness_core::Plugin for SessionPlugin {
         ctx.provide_key(
             KEY_SESSION_STORE,
             Arc::new(SessionStoreHandle(log.clone() as Arc<dyn SessionStoreApi>)),
+        );
+        ctx.provide_key(
+            KEY_SESSION_TREE,
+            Arc::new(SessionTreeHandle(log.clone() as Arc<dyn SessionTreeApi>)),
         );
         ctx.provide_key(
             KEY_SESSION_CATALOG,
@@ -755,14 +1007,14 @@ mod tests {
         log.append("s1", turn, Entry::tool("t1", "file body"));
         log.end_turn("s1", turn);
 
-        // One journal file, header + three records.
+        // One journal file: header + head line + three records.
         let journal = dir.join("s1.jsonl");
         let lines: Vec<String> = std::fs::read_to_string(&journal)
             .unwrap()
             .lines()
             .map(str::to_owned)
             .collect();
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
 
         // A fresh log over the same dir recovers everything lazily.
         let ctx2 = Context::root();
@@ -782,6 +1034,104 @@ mod tests {
         assert_eq!(catalog[0].title, "hello world");
         assert_eq!(catalog[0].turns, 2);
         assert_eq!(catalog[0].entries, 3);
+        // The reloaded head points past the recorded turn (the `begin_turn`
+        // above moved it), and the tree resolves the single node as active.
+        assert_eq!(reloaded.head("s1"), 2);
+        let tree = reloaded.tree("s1");
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].turn, 1);
+        assert_eq!(tree[0].parent, 0);
+        assert!(tree[0].active);
+        assert!(tree[1].active, "childless head turn still resolves");
+    }
+
+    #[test]
+    fn revert_hides_tail_and_branch_regrows_from_head() {
+        use harness_contracts::Message;
+
+        let ctx = Context::root();
+        ctx.load(SessionPlugin).unwrap();
+        let log: Arc<SessionLog> = ctx.inject_key(KEY_SESSIONS).unwrap();
+
+        let t1 = log.begin_turn("s");
+        log.append("s", t1, Entry::from_message(&Message::user("first")));
+        let t2 = log.begin_turn("s");
+        log.append("s", t2, Entry::from_message(&Message::user("second")));
+        assert_eq!(log.history("s").len(), 2);
+
+        // Revert to t1: the tail stays stored but leaves the history.
+        assert!(log.revert("s", t1));
+        assert_eq!(log.head("s"), t1);
+        let history = log.history("s");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "first");
+
+        let tree = log.tree("s");
+        assert_eq!(tree.len(), 2);
+        assert!(tree[0].active);
+        assert!(!tree[1].active, "abandoned tail is inactive, kept, dimmed");
+
+        // A new turn parents onto the reverted head, not the tail.
+        let t3 = log.begin_turn("s");
+        log.append("s", t3, Entry::from_message(&Message::user("third")));
+        let tree = log.tree("s");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[2].parent, t1);
+        let history = log.history("s");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content, "third");
+
+        // Unknown turns are a no-op; the head does not move.
+        assert!(!log.revert("s", 99));
+        assert_eq!(log.head("s"), t3);
+        assert!(!log.revert("nope", 1));
+    }
+
+    #[test]
+    fn revert_round_trips_through_the_journal() {
+        use harness_contracts::Message;
+
+        let dir = unique_tmp_dir("revert-rt");
+        let log = SessionLog::with_persistence(Context::root(), dir.clone());
+        let t1 = log.begin_turn("s");
+        log.append("s", t1, Entry::from_message(&Message::user("one")));
+        let t2 = log.begin_turn("s");
+        log.append("s", t2, Entry::from_message(&Message::user("two")));
+        assert!(log.revert("s", t1));
+
+        let reloaded = SessionLog::with_persistence(Context::root(), dir);
+        assert_eq!(reloaded.head("s"), t1);
+        let history = reloaded.history("s");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "one");
+        // New turns keep parenting onto the restored head.
+        assert_eq!(reloaded.begin_turn("s"), 3);
+        let tree = reloaded.tree("s");
+        assert_eq!(tree[2].parent, t1);
+    }
+
+    #[test]
+    fn v1_journals_replay_as_a_linear_chain() {
+        let dir = unique_tmp_dir("v1-chain");
+        // No parents, no head lines: the pre-tree format.
+        std::fs::write(
+            dir.join("s.jsonl"),
+            concat!(
+                "{\"v\":1,\"id\":\"s\",\"created_at\":100}\n",
+                "{\"turn\":1,\"ts\":100,\"entry\":{\"role\":\"user\",\"content\":\"a\"}}\n",
+                "{\"turn\":2,\"ts\":200,\"entry\":{\"role\":\"user\",\"content\":\"b\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let log = SessionLog::with_persistence(Context::root(), dir);
+        assert_eq!(log.history("s").len(), 2);
+        let tree = log.tree("s");
+        assert_eq!(tree.len(), 2);
+        assert_eq!((tree[0].parent, tree[1].parent), (0, 1));
+        assert!(tree.iter().all(|n| n.active));
+        assert_eq!(log.head("s"), 2);
+        assert_eq!(log.begin_turn("s"), 3);
     }
 
     #[test]

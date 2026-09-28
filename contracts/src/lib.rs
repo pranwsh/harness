@@ -13,7 +13,8 @@
 //! Exceptions (both acyclic, downward-only, documented as intentional
 //! coupling):
 //! - TUI leaf shell (`tui`, `tui-model`, `tui-commands`, `tui-sessions`,
-//!   `tui-filter`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-state`):
+//!   `tui-branch`, `tui-filter`, `tui-input`, `tui-markdown`, `tui-popup`,
+//!   `tui-state`):
 //!   the shell composes concrete TUI/loop crates it owns; e.g. `tui` → `harness-agent-loop` + `harness-tui-state`.
 //! - Hash hashing infra (`hashline-read`/`hashline-edit` → `hash-base`):
 //!   shared file-hashing library (pure line hashing + in-memory `HashStore`),

@@ -111,6 +111,7 @@ async fn run() -> Result<ExitCode> {
         "tui-sessions",
         harness_tui_sessions::TuiSessionsPlugin
     );
+    load!(ctx, "tui-branch", harness_tui_branch::TuiBranchPlugin);
     // Fresh session every launch; past sessions resume via `/sessions`.
     // The id is minted at the composition root so the TUI and any future
     // headless front-ends share one generation point.

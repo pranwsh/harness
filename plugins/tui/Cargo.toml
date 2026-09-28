@@ -10,6 +10,7 @@ harness-agent-loop = { path = "../agent-loop" }
 harness-tui-model = { path = "../tui-model" }
 harness-tui-commands = { path = "../tui-commands" }
 harness-tui-sessions = { path = "../tui-sessions" }
+harness-tui-branch = { path = "../tui-branch" }
 harness-tui-state = { path = "../tui-state" }
 harness-tui-input = { path = "../tui-input" }
 harness-tui-popup = { path = "../tui-popup" }

@@ -189,7 +189,7 @@ impl ModelPopup {
         let popup = self.filter.popup();
         tokio::spawn(async move {
             if let Some(ids) = std::sync::Arc::clone(&selector.0).refresh().await {
-                popup.refresh_items(ids, Some(selector.current()));
+                popup.refresh_items(ids, Some(selector.current()), Vec::new());
             }
         });
     }

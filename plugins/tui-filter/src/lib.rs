@@ -37,6 +37,14 @@ pub trait FilterSource: Send + Sync {
     /// Lists matches for a query, in display order.
     fn items(&self, query: &str) -> Vec<String>;
 
+    /// Per-item dim flags, parallel to [`FilterSource::items`]. The driver
+    /// carries them through `open`/`refresh_items` untouched; the shell
+    /// renders flagged rows dimmed. Defaults to empty (nothing dimmed) so
+    /// providers without dimmed rows change nothing.
+    fn dim(&self, _query: &str) -> Vec<bool> {
+        Vec::new()
+    }
+
     /// Handles `Enter` on a highlighted row. The default completes the
     /// row into the input (via [`FilterSource::render_completion`]) unless
     /// the line already renders exactly that, in which case it delegates
@@ -155,12 +163,19 @@ impl<S: FilterSource> FilterPopup<S> {
             }
             return;
         }
+        let dim = self.source.dim(&query);
         if self.popup.is_open() {
-            self.popup.refresh_items(items, self.source.current());
+            self.popup
+                .refresh_items(items, self.source.current(), dim);
         } else {
             let selected = self.source.initial_selected(&items);
-            self.popup
-                .open(self.source.title(), items, selected, self.source.current());
+            self.popup.open(
+                self.source.title(),
+                items,
+                selected,
+                self.source.current(),
+                dim,
+            );
         }
     }
 

@@ -160,6 +160,26 @@ pub struct SessionSummary {
     pub entries: usize,
 }
 
+/// One turn in a session's turn tree, for the `/branch` navigator.
+///
+/// Turns are the tree nodes: each turn keeps the monotonic id assigned by
+/// `begin_turn` and the head it branched from as its parent (`0` for the
+/// first turn). `active` marks the nodes on the current head's ancestry —
+/// everything else is an inactive branch (kept, dimmed, never deleted).
+/// Derived by the session plugin from its journal — never hand-written by
+/// consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchNode {
+    pub turn: u64,
+    /// Parent turn (`0` when this turn starts the tree).
+    pub parent: u64,
+    /// First user message of the turn, truncated to one line, for display.
+    pub title: String,
+    pub entries: usize,
+    /// On the path from the root to the current head.
+    pub active: bool,
+}
+
 // ---- errors -----------------------------------------------------------------
 
 /// Failure of a tool execution, carried in-band on `ToolExecuted`.

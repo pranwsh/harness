@@ -7,8 +7,8 @@
 //! publish `Arc<Handle>` under the corresponding `KEY_*_API` key alongside
 //! any legacy concrete service.
 //!
-//! Exceptions: the TUI leaf shell (`tui`/`tui-model`/`tui-commands`/
-//! `tui-filter`/`tui-input`/`tui-markdown`/`tui-popup`/`tui-state`) and the shared hashing infra
+//! Exceptions: the TUI leaf shell (`tui`/`tui-model`/`tui-commands`/`tui-sessions`/
+//! `tui-branch`/`tui-filter`/`tui-input`/`tui-markdown`/`tui-popup`/`tui-state`) and the shared hashing infra
 //! (`hashline-read`/`hashline-edit` → `hash-base`) are the only allowed
 //! direct plugin→plugin edges. Both are downward into leaves/bases, never
 //! domain→domain, and keep the graph acyclic. See `contracts/src/lib.rs`
@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::{AgentState, Entry, Message, SessionSummary, ToolCall, ToolError, ToolSpec};
+use crate::{AgentState, BranchNode, Entry, Message, SessionSummary, ToolCall, ToolError, ToolSpec};
 
 /// Boxed future for object-safe async service methods.
 pub type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
@@ -126,6 +126,30 @@ pub struct SessionCatalogHandle(pub Arc<dyn SessionCatalogApi>);
 
 impl std::ops::Deref for SessionCatalogHandle {
     type Target = dyn SessionCatalogApi;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+/// Tree surface the `/branch` navigator needs: the current session's turn
+/// tree plus head moves (revert). Read-only except for `revert`, which only
+/// moves the head pointer — entries are never deleted or rewritten, and new
+/// turns parent onto the head implicitly via `begin_turn`. Session creation
+/// and all entry writes stay inside the session plugin.
+pub trait SessionTreeApi: Send + Sync + 'static {
+    /// All turns of a session, ascending by turn. Empty for unknown sessions.
+    fn tree(&self, session_id: &str) -> Vec<BranchNode>;
+    /// Current head turn (`0` when the session has no turns yet).
+    fn head(&self, session_id: &str) -> u64;
+    /// Moves the head to `turn`. Returns `false` (no-op) for unknown turns.
+    fn revert(&self, session_id: &str, turn: u64) -> bool;
+}
+
+#[derive(Clone)]
+pub struct SessionTreeHandle(pub Arc<dyn SessionTreeApi>);
+
+impl std::ops::Deref for SessionTreeHandle {
+    type Target = dyn SessionTreeApi;
     fn deref(&self) -> &Self::Target {
         &*self.0
     }

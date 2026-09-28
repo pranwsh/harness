@@ -688,6 +688,7 @@ dependencies = [
  "harness-system-prompt",
  "harness-tools",
  "harness-tui",
+ "harness-tui-branch",
  "harness-tui-commands",
  "harness-tui-input",
  "harness-tui-markdown",
@@ -907,6 +908,7 @@ dependencies = [
  "harness-contracts",
  "harness-core",
  "harness-session",
+ "harness-tui-branch",
  "harness-tui-commands",
  "harness-tui-input",
  "harness-tui-markdown",
@@ -916,6 +918,17 @@ dependencies = [
  "harness-tui-state",
  "ratatui",
  "tokio",
+]
+
+[[package]]
+name = "harness-tui-branch"
+version = "0.1.0"
+dependencies = [
+ "harness-contracts",
+ "harness-core",
+ "harness-tui-filter",
+ "harness-tui-popup",
+ "harness-tui-state",
 ]
 
 [[package]]

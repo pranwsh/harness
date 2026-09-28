@@ -13,10 +13,11 @@ use crossterm::{
 use tokio::sync::mpsc;
 
 use harness_agent_loop::{AgentLoop, TurnEvent};
-use harness_contracts::SessionStoreHandle;
+use harness_contracts::{SessionStoreHandle, SessionTreeHandle};
 use harness_tui_commands::CommandPopup;
 use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
+use harness_tui_branch::BranchPopup;
 use harness_tui_sessions::SessionPopup;
 use harness_tui_state::{
     app::{App, AppMsg, KeyEvent},
@@ -37,8 +38,9 @@ const RENDER_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 /// The slash-commands provider (`command_popup`) filters `/`-prefixes
 /// non-modally (cursor stays in the entry bar); the model provider
 /// (`model_popup`) owns the modal `/model` selector; the sessions provider
-/// (`session_popup`) owns the `/sessions` picker. The loop draws at most
-/// one snapshot (model first, then sessions, else commands) and itself
+/// (`session_popup`) owns the `/sessions` picker; the branch provider
+/// (`branch_popup`) owns the `/branch` tree navigator. The loop draws at
+/// most one snapshot (model, sessions, branch, then commands) and itself
 /// stays domain-free, never touching catalogs or config directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -46,11 +48,13 @@ pub async fn run(
     agent_id: String,
     session_id: String,
     sessions: Arc<SessionStoreHandle>,
+    tree: Arc<SessionTreeHandle>,
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
+    branch_popup: Arc<BranchPopup>,
 ) {
     let terminal = ratatui::init();
     enable_terminal_features();
@@ -59,11 +63,13 @@ pub async fn run(
         agent_id,
         session_id,
         sessions,
+        tree,
         renderer,
         input,
         model_popup,
         command_popup,
         session_popup,
+        branch_popup,
     )
     .run(terminal)
     .await;
@@ -103,11 +109,13 @@ struct EventLoop {
     agent_id: String,
     session_id: String,
     sessions: Arc<SessionStoreHandle>,
+    tree: Arc<SessionTreeHandle>,
     app: App,
     renderer: Arc<RendererHandle>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
+    branch_popup: Arc<BranchPopup>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
     layout_cache: LayoutCache,
@@ -120,27 +128,32 @@ impl EventLoop {
         agent_id: String,
         session_id: String,
         sessions: Arc<SessionStoreHandle>,
+        tree: Arc<SessionTreeHandle>,
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
         model_popup: Arc<ModelPopup>,
         command_popup: Arc<CommandPopup>,
         session_popup: Arc<SessionPopup>,
+        branch_popup: Arc<BranchPopup>,
     ) -> Self {
         // Bound generous enough to absorb bursts of stream events; the
         // input task bails out if the loop ever stops draining.
         let (tx, rx) = mpsc::channel(256);
         input.spawn(tx.clone());
         session_popup.set_current(&session_id);
+        branch_popup.set_session(&session_id);
         EventLoop {
             agent_loop,
             agent_id,
             session_id,
             sessions,
+            tree,
             app: App::new(),
             renderer,
             model_popup,
             command_popup,
             session_popup,
+            branch_popup,
             tx,
             rx,
             layout_cache: LayoutCache::new(),
@@ -153,12 +166,13 @@ impl EventLoop {
     ) -> std::result::Result<(), String> {
         loop {
             // Each provider owns its surface; draw at most one, model
-            // first, then sessions, so the modal selectors win over
-            // autocomplete.
+            // first, then sessions, then branch, so the modal selectors
+            // win over autocomplete.
             let snapshot = self
                 .model_popup
                 .snapshot()
                 .or_else(|| self.session_popup.snapshot())
+                .or_else(|| self.branch_popup.snapshot())
                 .or_else(|| self.command_popup.snapshot());
             terminal
                 .draw(|f| {
@@ -187,12 +201,14 @@ impl EventLoop {
             //   `sync` re-filters the catalog.
             // - Else sessions picker active: same contract, keys belong to
             //   it while live.
+            // - Else branch navigator active: same contract again.
             // - Else slash open + nav/completion key: Up/Down/Esc/Tab move,
             //   dismiss, or complete via `set_input`. Exact-`Enter` falls
             //   through to execute.
-            // - Else exact `/model` Enter: opens model search (and exact
-            //   `/sessions` Enter opens the picker), closing the slash list
-            //   (the staged `/model ` / `/sessions ` lines still match a
+            // - Else exact `/model` Enter: opens model search (exact
+            //   `/sessions` Enter opens the picker, exact `/branch` Enter
+            //   opens the navigator), closing the slash list (the staged
+            //   `/model ` / `/sessions ` / `/branch ` lines still match a
             //   slash candidate, so they cannot self-close).
             // - Else: normal edit; post-reduce syncs the eligible provider.
             if let AppMsg::Key(key) = &msg {
@@ -210,6 +226,14 @@ impl EventLoop {
                             break;
                         }
                         self.drain_switch_request();
+                        continue;
+                    }
+                } else if self.branch_popup.is_active() {
+                    if self.branch_popup.handle_key(*key, &mut self.app) {
+                        if self.app.should_quit() {
+                            break;
+                        }
+                        self.drain_revert_request();
                         continue;
                     }
                 } else {
@@ -241,6 +265,13 @@ impl EventLoop {
                         self.command_popup.close();
                         continue;
                     }
+                    if *key == KeyEvent::Enter
+                        && self.branch_popup.wants_input(self.app.input())
+                    {
+                        self.branch_popup.open(&mut self.app);
+                        self.command_popup.close();
+                        continue;
+                    }
                 }
             }
 
@@ -257,10 +288,17 @@ impl EventLoop {
                 if self.session_popup.is_active() {
                     self.session_popup.sync(&self.app);
                 }
-                if !self.model_popup.is_active() && !self.session_popup.is_active() {
+                if self.branch_popup.is_active() {
+                    self.branch_popup.sync(&self.app);
+                }
+                if !self.model_popup.is_active()
+                    && !self.session_popup.is_active()
+                    && !self.branch_popup.is_active()
+                {
                     self.command_popup.sync(&self.app);
                 }
                 self.drain_switch_request();
+                self.drain_revert_request();
             }
             if let Some(input) = effect.submitted {
                 self.spawn_turn(input);
@@ -289,6 +327,46 @@ impl EventLoop {
         self.switch_session(session_id);
     }
 
+    /// Drains a staged `/branch` rewind pick, if any. Reject-while-busy
+    /// (mirroring submit): a rewind mid-turn would detach the streaming
+    /// turn from its history, so the pick is dropped with an inline error
+    /// and the user re-picks after the turn finishes.
+    fn drain_revert_request(&mut self) {
+        let Some(turn) = self.branch_popup.take_revert_request() else {
+            return;
+        };
+        if self.app.is_busy() {
+            self.app.update(AppMsg::Notice(
+                "busy: wait for the current turn to finish before rewinding".into(),
+            ));
+            return;
+        }
+        self.rewind_head(turn);
+    }
+
+    /// Moves the head to `turn` and reloads the transcript from the head's
+    /// ancestry. The abandoned tail stays stored (visible-but-dim in the
+    /// tree); the next turn parents onto the moved head.
+    fn rewind_head(&mut self, turn: u64) {
+        if !self.tree.revert(&self.session_id, turn) {
+            self.app
+                .update(AppMsg::Notice(format!("branch: unknown turn t{turn}")));
+            return;
+        }
+        let session_id = self.session_id.clone();
+        self.reload_transcript(&session_id);
+        self.app.update(AppMsg::Notice(format!(
+            "rewound to t{turn} — reply to branch from here"
+        )));
+    }
+
+    /// Reloads the transcript from the head's ancestry, re-pinning the
+    /// view to the newest restored content.
+    fn reload_transcript(&mut self, session_id: &str) {
+        let history = self.sessions.history(session_id);
+        self.app.set_transcript(&history);
+    }
+
     /// Swaps the live session: reloads the transcript from the session
     /// store and retargets future turns. History comes through the
     /// decoupled store handle (lazily hydrated from disk by the session
@@ -299,6 +377,7 @@ impl EventLoop {
         self.app.set_transcript(&history);
         self.session_id = session_id.clone();
         self.session_popup.set_current(&session_id);
+        self.branch_popup.set_session(&session_id);
         let short: String = session_id.chars().take(8).collect();
         self.app.update(AppMsg::Notice(format!(
             "resumed session {short} ({entries} {})",
@@ -350,12 +429,14 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use harness_tui_branch::BranchPopup;
     use harness_contracts::{
         AgentRegistryApi, AgentRegistryHandle, AgentState, BoxFuture, Entry, Message,
         ModelCatalogApi, ModelCatalogHandle, ModelSelectorApi, ModelSelectorHandle,
         ModelStreamerApi, ModelStreamerHandle, PromptAssemblerApi, PromptAssemblerHandle,
-        SessionCatalogApi, SessionCatalogHandle, SessionStoreApi, SessionSummary, StreamEvent,
-        ToolExecutorApi, ToolExecutorHandle, ToolSpec,
+        SessionCatalogApi, SessionCatalogHandle, SessionStoreApi, SessionSummary,
+        SessionTreeApi, SessionTreeHandle, StreamEvent, ToolExecutorApi, ToolExecutorHandle,
+        ToolSpec,
     };
     use harness_core::Context;
     use harness_session::SessionLog;
@@ -488,10 +569,23 @@ mod tests {
     }
 
     /// Builds the loop with a real (in-memory) session store pre-seeded
-    /// with two entries on `"past-1"`, and a picker catalog listing it.
+    /// with two entries on `"past-1"` (picker catalog) and two turns on
+    /// `"live-1"` (branch navigator), wired with the tree handle.
     fn fixture() -> (Arc<SessionLog>, Fixture) {
         let ctx = Context::root();
         let log = Arc::new(SessionLog::new(ctx.clone()));
+        let live_t1 = log.begin_turn("live-1");
+        log.append(
+            "live-1",
+            live_t1,
+            Entry::from_message(&Message::user("live one")),
+        );
+        let live_t2 = log.begin_turn("live-1");
+        log.append(
+            "live-1",
+            live_t2,
+            Entry::from_message(&Message::user("live two")),
+        );
         let turn = log.begin_turn("past-1");
         log.append("past-1", turn, Entry::from_message(&Message::user("old question")));
         log.append(
@@ -500,6 +594,7 @@ mod tests {
             Entry::from_message(&Message::assistant("old answer")),
         );
         let store = Arc::new(SessionStoreHandle(log.clone() as Arc<dyn SessionStoreApi>));
+        let tree = Arc::new(SessionTreeHandle(log.clone() as Arc<dyn SessionTreeApi>));
 
         let agent_loop = Arc::new(AgentLoop::new(
             ctx,
@@ -519,6 +614,7 @@ mod tests {
             "agent-1".to_owned(),
             "live-1".to_owned(),
             store,
+            tree.clone(),
             Arc::new(RendererHandle(Arc::new(PlainRenderer::new(ASSISTANT_BASE)))),
             Arc::new(Input),
             Arc::new(ModelPopup::new(
@@ -529,6 +625,7 @@ mod tests {
             Arc::new(SessionPopup::new(Arc::new(SessionCatalogHandle(
                 catalog as Arc<dyn SessionCatalogApi>,
             )))),
+            Arc::new(BranchPopup::new(tree)),
         );
         (log, Fixture { events })
     }
@@ -595,6 +692,67 @@ mod tests {
         fx.events.drain_switch_request();
         assert_eq!(fx.events.session_id, "live-1");
         assert_eq!(fx.events.app.items().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rewind_reloads_transcript_from_head_ancestry() {
+        let (_log, mut fx) = fixture();
+
+        // live-1 has two turns with the cursor on the head (t2);
+        // move up to t1, complete it, then exact-Enter to stage it.
+        let mut scratch = App::new();
+        fx.events.branch_popup.open(&mut scratch);
+        assert!(fx.events.branch_popup.handle_key(KeyEvent::Up, &mut scratch));
+        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        fx.events.drain_revert_request();
+
+        let items = fx.events.app.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ItemKind::User);
+        assert_eq!(items[0].text, "live one");
+        assert_eq!(items[1].kind, ItemKind::Notice);
+        assert!(items[1].text.contains("rewound to t1"), "got: {}", items[1].text);
+        // Head moved: a new turn parents onto t1.
+        assert_eq!(fx.events.tree.head("live-1"), 1);
+    }
+
+    #[tokio::test]
+    async fn rewind_while_busy_is_dropped_with_notice() {
+        let (_log, mut fx) = fixture();
+
+        let mut scratch = App::new();
+        fx.events.branch_popup.open(&mut scratch);
+        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+
+        fx.events.app.turn_started();
+        fx.events.drain_revert_request();
+
+        // Dropped, head unmoved, staged pick consumed.
+        assert_eq!(fx.events.tree.head("live-1"), 2);
+        let items = fx.events.app.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Notice);
+        assert!(items[0].text.contains("busy"), "got: {}", items[0].text);
+        assert!(fx.events.branch_popup.take_revert_request().is_none());
+
+        fx.events.app.turn_finished();
+        fx.events.drain_revert_request();
+        assert_eq!(fx.events.tree.head("live-1"), 2);
+    }
+
+    #[tokio::test]
+    async fn switch_session_retargets_branch_navigator() {
+        let (_log, mut fx) = fixture();
+        fx.events.switch_session("past-1".to_owned());
+
+        // The navigator now serves past-1's single turn.
+        let mut scratch = App::new();
+        fx.events.branch_popup.open(&mut scratch);
+        let snap = fx.events.branch_popup.snapshot().expect("open");
+        assert_eq!(snap.items.len(), 1);
+        assert!(snap.items[0].contains("old question"), "got: {:?}", snap.items);
     }
 
     #[tokio::test]
