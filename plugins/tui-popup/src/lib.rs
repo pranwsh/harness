@@ -25,6 +25,10 @@ pub struct ActivePopup {
     pub selected: usize,
     /// Active value (e.g. current model), marked distinctly from the cursor.
     pub current: Option<String>,
+    /// Per-row dim flags, parallel to `items` (shorter reads as all-false).
+    /// Providers mark inactive rows (e.g. off-head tree branches); the
+    /// shell renders them dimmed. Empty means nothing is dimmed.
+    pub dim: Vec<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +38,7 @@ struct Inner {
     items: Vec<String>,
     selected: usize,
     current: Option<String>,
+    dim: Vec<bool>,
 }
 
 /// Single floating list. At most one is visible at a time; opening replaces
@@ -58,6 +63,7 @@ impl Popup {
         items: Vec<String>,
         selected: usize,
         current: Option<String>,
+        dim: Vec<bool>,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.open = true;
@@ -65,6 +71,7 @@ impl Popup {
         state.items = items;
         state.selected = selected.min(state.items.len().saturating_sub(1));
         state.current = current;
+        state.dim = dim;
     }
 
     /// Closes the popup and clears its contents.
@@ -88,6 +95,7 @@ impl Popup {
             items: state.items.clone(),
             selected: state.selected.min(state.items.len().saturating_sub(1)),
             current: state.current.clone(),
+            dim: state.dim.clone(),
         })
     }
 
@@ -122,7 +130,7 @@ impl Popup {
     /// Replaces items while open (e.g. a background `/models` refresh
     /// landing after the popup opened). Keeps the cursor on the same value
     /// when it still exists, otherwise clamps. No-op when closed.
-    pub fn refresh_items(&self, items: Vec<String>, current: Option<String>) {
+    pub fn refresh_items(&self, items: Vec<String>, current: Option<String>, dim: Vec<bool>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.open {
             return;
@@ -130,6 +138,7 @@ impl Popup {
         let keep = state.items.get(state.selected).cloned();
         state.items = items;
         state.current = current;
+        state.dim = dim;
         state.selected = keep
             .and_then(|prev| state.items.iter().position(|item| *item == prev))
             .unwrap_or(0)
@@ -171,7 +180,7 @@ mod tests {
     #[test]
     fn open_clamps_selection() {
         let p = popup();
-        p.open("t", vec!["a".into(), "b".into()], 99, None);
+        p.open("t", vec!["a".into(), "b".into()], 99, None, vec![]);
         assert!(p.is_open());
         let snap = p.snapshot().expect("open");
         assert_eq!(snap.selected, 1);
@@ -181,7 +190,7 @@ mod tests {
     #[test]
     fn arrows_wrap_around() {
         let p = popup();
-        p.open("t", vec!["a".into(), "b".into()], 0, None);
+        p.open("t", vec!["a".into(), "b".into()], 0, None, vec![]);
         p.move_up();
         assert_eq!(p.snapshot().expect("open").selected, 1);
         p.move_down();
@@ -191,25 +200,39 @@ mod tests {
     #[test]
     fn refresh_keeps_cursor_on_same_value() {
         let p = popup();
-        p.open("t", vec!["a".into(), "b".into()], 1, Some("a".into()));
-        p.refresh_items(vec!["a".into(), "b".into(), "c".into()], Some("a".into()));
+        p.open(
+            "t",
+            vec!["a".into(), "b".into()],
+            1,
+            Some("a".into()),
+            vec![false, true],
+        );
+        assert_eq!(
+            p.snapshot().expect("open").dim,
+            vec![false, true]
+        );
+        p.refresh_items(
+            vec!["a".into(), "b".into(), "c".into()],
+            Some("a".into()),
+            vec![false, true, false],
+        );
         assert_eq!(p.snapshot().expect("open").selected, 1);
         // Removed value falls back to the head.
-        p.refresh_items(vec!["c".into()], Some("c".into()));
+        p.refresh_items(vec!["c".into()], Some("c".into()), vec![true]);
         assert_eq!(p.snapshot().expect("open").selected, 0);
     }
 
     #[test]
     fn refresh_when_closed_is_noop() {
         let p = popup();
-        p.refresh_items(vec!["a".into()], None);
+        p.refresh_items(vec!["a".into()], None, vec![]);
         assert!(!p.is_open());
     }
 
     #[test]
     fn close_clears() {
         let p = popup();
-        p.open("t", vec!["a".into()], 0, None);
+        p.open("t", vec!["a".into()], 0, None, vec![]);
         p.close();
         assert!(!p.is_open());
         assert_eq!(p.snapshot(), None);

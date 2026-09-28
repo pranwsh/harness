@@ -55,6 +55,11 @@ pub const KEY_COMMAND_POPUP: &str = "ui.command_popup";
 /// Owns its own popup surface (injects only the session catalog), so it
 /// can never observe or clobber another provider's list.
 pub const KEY_SESSION_POPUP: &str = "ui.session_popup";
+/// `Arc<BranchPopup>` — provided by the tui-branch plugin, injected by the
+/// tui shell to route `/branch` navigator keys and head moves. Owns its
+/// own popup surface (injects only the session tree), so it can never
+/// observe or clobber another provider's list.
+pub const KEY_BRANCH_POPUP: &str = "ui.branch_popup";
 /// `Arc<HashStore>` — provided by the hash-base plugin, injected by the
 /// hashline-read and hashline-edit plugins for line hashing and revisions.
 pub const KEY_HASH_STORE: &str = "hash.store";
@@ -76,6 +81,10 @@ pub const KEY_AGENTS_API: &str = "agents.api";
 pub const KEY_SESSION_STORE: &str = "sessions.store";
 /// `Arc<SessionCatalogHandle>` — catalog view over past sessions for the
 /// `/sessions` picker. Provided alongside the store by the session plugin.
+/// `Arc<SessionTreeHandle>` — tree view over the current session's turns
+/// for the `/branch` navigator. Provided alongside the store by the session
+/// plugin.
+pub const KEY_SESSION_TREE: &str = "sessions.tree";
 pub const KEY_SESSION_CATALOG: &str = "sessions.catalog";
 /// `Arc<ToolExecutorHandle>` — specs + execute view over tools.
 pub const KEY_TOOL_EXECUTOR: &str = "tools.executor_api";

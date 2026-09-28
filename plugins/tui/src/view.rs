@@ -312,13 +312,21 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
     let items: Vec<ListItem<'static>> = popup
         .items
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(idx, item)| {
             let marker = if popup.current.as_deref() == Some(item.as_str()) {
                 "● "
             } else {
                 "  "
             };
-            ListItem::new(Line::from(format!("{marker}{item}")))
+            // Inactive tree branches render dimmed; the highlight cursor
+            // still inverts the row, so dimness never hides selection.
+            let style = if popup.dim.get(idx).copied().unwrap_or(false) {
+                Style::new().fg(Color::DarkGray)
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::styled(format!("{marker}{item}"), style))
         })
         .collect();
     let list = List::new(items)
@@ -846,6 +854,7 @@ mod tests {
             items: vec!["aaa".into(), "bbb".into()],
             selected: 1,
             current: Some("aaa".into()),
+            dim: vec![false, true],
         };
         let rows = render_popup(&mut app, &plain(), Some(&popup), 30, 12);
         // Input box is 3 rows at the bottom (rows 9..=11); the 4-row popup

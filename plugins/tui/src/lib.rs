@@ -17,8 +17,9 @@
 use std::sync::Arc;
 
 use harness_contracts::{
-    KEY_AGENT_LOOP, KEY_COMMAND_POPUP, KEY_INPUT, KEY_MARKDOWN_RENDERER, KEY_MODEL_POPUP,
-    KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_TUI, SessionStoreHandle,
+    KEY_AGENT_LOOP, KEY_BRANCH_POPUP, KEY_COMMAND_POPUP, KEY_INPUT, KEY_MARKDOWN_RENDERER,
+    KEY_MODEL_POPUP, KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_TUI,
+    SessionStoreHandle, SessionTreeHandle,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
@@ -27,6 +28,7 @@ use harness_agent_loop::AgentLoop;
 use harness_tui_commands::CommandPopup;
 use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
+use harness_tui_branch::BranchPopup;
 use harness_tui_sessions::SessionPopup;
 use harness_tui_state::render::RendererHandle;
 
@@ -41,11 +43,13 @@ pub struct Tui {
     agent_id: String,
     session_id: String,
     sessions: Arc<SessionStoreHandle>,
+    tree: Arc<SessionTreeHandle>,
     renderer: Arc<RendererHandle>,
     input: Arc<Input>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
+    branch_popup: Arc<BranchPopup>,
     done: mpsc::Sender<()>,
 }
 
@@ -56,11 +60,13 @@ impl Tui {
         agent_id: impl Into<String>,
         session_id: impl Into<String>,
         sessions: Arc<SessionStoreHandle>,
+        tree: Arc<SessionTreeHandle>,
         renderer: Arc<RendererHandle>,
         input: Arc<Input>,
         model_popup: Arc<ModelPopup>,
         command_popup: Arc<CommandPopup>,
         session_popup: Arc<SessionPopup>,
+        branch_popup: Arc<BranchPopup>,
         done: mpsc::Sender<()>,
     ) -> Self {
         Tui {
@@ -68,11 +74,13 @@ impl Tui {
             agent_id: agent_id.into(),
             session_id: session_id.into(),
             sessions,
+            tree,
             renderer,
             input,
             model_popup,
             command_popup,
             session_popup,
+            branch_popup,
             done,
         }
     }
@@ -85,11 +93,13 @@ impl Tui {
             self.agent_id.clone(),
             self.session_id.clone(),
             self.sessions.clone(),
+            self.tree.clone(),
             self.renderer.clone(),
             self.input.clone(),
             self.model_popup.clone(),
             self.command_popup.clone(),
             self.session_popup.clone(),
+            self.branch_popup.clone(),
         )
         .await;
         let _ = self.done.send(()).await;
@@ -121,6 +131,8 @@ impl harness_core::Plugin for TuiPlugin {
             .injects(KEY_MODEL_POPUP)
             .injects(KEY_COMMAND_POPUP)
             .injects(KEY_SESSION_POPUP)
+            .injects(KEY_SESSION_TREE)
+            .injects(KEY_BRANCH_POPUP)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
@@ -131,6 +143,8 @@ impl harness_core::Plugin for TuiPlugin {
         let model_popup: Arc<ModelPopup> = ctx.inject_key(KEY_MODEL_POPUP)?;
         let command_popup: Arc<CommandPopup> = ctx.inject_key(KEY_COMMAND_POPUP)?;
         let session_popup: Arc<SessionPopup> = ctx.inject_key(KEY_SESSION_POPUP)?;
+        let branch_popup: Arc<BranchPopup> = ctx.inject_key(KEY_BRANCH_POPUP)?;
+        let tree: Arc<SessionTreeHandle> = ctx.inject_key(KEY_SESSION_TREE)?;
         ctx.provide_key(
             KEY_TUI,
             Arc::new(Tui::new(
@@ -138,11 +152,13 @@ impl harness_core::Plugin for TuiPlugin {
                 "agent-1",
                 self.session_id.clone(),
                 sessions,
+                tree,
                 renderer,
                 input,
                 model_popup,
                 command_popup,
                 session_popup,
+                branch_popup,
                 self.done.clone(),
             )),
         );
