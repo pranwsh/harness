@@ -2,23 +2,45 @@
 
 Single-binary agent harness TUI (Rust workspace, statically linked). All plugins are rlibs compiled into one `harness` binary.
 
-## Install (Nix)
+## Install (Nix, declarative)
 
 Requires Nix with flakes. Supports `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`.
 
-```sh
-# run directly
-nix run
+Add as a flake input:
 
-# build binary -> ./result/bin/harness
-nix build
-
-# dev shell (rustc, cargo, clippy, rustfmt)
-nix develop
-
-# checks: build + clippy (`--deny warnings`) + tests
-nix flake check
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    harness.url = "github:<owner>/harness";
+  };
+}
 ```
+
+NixOS (`configuration.nix` / flake module):
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    inputs.harness.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+}
+```
+
+Home Manager (standalone `home.nix` or NixOS `home-manager` module):
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  home.packages = [
+    inputs.harness.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+}
+```
+
+Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --flake .`). No `nix run` / `nix build` / `nix develop` needed; `nix flake check` (build + clippy `--deny warnings` + tests) is for hacking on `harness` itself.
 
 Configure:
 
