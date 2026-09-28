@@ -102,8 +102,9 @@ fn render_label(depth: usize, fork: bool, node: &BranchNode) -> String {
 /// Lays out turn nodes as indented rows: the first child continues its
 /// parent's depth, later children (and their subtrees) indent one level
 /// and carry the fork marker. Nodes whose parent is missing hang off the
-/// root. Input order is irrelevant; output is ascending by turn within
-/// each sibling group.
+/// root. Input order is irrelevant. Siblings render fork-first: later
+/// children (ascending by turn) directly under the parent, then the
+/// earliest child (the flat mainline) last; roots stay ascending by turn.
 fn build_rows(nodes: &[BranchNode]) -> Vec<BranchRow> {
     let mut children: HashMap<u64, Vec<&BranchNode>> = HashMap::new();
     let mut roots: Vec<&BranchNode> = Vec::new();
@@ -131,12 +132,12 @@ fn build_rows(nodes: &[BranchNode]) -> Vec<BranchRow> {
             dim: !node.active,
         });
         if let Some(group) = children.remove(&node.turn) {
-            for (i, child) in group.into_iter().enumerate().rev() {
-                if i == 0 {
-                    stack.push((child, depth, false));
-                } else {
-                    stack.push((child, depth + 1, true));
-                }
+            // Fork-first: mainline (group[0]) pushed first so it pops last;
+            // forks pushed after (in reverse) so they pop ascending directly
+            // under the parent. Identity is stable: earliest turn stays flat.
+            stack.push((group[0], depth, false));
+            for child in group.into_iter().skip(1).rev() {
+                stack.push((child, depth + 1, true));
             }
         }
     }
@@ -458,17 +459,68 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].label, "root t1 · 2 entries");
         assert!(!rows[0].dim);
-        assert_eq!(rows[1].label, "kept t2 · 2 entries");
-        assert!(!rows[1].dim);
-        // Non-first child indents one level with the fork marker, dimmed.
+        // Fork-first: the later child sits directly under the parent even
+        // though the mainline turn is earlier; mainline renders last.
         assert_eq!(
-            rows[2].label,
+            rows[1].label,
             format!("{INDENT}{FORK_MARK}abandoned t3 · 2 entries")
         );
-        assert!(rows[2].dim);
+        assert!(rows[1].dim);
         // Its subtree keeps the fork depth.
-        assert_eq!(rows[3].label, format!("{INDENT}revived t4 · 2 entries"));
+        assert_eq!(rows[2].label, format!("{INDENT}revived t4 · 2 entries"));
+        assert!(!rows[2].dim);
+        assert_eq!(rows[3].label, "kept t2 · 2 entries");
         assert!(!rows[3].dim);
+    }
+
+    #[test]
+    fn late_fork_sits_directly_under_parent() {
+        // t4 branches from t1 after the t2->t3 mainline already exists.
+        let rows = build_rows(&[
+            node(1, 0, "root", true),
+            node(2, 1, "second", true),
+            node(3, 2, "third", true),
+            node(4, 1, "late-fork", false),
+        ]);
+        let turns: Vec<u64> = rows.iter().map(|r| r.turn).collect();
+        assert_eq!(turns, vec![1, 4, 2, 3]);
+        assert_eq!(
+            rows[1].label,
+            format!("{INDENT}{FORK_MARK}late-fork t4 · 2 entries")
+        );
+        assert_eq!(rows[2].label, "second t2 · 2 entries");
+        assert_eq!(rows[3].label, "third t3 · 2 entries");
+    }
+
+    #[test]
+    fn multiple_forks_stay_turn_ordered_before_mainline() {
+        let rows = build_rows(&[
+            node(1, 0, "root", true),
+            node(2, 1, "main", true),
+            node(3, 1, "fork-a", false),
+            node(4, 1, "fork-b", false),
+        ]);
+        let turns: Vec<u64> = rows.iter().map(|r| r.turn).collect();
+        assert_eq!(turns, vec![1, 3, 4, 2]);
+    }
+
+    #[test]
+    fn nested_forks_render_before_nested_mainline() {
+        // Fork-first applies recursively: under t2 the late fork t5 sits
+        // directly under t2 ahead of the earlier child t3 (and its child t4).
+        let rows = build_rows(&[
+            node(1, 0, "root", true),
+            node(2, 1, "second", true),
+            node(3, 2, "third", true),
+            node(4, 3, "fourth", true),
+            node(5, 2, "nested-fork", false),
+        ]);
+        let turns: Vec<u64> = rows.iter().map(|r| r.turn).collect();
+        assert_eq!(turns, vec![1, 2, 5, 3, 4]);
+        assert_eq!(
+            rows[2].label,
+            format!("{INDENT}{FORK_MARK}nested-fork t5 · 2 entries")
+        );
     }
 
     #[test]
