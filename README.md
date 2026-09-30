@@ -13,7 +13,7 @@ Add as a flake input:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    harness.url = "github:<owner>/harness";
+    harness.url = "github:pranwsh/harness";
   };
 }
 ```
