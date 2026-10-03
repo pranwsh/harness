@@ -19,6 +19,10 @@ use harness_tui_state::{
 /// Margin, in columns, on each side of assistant/tool/notice output.
 const SIDE_MARGIN: u16 = 2;
 
+/// Margin, in columns, on each side of the input box. The box is inset
+/// from the terminal edge so its border has one column of breathing room.
+const INPUT_SIDE_MARGIN: u16 = 1;
+
 /// Max popup rows including its border, so a huge `/models` catalog never
 /// eats the whole chat pane (the list itself is not scrollable in v1; the
 /// catalog is small and the cap only guards tiny terminals).
@@ -140,10 +144,26 @@ pub(crate) fn draw_with_popup_cached(
     cache: &mut LayoutCache,
 ) {
     let area = f.area();
-    app.set_input_width(area.width.saturating_sub(2).max(1) as usize);
+    // One-column breathing room on each side of the input box; fall back
+    // to full width on tiny terminals where the margins would collapse it.
+    let box_width = if area.width > 2 * INPUT_SIDE_MARGIN {
+        area.width - 2 * INPUT_SIDE_MARGIN
+    } else {
+        area.width
+    };
+    app.set_input_width(box_width.saturating_sub(2).max(1) as usize);
     let input_height = app.input_rows().min(INPUT_VISIBLE_ROWS) as u16 + 2;
-    let [chat_area, input_area] =
+    let [chat_area, input_row] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_height)]).areas(area);
+    let input_area = if input_row.width > 2 * INPUT_SIDE_MARGIN {
+        Rect {
+            x: input_row.x + INPUT_SIDE_MARGIN,
+            width: input_row.width - 2 * INPUT_SIDE_MARGIN,
+            ..input_row
+        }
+    } else {
+        input_row
+    };
 
     draw_chat_cached(f, app, chat_area, renderer, cache);
     draw_input(f, app, input_area);
@@ -817,6 +837,19 @@ mod tests {
         assert_eq!(input.len(), 4, "input box: {input:?}");
         assert!(input[1].contains("ab"), "first line: {input:?}");
         assert!(input[2].contains("cd"), "second line: {input:?}");
+    }
+
+
+    #[test]
+    fn input_box_has_one_column_side_margins() {
+        let mut app = App::new();
+        let rows = render(&mut app, &plain(), 30, 12);
+        let input = input_box(&rows, &app);
+        assert_eq!(input.len(), 3, "input box: {input:?}");
+        for row in input {
+            assert!(row.starts_with(' '), "left margin: {row:?}");
+            assert_eq!(row.chars().count(), 29, "right margin: {row:?}");
+        }
     }
 
     /// Renders `draw_with_popup` on a fixed-size test backend.
