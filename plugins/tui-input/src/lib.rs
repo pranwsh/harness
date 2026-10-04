@@ -67,6 +67,9 @@ fn translate(event: TermEvent) -> Option<AppMsg> {
             }
             map_key(key).map(AppMsg::Key)
         }
+        // Bracketed paste: one message for the whole paste (fast path).
+        // Sanitizing happens in `App::on_paste`; never prompt here.
+        TermEvent::Paste(text) => Some(AppMsg::Paste(text)),
         TermEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(AppMsg::ScrollUp),
             MouseEventKind::ScrollDown => Some(AppMsg::ScrollDown),
@@ -153,6 +156,14 @@ mod tests {
         assert_eq!(
             map_key(TermKeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(KeyEvent::Interrupt)
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_maps_to_one_message() {
+        assert_eq!(
+            translate(TermEvent::Paste("hello\nworld".into())),
+            Some(AppMsg::Paste("hello\nworld".into()))
         );
     }
 

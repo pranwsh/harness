@@ -63,6 +63,18 @@ impl Editor {
         Edit::Changed
     }
 
+    /// Inserts a whole string at the cursor in one splice and advances
+    /// past it. The bulk path for bracketed paste: a single O(n) edit
+    /// instead of one `insert` per char. Empty input is a no-op.
+    pub fn insert_str(&mut self, s: &str) -> Edit {
+        if s.is_empty() {
+            return Edit::Unchanged;
+        }
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+        Edit::Changed
+    }
+
     /// Deletes the character before the cursor, if any.
     pub fn backspace(&mut self) -> Edit {
         if self.cursor == 0 {
@@ -320,6 +332,20 @@ mod tests {
         assert_eq!(ed.cursor(), 1);
         ed.backspace();
         assert_eq!(ed.text(), "ü");
+    }
+
+    #[test]
+    fn insert_str_splices_in_one_edit() {
+        let mut ed = Editor::new();
+        ed.insert('a');
+        ed.insert('b');
+        ed.home(20);
+        ed.right(); // cursor between a|b
+        assert_eq!(ed.insert_str("X\nY"), Edit::Changed);
+        assert_eq!(ed.text(), "aX\nYb");
+        assert_eq!(ed.cursor(), 1 + 3);
+        assert_eq!(ed.insert_str(""), Edit::Unchanged);
+        assert_eq!(ed.text(), "aX\nYb");
     }
 
     #[test]

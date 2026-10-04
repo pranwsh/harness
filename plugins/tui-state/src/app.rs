@@ -65,6 +65,10 @@ impl ChatItem {
 pub enum AppMsg {
     /// A keypress from the terminal input task.
     Key(KeyEvent),
+    /// A bracketed paste from the terminal input task. Already one
+    /// message for the whole paste (fast path); sanitized silently in
+    /// `on_paste`, never prompting.
+    Paste(String),
     /// An assistant text chunk arrived on a turn stream.
     Assistant(String),
     /// A streamed assistant text slice: appended to the trailing assistant
@@ -326,6 +330,7 @@ impl App {
     pub fn reduce(&mut self, msg: AppMsg) -> Effect {
         match msg {
             AppMsg::Key(key) => self.on_key(key),
+            AppMsg::Paste(text) => self.on_paste(&text),
             AppMsg::Assistant(text) => {
                 self.push(ChatItem::new(text, ItemKind::Assistant));
                 Effect::redraw()
@@ -408,6 +413,19 @@ impl App {
     /// clears the busy state.
     pub fn turn_finished(&mut self) {
         self.live_turns = self.live_turns.saturating_sub(1);
+    }
+
+    /// Handles a bracketed paste: sanitizes control sequences silently
+    /// (no prompt, no popup) and inserts the result in one bulk edit, so
+    /// a large paste costs one `reduce`/redraw instead of one per char.
+    fn on_paste(&mut self, text: &str) -> Effect {
+        let clean = sanitize_paste(text);
+        if clean.is_empty() {
+            return Effect::default();
+        }
+        self.editor.insert_str(&clean);
+        self.follow_input_cursor();
+        Effect::redraw()
     }
 
     /// Handles a keypress, returning the effect for the runtime. Every
@@ -566,6 +584,67 @@ impl App {
     }
 }
 
+/// Translates pasted control sequences into plain text, silently.
+///
+/// - `\r\n` -> `\n`, lone `\r` -> `\n`
+/// - ANSI CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL` or `ESC \\`),
+///   and any other `ESC` + single char are stripped
+/// - Remaining C0 controls (except `\n`, `\t`) and DEL are stripped
+/// - Everything else (including unicode) passes through
+fn sanitize_paste(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                // `\r\n` is one newline; a lone `\r` is also a newline.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(ch),
+            '\x1b' => match chars.peek() {
+                // CSI: ESC [ params... intermediates... final (@..~).
+                Some(&'[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ESC \.
+                Some(&']') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            None => break,
+                            Some('\x07') => break,
+                            Some('\x1b') => {
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                // Any other escape: drop ESC plus one char.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // Strip other C0 controls and DEL.
+            c if c.is_control() || c == '\x7f' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((i, _)) => &s[..i],
@@ -593,6 +672,55 @@ mod tests {
         }
         assert_eq!(app.input(), "hello");
         assert_eq!(app.input_cursor(), 5);
+    }
+
+    #[test]
+    fn paste_inserts_bulk_in_one_reduce() {
+        let mut app = App::new();
+        let big = "lorem ipsum ".repeat(500);
+        let eff = app.reduce(AppMsg::Paste(big.clone()));
+        assert!(eff.redraw);
+        assert!(eff.submitted.is_none());
+        assert_eq!(app.input(), big);
+        assert_eq!(app.input_cursor(), big.len());
+    }
+
+    #[test]
+    fn paste_at_mid_cursor_splices() {
+        let mut app = App::new();
+        type_text(&mut app, "ac");
+        app.update(key(KeyEvent::Left));
+        app.update(AppMsg::Paste("B\nD".into()));
+        assert_eq!(app.input(), "aB\nDc");
+    }
+
+    #[test]
+    fn paste_translates_control_sequences_silently() {
+        let mut app = App::new();
+        // CRLF -> LF, lone CR -> LF, ANSI stripped, C0/DEL stripped,
+        // tab + unicode kept. No prompt, no notice item — just text.
+        app.update(AppMsg::Paste(
+            "a\r\nb\rc\x1b[31mRED\x1b[0m\u{7}d\u{0}e\u{7f}f\tg\u{e9}".into(),
+        ));
+        // BEL/NUL/DEL stripped, tab + unicode kept.
+        assert_eq!(app.input(), "a\nb\ncREDdef\tg\u{e9}");
+        assert!(app.items().is_empty(), "paste must not push notices");
+    }
+
+    #[test]
+    fn paste_osc_sequence_stripped() {
+        let mut app = App::new();
+        app.update(AppMsg::Paste("a\x1b]0;title\x07b".into()));
+        assert_eq!(app.input(), "ab");
+        app.update(AppMsg::Paste("c\x1b]0;title\x1b\\d".into()));
+        assert_eq!(app.input(), "abcd");
+    }
+
+    #[test]
+    fn paste_only_controls_is_noop() {
+        let mut app = App::new();
+        assert!(!app.update(AppMsg::Paste("\x1b[31m\x00\x7f".into())));
+        assert_eq!(app.input(), "");
     }
 
     #[test]

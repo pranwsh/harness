@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -80,14 +80,16 @@ pub async fn run(
     }
 }
 
-/// Mouse reporting (wheel scrolling) and Kitty keyboard enhancements
-/// (disambiguated Shift+Enter). Best-effort: terminals that lack
-/// either feature ignore the sequences.
+/// Mouse reporting (wheel scrolling), bracketed paste (single-message
+/// bulk paste instead of one key event per char), and Kitty keyboard
+/// enhancements (disambiguated Shift+Enter). Best-effort: terminals that
+/// lack any feature ignore the sequences.
 fn enable_terminal_features() {
     let mut stdout = std::io::stdout();
     let _ = execute!(
         stdout,
         EnableMouseCapture,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     // ratatui::init installs a panic hook that restores the terminal;
@@ -101,7 +103,12 @@ fn enable_terminal_features() {
 
 fn disable_terminal_features() {
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, PopKeyboardEnhancementFlags, DisableMouseCapture);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture
+    );
 }
 
 struct EventLoop {
@@ -275,9 +282,9 @@ impl EventLoop {
                 }
             }
 
-            let is_key = matches!(msg, AppMsg::Key(_));
+            let is_edit = matches!(msg, AppMsg::Key(_) | AppMsg::Paste(_));
             let effect = self.app.reduce(msg);
-            if is_key {
+            if is_edit {
                 // Only the eligible provider re-filters: an active search
                 // suppresses slash completion, and a session ended by
                 // editing (e.g. backspaced to `/mode`) falls straight
