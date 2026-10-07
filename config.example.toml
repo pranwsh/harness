@@ -46,6 +46,15 @@ max_iterations = 128
 # enabled = true
 # dir = "/home/you/.local/share/harness/sessions"
 
+# Agent Skills registry. On by default: each immediate child directory of
+# the skills dir holding a SKILL.md becomes one skill (progressive
+# disclosure: name + description in the prompt, full body via skill_read).
+# `dir` overrides the default `$XDG_CONFIG_HOME/harness/skills`
+# (`$HOME/.config/harness/skills` when `XDG_CONFIG_HOME` is unset).
+# [skills]
+# enabled = true
+# dir = "/home/you/.config/harness/skills"
+
 # Headless shell tools (shell_exec / shell_start / shell_poll / shell_stop).
 # No policy guardrails: any executable runs. Resource bounds only (timeouts,
 # output caps, max jobs). Policy belongs in a future guardrail plugin via
