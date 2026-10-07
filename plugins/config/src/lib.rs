@@ -9,7 +9,7 @@ use harness_core::{Context, Plugin};
 // Re-export config types from contracts for backward compat: existing
 // `use harness_config::AppConfig` paths keep working, new code should
 // `use harness_contracts::AppConfig`.
-pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, ShellConfig};
+pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, SessionConfig, ShellConfig, SkillsConfig};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
