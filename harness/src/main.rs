@@ -66,6 +66,7 @@ async fn run() -> Result<ExitCode> {
     );
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
+    load!(ctx, "skills", harness_skills::SkillsPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);
     load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
     load!(
