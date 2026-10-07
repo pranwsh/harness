@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -161,6 +163,38 @@ impl Default for SessionConfig {
 }
 
 fn default_session_enabled() -> bool {
+    true
+}
+
+
+/// `[skills]` section: Agent Skills registry. On by default; skills are
+/// discovered as immediate child dirs of the resolved skills directory,
+/// each holding a `SKILL.md` plus optional `scripts/` / `references/` /
+/// `assets/`. The skills plugin owns all file I/O; this section only
+/// carries the toggle and an optional override.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SkillsConfig {
+    /// Scan the skills directory at startup. `false` keeps the catalog
+    /// empty (the `skill_*` tools report no skills).
+    #[serde(default = "default_skills_enabled")]
+    pub enabled: bool,
+    /// Override for the skills directory. Absent means the XDG config dir
+    /// (`$XDG_CONFIG_HOME/harness/skills`, else
+    /// `$HOME/.config/harness/skills`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        SkillsConfig {
+            enabled: default_skills_enabled(),
+            dir: None,
+        }
+    }
+}
+
+fn default_skills_enabled() -> bool {
     true
 }
 

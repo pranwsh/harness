@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 // ---- agent ------------------------------------------------------------------
@@ -466,4 +469,66 @@ pub struct TurnFailed {
     pub session_id: SessionId,
     pub turn: u64,
     pub error: String,
+}
+
+// ---- skills -----------------------------------------------------------------
+
+/// Level-1 catalog entry for one Agent Skill (progressive disclosure:
+/// name + description loaded for every skill, body on demand).
+///
+/// Mirrors the Agent Skills `SKILL.md` frontmatter (`name`, `description`,
+/// plus optional `license` / `compatibility` / `metadata` /
+/// `allowed-tools`). Validation rules live with the skills plugin; this
+/// crate only carries the data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
+}
+
+/// Full skill record: catalog metadata plus the `SKILL.md` instruction
+/// body (verbatim markdown after frontmatter) and the canonical skill
+/// root for resolving bundled `scripts/` / `references/` / `assets/`
+/// paths. Read-only by design: execution reuses `shell` / `hashline-read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillDetail {
+    #[serde(flatten)]
+    pub meta: SkillMeta,
+    pub body: String,
+    pub root: PathBuf,
+}
+
+/// `CH_SKILL_REGISTERED`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRegistered {
+    pub name: String,
+}
+
+/// Renders the level-1 skills block injected into the system prompt
+/// (progressive disclosure: name + description per skill, ~100
+/// tokens/skill). `None` when empty so the assembler skips the block and
+/// the loop behaves exactly as without skills. Pure: shared by the
+/// system-prompt plugin; the skills plugin never calls it.
+pub fn skill_catalog_block(skills: &[SkillMeta]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let mut out = String::from("<available_skills>\n");
+    for s in skills {
+        out.push_str("- ");
+        out.push_str(&s.name);
+        out.push_str(": ");
+        out.push_str(&s.description);
+        out.push('\n');
+    }
+    out.push_str("Call skill_read(name) for the full instructions before using a skill; bundled files resolve via skill_read(name, path).\n</available_skills>");
+    Some(out)
 }

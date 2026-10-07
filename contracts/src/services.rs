@@ -270,6 +270,41 @@ impl std::ops::Deref for ModelSelectorHandle {
     }
 }
 
+
+// ---- skills ------------------------------------------------------------------
+
+/// Read + registration surface for Agent Skills (progressive disclosure).
+///
+/// The skills plugin owns discovery (`~/.config/harness/skills/*/SKILL.md`)
+/// and validation; consumers read level-1 metadata via `list` and fetch
+/// instruction bodies / bundled files on demand via `get` / `read_file`.
+/// Execution reuses `shell` / `hashline-read` — this trait never executes.
+pub trait SkillCatalogApi: Send + Sync + 'static {
+    /// Level-1 catalog: every valid skill (name + description + optional
+    /// frontmatter), sorted by name.
+    fn list(&self) -> Vec<crate::SkillMeta>;
+    /// Full record (meta + SKILL.md body + skill root), if known.
+    fn get(&self, name: &str) -> Option<crate::SkillDetail>;
+    /// Registers one validated skill. `Err` on duplicate or invalid —
+    /// the caller skips the skill and continues with siblings.
+    fn register(&self, detail: crate::SkillDetail) -> Result<(), String>;
+    /// Reads one bundled file (`SKILL.md` itself, or anything under the
+    /// skill root such as `references/…` / `scripts/…` / `assets/…`).
+    /// `path` is relative to the skill root; absolute or escaping paths
+    /// are denied. Returns the file text.
+    fn read_file(&self, name: &str, path: &str) -> Result<String, String>;
+}
+
+#[derive(Clone)]
+pub struct SkillCatalogHandle(pub std::sync::Arc<dyn SkillCatalogApi>);
+
+impl std::ops::Deref for SkillCatalogHandle {
+    type Target = dyn SkillCatalogApi;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
 // ---- config (single source of truth) ---------------------------------------
 
 /// Unified config surface. The single key `config.app` holds an

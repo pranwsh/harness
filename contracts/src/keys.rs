@@ -98,6 +98,8 @@ pub const KEY_MODEL_SELECTOR_API: &str = "model.selector_api";
 pub const KEY_MODEL_CATALOG: &str = "model.catalog";
 /// `Arc<ModelStreamerHandle>` — streaming view over the model client.
 pub const KEY_MODEL_STREAMER: &str = "model.streamer";
+/// `Arc<SkillCatalogHandle>` — trait view over the skills registry.
+pub const KEY_SKILL_CATALOG: &str = "skills.catalog";
 
 // ---- channels ---------------------------------------------------------------
 
@@ -130,6 +132,9 @@ pub const CH_TOOL_EXECUTED: &str = "tool.executed";
 /// `ToolApproval` — waterfall gate before a tool runs. Handlers may rewrite
 /// `call` or set `denied` to veto. No handlers = allow as-is.
 pub const CH_TOOL_APPROVAL: &str = "tool.approval";
+
+/// `SkillRegistered` — a skill was registered in the catalog.
+pub const CH_SKILL_REGISTERED: &str = "skill.registered";
 
 /// `PromptAssembled` — a system prompt was assembled (debug/telemetry).
 pub const CH_PROMPT_ASSEMBLED: &str = "prompt.assembled";
