@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use harness_contracts::{
-    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT, Message,
-    PromptAssembled, PromptAssemblerApi, PromptAssemblerHandle, Role,
+    CH_PROMPT_ASSEMBLED, Entry, KEY_PROMPT, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT,
+    KEY_SKILL_CATALOG, Message, PromptAssembled, PromptAssemblerApi, PromptAssemblerHandle, Role,
+    SkillCatalogHandle,
 };
 use harness_core::{Context, Result};
 
@@ -30,9 +31,21 @@ impl PromptAssembler {
         system_prompt: &str,
         history: &[Entry],
     ) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(history.len() + 1);
+        let mut messages = Vec::with_capacity(history.len() + 2);
         if !system_prompt.trim().is_empty() {
             messages.push(Message::system(system_prompt));
+        }
+        // Progressive disclosure, level 1: every installed skill's name +
+        // description rides the system message (~100 tokens/skill). Bodies
+        // load on demand via `skill_read`; bundled files via
+        // `skill_read(name, path)`. Optional on purpose (`try_inject`, no
+        // `injects` declaration): works with or without the skills plugin
+        // and never affects load ordering.
+        if let Some(catalog) = self.ctx.try_inject_key::<SkillCatalogHandle>(KEY_SKILL_CATALOG)
+            && let Some(block) =
+                harness_contracts::skill_catalog_block(&catalog.list())
+        {
+            messages.push(Message::system(block));
         }
         for entry in history {
             messages.push(message_from_entry(entry));
@@ -189,5 +202,58 @@ mod tests {
         let ctx = Context::root();
         ctx.load(SystemPromptPlugin::default()).unwrap();
         assert_eq!(system_prompt_of(&ctx), DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn skills_catalog_in_system_message() {
+        use harness_contracts::{
+            KEY_SKILL_CATALOG, SkillCatalogHandle, SkillDetail, SkillMeta,
+        };
+        use harness_core::Context;
+
+        struct Fake(std::sync::Mutex<Vec<SkillMeta>>);
+        impl harness_contracts::SkillCatalogApi for Fake {
+            fn list(&self) -> Vec<SkillMeta> {
+                self.0.lock().unwrap().clone()
+            }
+            fn get(&self, _: &str) -> Option<SkillDetail> {
+                None
+            }
+            fn register(&self, _: SkillDetail) -> std::result::Result<(), String> {
+                Ok(())
+            }
+            fn read_file(&self, _: &str, _: &str) -> std::result::Result<String, String> {
+                Err("no".into())
+            }
+        }
+
+        // Without the skills plugin: system message only.
+        let ctx = Context::root();
+        ctx.load(SystemPromptPlugin::new("be brief")).unwrap();
+        let asm: Arc<PromptAssembler> = ctx.inject_key(KEY_PROMPT).unwrap();
+        let msgs = asm.assemble("a", "s", 1, "be brief", &[]);
+        assert_eq!(msgs.len(), 1);
+
+        // With a catalog: system + <available_skills> block.
+        let ctx = Context::root();
+        ctx.load(SystemPromptPlugin::new("be brief")).unwrap();
+        ctx.provide_key(
+            KEY_SKILL_CATALOG,
+            Arc::new(SkillCatalogHandle(Arc::new(Fake(std::sync::Mutex::new(
+                vec![SkillMeta {
+                    name: "pdf".into(),
+                    description: "Works with PDFs.".into(),
+                    license: None,
+                    compatibility: None,
+                    metadata: Default::default(),
+                    allowed_tools: None,
+                }],
+            ))) as Arc<dyn harness_contracts::SkillCatalogApi>)),
+        );
+        let asm: Arc<PromptAssembler> = ctx.inject_key(KEY_PROMPT).unwrap();
+        let msgs = asm.assemble("a", "s", 1, "be brief", &[]);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[1].content.contains("<available_skills>"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("pdf: Works with PDFs."), "{}", msgs[1].content);
     }
 }
