@@ -685,6 +685,7 @@ dependencies = [
  "harness-model-headers",
  "harness-session",
  "harness-shell",
+ "harness-skills",
  "harness-system-prompt",
  "harness-tools",
  "harness-tui",
@@ -877,6 +878,21 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harness-skills"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "harness-config",
+ "harness-contracts",
+ "harness-core",
+ "harness-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -9,6 +9,7 @@ members = [
     "plugins/model-headers",
     "plugins/agent",
     "plugins/session",
+    "plugins/skills",
     "plugins/tools",
     "plugins/hash-base",
     "plugins/hashline-read",
