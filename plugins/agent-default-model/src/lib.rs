@@ -214,7 +214,7 @@ impl ModelCatalogApi for ModelSelector {
         ModelSelector::sync_default(self, model)
     }
     fn refresh(self: Arc<Self>) -> BoxFuture<Option<Vec<String>>> {
-        Box::pin(async move { ModelSelector::refresh(&*self).await })
+        Box::pin(async move { ModelSelector::refresh(&self).await })
     }
 }
 

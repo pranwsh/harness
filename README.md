@@ -1,6 +1,6 @@
 # harness
 
-Single-binary agent harness TUI (Rust workspace, statically linked). All plugins are rlibs compiled into one `harness` binary.
+Single-binary agent harness TUI (Rust workspace). All plugins are rlibs compiled into one `harness` binary. See [Linkage](#linkage) for what "single-binary" does and does not mean.
 
 ## Install (Nix, declarative)
 
@@ -42,6 +42,37 @@ Home Manager (standalone `home.nix` or NixOS `home-manager` module):
 
 Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --flake .`). No `nix run` / `nix build` / `nix develop` needed; `nix flake check` (build + clippy `--deny warnings` + tests) is for hacking on `harness` itself.
 
+## Development
+
+The dev environment is project-local; nothing needs to be installed
+system-wide. If you use [direnv](https://direnv.net), the included `.envrc`
+loads the flake's dev shell automatically on `cd`:
+
+```sh
+direnv allow   # once, to trust .envrc
+cargo build    # works directly, no global gcc needed
+```
+
+Without direnv, enter the same environment manually:
+
+```sh
+nix develop
+# or, for a single command:
+nix develop --command cargo build
+```
+
+The dev shell provides `rustc`, `cargo`, `clippy`, `rustfmt` and
+`stdenv.cc`. The C compiler matters: `ring` (pulled in by `rustls`, which
+`reqwest` enables via its `rustls-tls` feature) builds C and assembly through
+the `cc` crate, and rustc shells out to `cc` to link every crate's build
+script. On a machine with no system compiler, a bare `cargo build` fails with
+`error: linker `cc` not found` — the dev shell supplies `cc` for you.
+
+The toolchain version comes from the pinned `nixpkgs` input in
+`flake.lock`, so there is no separate toolchain pin to keep in sync.
+
+Checks: `nix flake check` (build + clippy `--deny warnings` + tests).
+
 Configure:
 
 ```sh
@@ -66,8 +97,18 @@ error. Packaged example also at `$out/share/doc/harness/config.example.toml`.
 harness/src/main.rs (composition root)
   -> core (Context: services + event bus + dependency graph)
   -> contracts (shared keys/types)
-  -> plugins/* (rlibs, statically linked)
+  -> plugins/* (rlibs, linked into the binary)
 ```
+
+## Linkage
+
+`harness` is a single self-contained binary in the sense that matters here: all
+25 plugins are compiled in as Rust rlibs and there is nothing else to install.
+It is not a fully static executable — the C runtime is linked dynamically
+against the platform libc (glibc on Linux, system `libSystem` on Darwin), plus
+`libgcc_s.so.1`. Those come from the host system, so the Nix derivation is the
+right distribution mechanism. Fully static linking is possible with crane via
+`muslOverride` / `pkgsStatic`, but is not configured here.
 
 - **core (`harness-core`):** plugin runtime. Plugins declare `meta()` (`provides`/`injects` services by string `Key`, `emits`/`listens`/`waterfalls` typed event channels) plus a one-shot `build(ctx)` hook. Missing deps park as pending and auto-activate; unload cascades to dependents.
 - **contracts (`harness-contracts`):** shared vocabulary only (keys, domain/event types, `*_API` trait handles). Domain plugins depend on `contracts` + `core`, never on each other; sibling `Plugin` deps live only in `[dev-dependencies]` for wiring tests. All runtime cross-plugin comms go through trait handles under `KEY_*_API` / store keys or the core bus — the crate graph stays acyclic. Two intentional direct edges are documented in `contracts/src/lib.rs`: the TUI leaf shell (`tui` → `agent-loop` / `tui-*`) and the shared hashing infra (`hashline-*` → `hash-base`).

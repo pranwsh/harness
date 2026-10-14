@@ -16,6 +16,7 @@ target
 # Nix
 result
 result-*
+.direnv
 
 config.toml
 

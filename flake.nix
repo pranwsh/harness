@@ -1,5 +1,5 @@
 {
-  description = "harness — statically-linked single-binary agent harness (cargo workspace)";
+  description = "harness — single-binary agent harness (cargo workspace)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -48,7 +48,10 @@
           // {
             inherit cargoArtifacts;
             # Only binary in the workspace is `harness` (harness/src/main.rs).
-            # All 22 plugins are rlibs statically linked into it.
+            # All 25 plugins are rlibs linked into it — "linked" here means
+            # Rust-level: every plugin rlib is compiled into that one binary.
+            # The C runtime is still dynamic (glibc on Linux, system libSystem
+            # on Darwin); see "Linkage" in the README.
             cargoExtraArgs = "-p harness";
 
             postInstall = ''
@@ -91,10 +94,12 @@
                 python3
                 bash
               ];
-              # `explicit_env_gives_clean_subprocess` clears PATH then
-              # respawns `bash` via PATH lookup: works on FHS (/bin/bash)
-              # but not in the Nix sandbox (bash lives in /nix/store).
-              # Pre-existing hermeticity assumption, unrelated to packaging.
+              # `explicit_env_gives_clean_subprocess` clears PATH, then
+              # respawns a python probe that the test locates via hardcoded
+              # FHS paths (/usr/bin/python3, /usr/local/bin/python3). On
+              # NixOS none of those exist, so it fails with "python3: command
+              # not found" no matter how this package is built. The test needs
+              # an FHS-shaped PATH; unrelated to packaging.
               cargoTestExtraArgs = "--workspace -- --skip explicit_env_gives_clean_subprocess";
             }
           );
@@ -108,6 +113,18 @@
             clippy
             rustfmt
             pkg-config
+            # `ring` (pulled in by rustls via reqwest's `rustls-tls` feature)
+            # compiles C/asm through the `cc` crate and so needs a real
+            # linker. stdenv.cc supplies this implicitly, but naming it here
+            # makes the dev shell's contract explicit and keeps working if
+            # stdenv's cc ever stops being on the initial PATH. Without it, a
+            # bare `cargo build` inside the shell fails with
+            # "linker `cc` not found".
+            stdenv.cc
+            # `cargo test` here mirrors checks.harness-test above: shell plugin
+            # tests spawn `python3` and `bash -c`.
+            python3
+            bash
           ];
         };
 

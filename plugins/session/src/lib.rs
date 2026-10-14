@@ -677,10 +677,10 @@ impl SessionLog {
     fn journal_write<T: Serialize>(&self, file: &mut std::fs::File, session_id: &str, value: &T) {
         match serde_json::to_string(value) {
             Ok(line) => {
-                if writeln!(file, "{line}").is_err() {
-                    if let Some(path) = self.journal_path(session_id) {
-                        eprintln!("session: journal {} failed", path.display());
-                    }
+                if writeln!(file, "{line}").is_err()
+                    && let Some(path) = self.journal_path(session_id)
+                {
+                    eprintln!("session: journal {} failed", path.display());
                 }
             }
             Err(e) => eprintln!("session: journal record encode failed: {e}"),
