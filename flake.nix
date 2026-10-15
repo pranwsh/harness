@@ -13,8 +13,17 @@
     crane,
     flake-utils,
     ...
-  }:
-  # nixos-unstable (26.11+) dropped x86_64-darwin, so don't use eachDefaultSystem.
+  }: let
+    # Home Manager module, importable as a single module:
+    # `imports = [ inputs.harness.homeManagerModules.default ]`. It generates
+    # `$XDG_CONFIG_HOME/harness/config.toml` from `programs.harness.settings`
+    # and points the installed `harness` at it; see `modules/harness.nix` for
+    # the caveats (the managed file is read-only, hence the `--config`
+    # wrapper). Merged into the outputs below, since `eachSystem` only emits
+    # the per-system ones.
+    hm.homeManagerModules.default = ./modules/harness.nix;
+  in
+    # nixos-unstable (26.11+) dropped x86_64-darwin, so don't use eachDefaultSystem.
     flake-utils.lib.eachSystem
     [
       "x86_64-linux"
@@ -130,5 +139,10 @@
 
         formatter = pkgs.alejandra;
       }
-    );
+    )
+    // {
+      # Rightmost wins, and function application binds tighter than `//`, so
+      # this merges onto the `eachSystem` result above.
+      inherit (hm) homeManagerModules;
+    };
 }

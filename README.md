@@ -42,6 +42,58 @@ Home Manager (standalone `home.nix` or NixOS `home-manager` module):
 
 Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --flake .`). No `nix run` / `nix build` / `nix develop` needed; `nix flake check` (build + clippy `--deny warnings` + tests) is for hacking on `harness` itself.
 
+### Config from Home Manager
+
+`programs.harness` generates the config file for you. Import the module:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    harness.url = "github:pranwsh/harness";
+  };
+}
+```
+
+```nix
+# home.nix
+{ inputs, pkgs, ... }:
+{
+  imports = [ inputs.harness.homeManagerModules.default ];
+
+  programs.harness = {
+    enable = true;
+    settings = {
+      llm = {
+        base_url = "https://opencode.ai/zen/v1";
+        model = "muse-spark-1.3-contributor-free";
+        api_key = "public";
+        user_agent = "opencode/1.18.18";
+        headers = {
+          HTTP-Referer = "https://opencode.ai/";
+          X-Title = "opencode";
+        };
+      };
+      agent.max_iterations = 128;
+      # Optional; omit a key (or set it to `null`) and the built-in default applies.
+      session.enabled = true;
+      skills.enabled = true;
+      theme.colors."text.user_border" = "green";
+    };
+  };
+}
+```
+
+`settings` mirrors the sections in `config.example.toml`. Only `llm.base_url`, `llm.model` and `llm.api_key` are required — a missing `[llm]` is a parse error and `harness` exits at startup.
+
+Two caveats:
+
+- **The generated file is read-only.** It is a symlink into the Nix store, and the model popup persists a choice by rewriting `[llm] model` in place. That write fails against a store path; the choice still applies for the session and the notice reads `config save failed`. Change `settings.llm.model` and re-run `home-manager switch` to persist it.
+- **`harness` is wrapped.** The app resolves config as `./config.toml` in the *current directory*, with no XDG fallback (`plugins/config/src/lib.rs`), so it cannot find a file managed at `$XDG_CONFIG_HOME/harness/config.toml` on its own. The module therefore installs a wrapper that passes `--config` for you. Unset `settings` and you get the plain binary plus no managed file.
+
+With `settings` unset the module changes nothing beyond installing the package, which is the same as the `home.packages` snippet above.
+
 ## Development
 
 The dev environment is project-local; nothing needs to be installed
