@@ -31,6 +31,11 @@ pub const KEY_TUI: &str = "ui.tui";
 /// `Arc<RendererHandle>` — provided by the tui-markdown plugin,
 /// injected by the tui plugin to render assistant messages.
 pub const KEY_MARKDOWN_RENDERER: &str = "markdown.renderer";
+/// `Arc<ThemeHandle>` — provided by the tui-theme plugin, injected by every
+/// plugin that paints (tui shell, tui-markdown, any future renderer). The
+/// single source of colors: no TUI plugin hardcodes a palette, so replacing
+/// this one service re-themes the whole UI without touching consumers.
+pub const KEY_THEME: &str = "ui.theme";
 /// `Arc<Input>` — provided by the tui-input plugin, injected by the tui
 /// plugin to read terminal key/mouse events.
 pub const KEY_INPUT: &str = "ui.input";

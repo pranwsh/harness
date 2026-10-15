@@ -68,6 +68,40 @@ max_jobs = 32
 max_job_time_ms = 600000
 max_job_output_bytes = 262144
 
+# TUI palette. Absent means the built-in default; every key is optional and
+# overrides only its own slot. The role vocabulary (which slots exist) is
+# code, not config, so a typo can never desynchronize a renderer from the
+# palette. Applied by the tui-theme plugin, which every painting TUI plugin
+# injects -- swap that one plugin to re-theme the whole UI.
+#
+# Each slot takes a color: an ANSI name ("red", "light cyan"), a 256-color
+# palette index ("240"), or a hex triple ("#a1b2c3"). Use the table form to
+# set a background too. An unparseable value is reported on stderr and that
+# one slot keeps its built-in color; it never takes the app down.
+#
+#   [theme.colors]
+#   "text.user_border"      = "green"                    # message box outline
+#   "chrome.input_border"  = "blue"                     # input box border
+#   "text.error"            = { fg = "red", bg = "black" }
+#   "markdown.emphasis"     = "220"                      # 256-color index
+#
+# Full slot list: text.{assistant,user,user_border,tool,error,error_emphasis,
+# muted}, chrome.{input_border,input_title,input_title_busy,popup_border,
+# popup_title,popup_cursor}, markdown.{emphasis,strong,strike,link_text,
+# link_wrap,rule,table_border,table_header,list_marker,blockquote_0..5}.
+#
+# Only colors are configurable. Modifiers belong to the role (emphasis is
+# italic because it is emphasis), so a recolor never strips what makes a
+# slot that slot -- and components you leave unset keep their current value.
+#
+# [theme.colors]
+# "text.user_border" = "green"
+
+# syntect theme for fenced code blocks. Unknown names fall back to the
+# built-in default (base16-ocean.dark) rather than failing.
+# [theme.code]
+# name = "base16-eighties.dark"
+
 # MCP servers (stdio transport). Each `[mcp.servers.<name>]` spawns one
 # persistent child speaking JSON-RPC 2.0 over stdio; its tools appear as
 # `mcp__<server>__<tool>`. Absent means no MCP servers. One bad command

@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub mcp: McpConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+#[serde(default)]
+pub theme: ThemeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -196,6 +198,95 @@ impl Default for SkillsConfig {
 
 fn default_skills_enabled() -> bool {
     true
+}
+
+/// `[theme]` section: TUI palette overrides. Absent means the built-in
+/// default palette; every key is optional and overrides only its own slot.
+///
+/// Every slot is addressable by its dotted key, matching the role
+/// vocabulary in `harness_tui_state::theme`:
+///
+/// ```toml
+/// [theme]
+/// "text.user_border"   = "green"
+/// "chrome.input_border" = "blue"
+/// "text.error"         = { fg = "red", bg = "black" }
+/// ```
+///
+/// Colors accept an ANSI name (`"red"`, `"light cyan"`), a 256-color
+/// palette index (`"240"`), a hex triple (`"#a1b2c3"`), or `rgb(r, g, b)`
+/// via the table form. Unparseable values are reported at load time rather
+/// than silently ignored, but never take the app down: the affected slot
+/// keeps its built-in value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ThemeConfig {
+    /// Fenced-code highlighting (`[theme.code]`).
+    #[serde(default)]
+    pub code: CodeThemeConfig,
+    /// `[theme.colors]` — slot overrides: `"text.error" = "red"`.
+    ///
+    /// A named sub-table rather than `#[serde(flatten)]`: flattening would
+    /// make `[theme.colors]` deserialize as a slot literally named
+    /// `"colors"`, colliding with the keys it is supposed to contain.
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, ColorSpec>,
+}
+
+/// `[theme.code]` — fenced-code highlighting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CodeThemeConfig {
+    /// syntect theme name for fenced code blocks (e.g. `base16-ocean.dark`).
+    /// Unknown names fall back to the built-in default rather than failing.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One slot's color override.
+///
+/// Deserializes from either a bare string (`"red"`, `"240"`, `"#a1b2c3"`)
+/// or a table naming components:
+///
+/// ```toml
+/// "chrome.popup_cursor" = { fg = "black", bg = "cyan" }
+/// ```
+///
+/// An empty spec (`{}` or `""`) means "leave this slot alone", so a
+/// half-written override never blanks a color.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ColorSpec {
+    /// Shorthand: the foreground color.
+    Simple(String),
+    /// Explicit components.
+    Detailed {
+        /// Foreground color; `None` inherits the current value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fg: Option<String>,
+        /// Background color; `None` inherits the current value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bg: Option<String>,
+    },
+}
+
+impl ColorSpec {
+    /// Foreground spelling, if this spec names one.
+    pub fn fg(&self) -> Option<&str> {
+        match self {
+            ColorSpec::Simple(s) => Some(s.as_str()),
+            ColorSpec::Detailed { fg, .. } => fg.as_deref(),
+        }
+    }
+
+    /// Background spelling, if this spec names one.
+    pub fn bg(&self) -> Option<&str> {
+        match self {
+            // A bare string is foreground-only by definition; naming it as
+            // a background too would make `"red"` mean something different
+            // depending on which key it was assigned to.
+            ColorSpec::Simple(_) => None,
+            ColorSpec::Detailed { bg, .. } => bg.as_deref(),
+        }
+    }
 }
 
 /// `[mcp]` section: Model Context Protocol servers (stdio transport).

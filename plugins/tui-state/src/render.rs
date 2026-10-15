@@ -5,13 +5,10 @@
 use std::sync::Arc;
 
 use ratatui::{
-    style::{Color, Style},
-    text::Line,
+style::Style,
+text::Line,
 };
 
-/// Base style for assistant messages, shared by views (plain items) and
-/// renderer defaults so the two can never silently drift apart.
-pub const ASSISTANT_BASE: Style = Style::new().fg(Color::White);
 
 /// Renders an assistant message to ratatui lines already wrapped to
 /// `width`. Implementations must not require re-wrapping by the caller.

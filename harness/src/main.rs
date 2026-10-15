@@ -102,6 +102,10 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "agent-loop", harness_agent_loop::AgentLoopPlugin);
 
     let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+    // Theme before every painter: it injects `config.app` and provides
+    // `ui.theme`, which the markdown renderer and the tui shell both park
+    // on, so load order here is convenience only.
+    load!(ctx, "tui-theme", harness_tui_theme::ThemePlugin);
     load!(ctx, "tui-input", harness_tui_input::InputPlugin);
     load!(ctx, "tui-markdown", harness_tui_markdown::MarkdownPlugin);
     load!(ctx, "tui-popup", harness_tui_popup::TuiPopupPlugin);
