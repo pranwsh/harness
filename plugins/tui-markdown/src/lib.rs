@@ -23,10 +23,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use harness_contracts::KEY_MARKDOWN_RENDERER;
+use harness_contracts::{KEY_MARKDOWN_RENDERER, KEY_THEME};
 use harness_core::{Context, Result};
 use harness_tui_state::{
     render::{MessageRenderer, RendererHandle},
+    theme::{Theme, ThemeApi, ThemeHandle},
     wrap::{display_width, wrap_spans},
 };
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -46,7 +47,7 @@ use syntect::{
 /// highlighting costs milliseconds per message — that is the scroll
 /// stutter. Chat items are immutable once pushed, so a cache hit
 /// (hash + clone) is always valid. Bounded; cleared on overflow.
-type RenderCache = Mutex<HashMap<(u64, u16), Vec<Line<'static>>>>;
+type RenderCache = Mutex<HashMap<(u64, u16, u64), Vec<Line<'static>>>>;
 
 static RENDER_CACHE: OnceLock<RenderCache> = OnceLock::new();
 
@@ -57,10 +58,18 @@ fn render_cache() -> &'static RenderCache {
 /// Maximum cached messages before the cache is reset.
 const CACHE_CAP: usize = 256;
 
-fn cache_key(text: &str, width: u16) -> (u64, u16) {
+/// Cache key: content hash, wrap width, and the theme's own hash.
+///
+/// Cached rows hold fully resolved `Style`s, so serving one keyed under a
+/// different palette would paint stale colors. Hashing the theme *value*
+/// (rather than trusting a version counter) means this is correct even if
+/// a caller builds a theme by hand and never bumps an epoch — there is no
+/// bookkeeping to forget.
+fn cache_key(text: &str, width: u16, theme: &Theme) -> (u64, u16, u64) {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
-    (hasher.finish(), width)
+    theme.hash(&mut hasher);
+    (hasher.finish(), width, theme.epoch)
 }
 
 // ============================================================================
@@ -88,65 +97,6 @@ const TABLE_RJ: &str = "┤";
 const TABLE_X: &str = "┼";
 const BULLET: &str = "- ";
 
-fn emphasis_style() -> Style {
-    Style::default()
-        .add_modifier(RatModifier::ITALIC)
-        .fg(RatColor::Indexed(220))
-}
-
-fn strong_style() -> Style {
-    Style::default()
-        .add_modifier(RatModifier::BOLD)
-        .fg(RatColor::Indexed(220))
-}
-
-fn strike_style() -> Style {
-    Style::default()
-        .add_modifier(RatModifier::CROSSED_OUT | RatModifier::DIM)
-        .fg(RatColor::Indexed(245))
-}
-
-fn link_text_style() -> Style {
-    Style::default()
-        .fg(RatColor::Indexed(4))
-        .bg(RatColor::Indexed(237))
-        .add_modifier(RatModifier::UNDERLINED)
-}
-
-fn link_wrap_style() -> Style {
-    Style::default().fg(RatColor::Indexed(237))
-}
-
-fn hr_style() -> Style {
-    Style::default().fg(RatColor::Indexed(240))
-}
-
-fn table_border_style() -> Style {
-    Style::default().fg(RatColor::Indexed(240))
-}
-
-fn table_header_style() -> Style {
-    Style::default()
-        .add_modifier(RatModifier::BOLD)
-        .fg(RatColor::Indexed(255))
-}
-
-fn prefix_style() -> Style {
-    Style::default().fg(RatColor::Indexed(222))
-}
-
-fn blockquote_style(depth: usize) -> Style {
-    const COLORS: [RatColor; 6] = [
-        RatColor::Indexed(202),
-        RatColor::Indexed(203),
-        RatColor::Indexed(204),
-        RatColor::Indexed(205),
-        RatColor::Indexed(206),
-        RatColor::Indexed(207),
-    ];
-    Style::default().fg(COLORS[depth % COLORS.len()])
-}
-
 // ============================================================================
 // Syntax highlighting assets (loaded once, shared)
 // ============================================================================
@@ -164,10 +114,6 @@ fn hl_assets() -> &'static HlAssets {
         themes: ThemeSet::load_defaults(),
     })
 }
-
-/// syntect theme for code. Dark, readable, foreground-only use (the
-/// background is always dropped so code never gets a grey fill).
-const HL_THEME: &str = "base16-ocean.dark";
 
 /// syntect foreground + font style mapped to ratatui. The background is
 /// deliberately dropped: code renders on the terminal background.
@@ -267,20 +213,24 @@ struct Seg {
     text: String,
 }
 
-fn seg_style(m: Marks, header: bool) -> Style {
+/// Resolves one marked run to a style.
+///
+/// Markup decides *which slot* a run is (emphasis is emphasis); the theme
+/// decides what that slot looks like. Keeping those two apart is what
+/// lets a palette swap recolor everything without the parser ever naming a
+/// color, and it means a themed run always keeps the modifier its markup
+/// implies — emphasis stays italic even under a monochrome theme.
+fn seg_style(m: Marks, header: bool, theme: &Theme) -> Style {
+    let md = &theme.markdown;
     if m.link_wrap {
-        return link_wrap_style();
+        return md.link_wrap;
     }
     if m.link_url {
-        return link_text_style();
+        return md.link_text;
     }
-    let mut style = if header {
-        table_header_style()
-    } else {
-        Style::default()
-    };
+    let mut style = if header { md.table_header } else { Style::default() };
     if m.link_text {
-        style = style.patch(link_text_style());
+        style = style.patch(md.link_text);
     }
     if m.code {
         // Inline code carries no style of its own: the caller patches the
@@ -288,13 +238,13 @@ fn seg_style(m: Marks, header: bool) -> Style {
         return style.patch(Style::default());
     }
     if m.em {
-        style = style.patch(emphasis_style());
+        style = style.patch(md.emphasis);
     }
     if m.strong {
-        style = style.patch(strong_style());
+        style = style.patch(md.strong);
     }
     if m.strike {
-        style = style.patch(strike_style());
+        style = style.patch(md.strike);
     }
     style
 }
@@ -361,6 +311,10 @@ struct Body<'a> {
     pos: usize,
     width: usize,
     base: Style,
+    /// The palette for this render. A `Copy` snapshot (not a reference) so
+    /// `Body` stays self-contained and the borrow checker never fights the
+    /// emitter methods over `&self`/`&mut self`.
+    theme: Theme,
     out: Vec<Line<'static>>,
     /// A block was emitted that wants a blank line after it (everything
     /// except headers).
@@ -641,7 +595,7 @@ impl<'a> Body<'a> {
         let mut first = Vec::new();
         let mut cont = Vec::new();
         for d in 0..self.bq_depth {
-            let bar = RatSpan::styled(BLOCKQUOTE_BAR.to_owned(), blockquote_style(d));
+            let bar = RatSpan::styled(BLOCKQUOTE_BAR.to_owned(), self.theme.blockquote(d));
             first.push(bar.clone());
             cont.push(bar);
         }
@@ -651,7 +605,7 @@ impl<'a> Body<'a> {
                 && let Some(item) = &self.item
                 && item.first
             {
-                first.push(RatSpan::styled(item.marker.clone(), prefix_style()));
+                first.push(RatSpan::styled(item.marker.clone(), self.theme.markdown.list_marker));
                 cont.push(RatSpan::styled(
                     " ".repeat(item.width),
                     Style::default(),
@@ -1008,7 +962,7 @@ impl<'a> Body<'a> {
         let styled: Vec<(Style, String)> = segs
             .into_iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| (seg_style(s.marks, header), s.text))
+            .map(|s| (seg_style(s.marks, header, &self.theme), s.text))
             .collect();
         if styled.is_empty() {
             let mut line = Line::from(first_pre);
@@ -1049,7 +1003,7 @@ impl<'a> Body<'a> {
         let styled: Vec<(Style, String)> = segs
             .into_iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| (seg_style(s.marks, true), s.text))
+            .map(|s| (seg_style(s.marks, true, &self.theme), s.text))
             .collect();
         if styled.is_empty() {
             let mut line = Line::from(Vec::new());
@@ -1070,7 +1024,7 @@ impl<'a> Body<'a> {
         let pre_w = span_width(&first_pre);
         let avail = self.width.saturating_sub(pre_w);
         let mut spans = first_pre;
-        spans.push(RatSpan::styled(HR_CHAR.repeat(avail), hr_style()));
+        spans.push(RatSpan::styled(HR_CHAR.repeat(avail), self.theme.markdown.rule));
         let mut line = Line::from(spans);
         patch_line(&mut line, self.base);
         self.out.push(line);
@@ -1111,10 +1065,13 @@ impl<'a> Body<'a> {
         let pre_w = span_width(&first_pre);
         let content_w = self.width.saturating_sub(pre_w).max(1);
         let assets = hl_assets();
+        // Theme name comes from the injected palette; an unknown name (or a
+        // stripped syntect build) falls back to the first bundled theme
+        // rather than failing the whole transcript.
         let theme = assets
             .themes
             .themes
-            .get(HL_THEME)
+            .get(self.theme.code.theme.as_str())
             .or_else(|| assets.themes.themes.values().next())
             .expect("syntect default themes");
         let syntax = assets
@@ -1188,14 +1145,15 @@ impl<'a> Body<'a> {
         }
 
         let border = |left: &str, mid: &str, right: &str| -> Vec<RatSpan<'static>> {
-            let mut spans = vec![RatSpan::styled(left.to_owned(), table_border_style())];
+            let border_style = self.theme.markdown.table_border;
+            let mut spans = vec![RatSpan::styled(left.to_owned(), border_style)];
             for (i, &w) in col_widths.iter().enumerate() {
-                spans.push(RatSpan::styled(TABLE_H.repeat(w), table_border_style()));
+                spans.push(RatSpan::styled(TABLE_H.repeat(w), self.theme.markdown.table_border));
                 if i + 1 < num_cols {
-                    spans.push(RatSpan::styled(mid.to_owned(), table_border_style()));
+                    spans.push(RatSpan::styled(mid.to_owned(), self.theme.markdown.table_border));
                 }
             }
-            spans.push(RatSpan::styled(right.to_owned(), table_border_style()));
+            spans.push(RatSpan::styled(right.to_owned(), self.theme.markdown.table_border));
             spans
         };
         // The header separator and every inter-row separator are
@@ -1211,7 +1169,7 @@ impl<'a> Body<'a> {
                     let styled: Vec<(Style, String)> = cell
                         .iter()
                         .filter(|s| !s.text.is_empty())
-                        .map(|s| (seg_style(s.marks, is_header), s.text.clone()))
+                        .map(|s| (seg_style(s.marks, is_header, &self.theme), s.text.clone()))
                         .collect();
                     wrap_runs(&styled, inner)
                 })
@@ -1220,7 +1178,7 @@ impl<'a> Body<'a> {
             let mut lines = Vec::with_capacity(height);
             for li in 0..height {
                 let mut spans =
-                    vec![RatSpan::styled(TABLE_V.to_owned(), table_border_style())];
+                    vec![RatSpan::styled(TABLE_V.to_owned(), self.theme.markdown.table_border)];
                 for (i, &w) in col_widths.iter().enumerate() {
                     let inner = w.saturating_sub(2);
                     let row = wrapped.get(i).and_then(|c| c.get(li));
@@ -1238,7 +1196,7 @@ impl<'a> Body<'a> {
                         spans.extend(r.clone());
                     }
                     spans.push(RatSpan::raw(format!("{} ", " ".repeat(right_pad))));
-                    spans.push(RatSpan::styled(TABLE_V.to_owned(), table_border_style()));
+                    spans.push(RatSpan::styled(TABLE_V.to_owned(), self.theme.markdown.table_border));
                 }
                 lines.push(spans);
             }
@@ -1282,23 +1240,40 @@ impl<'a> Body<'a> {
 /// markdown with syntect code highlighting and no background fill.
 pub struct MarkdownRenderer {
     base: Style,
+    /// The active palette. Read per call (never cached) so a theme swap
+    /// takes effect on the very next redraw.
+    theme: Arc<ThemeHandle>,
 }
 
 impl MarkdownRenderer {
-    pub fn new(base: Style) -> Self {
-        MarkdownRenderer { base }
+    /// Renderer with an explicit base style and an injected theme.
+    pub fn new(base: Style, theme: Arc<ThemeHandle>) -> Self {
+        MarkdownRenderer { base, theme }
+    }
+
+    /// Convenience constructor for tests and embedders with no DI context:
+    /// the built-in palette, wrapped so it behaves like any other provider.
+    pub fn with_default_theme(base: Style) -> Self {
+        MarkdownRenderer {
+            base,
+            theme: Arc::new(ThemeHandle(Arc::new(Theme::default()))),
+        }
     }
 }
 
 impl Default for MarkdownRenderer {
     fn default() -> Self {
-        MarkdownRenderer::new(harness_tui_state::render::ASSISTANT_BASE)
+        let theme = Theme::default();
+        MarkdownRenderer {
+            base: theme.text.assistant,
+            theme: Arc::new(ThemeHandle(Arc::new(theme))),
+        }
     }
 }
 
 impl MessageRenderer for MarkdownRenderer {
     fn render_assistant(&self, text: &str, width: u16) -> Vec<Line<'static>> {
-        render_assistant(text, width, self.base)
+        render_assistant(text, width, self.base, &self.theme)
     }
 }
 
@@ -1310,13 +1285,17 @@ pub struct MarkdownPlugin;
 
 impl harness_core::Plugin for MarkdownPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
-        harness_core::PluginMeta::new("markdown").provides(KEY_MARKDOWN_RENDERER)
+        harness_core::PluginMeta::new("markdown")
+            .provides(KEY_MARKDOWN_RENDERER)
+            .injects(KEY_THEME)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
+        let theme: Arc<ThemeHandle> = ctx.inject_key(KEY_THEME)?;
+        let base = theme.snapshot().text.assistant;
         ctx.provide_key(
             KEY_MARKDOWN_RENDERER,
-            Arc::new(RendererHandle(Arc::new(MarkdownRenderer::default()))),
+            Arc::new(RendererHandle(Arc::new(MarkdownRenderer::new(base, theme)))),
         );
         Ok(())
     }
@@ -1332,15 +1311,21 @@ impl harness_core::Plugin for MarkdownPlugin {
 /// Results are cached per content and width: the view calls this for every
 /// assistant item on every draw, and repeat renders are hash + clone instead
 /// of a full parse + highlight.
-pub fn render_assistant(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
+pub fn render_assistant(
+    text: &str,
+    width: u16,
+    base: Style,
+    theme: &dyn ThemeApi,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let key = cache_key(text, width);
+    let snapshot = theme.snapshot();
+    let key = cache_key(text, width, &snapshot);
     if let Ok(cache) = render_cache().lock()
         && let Some(hit) = cache.get(&key).cloned()
     {
         return hit;
     }
-    let lines = render_assistant_uncached(text, width, base);
+    let lines = render_assistant_uncached(text, width, base, snapshot);
     if let Ok(mut cache) = render_cache().lock() {
         if cache.len() >= CACHE_CAP {
             cache.clear();
@@ -1350,7 +1335,12 @@ pub fn render_assistant(text: &str, width: u16, base: Style) -> Vec<Line<'static
     lines
 }
 
-fn render_assistant_uncached(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
+fn render_assistant_uncached(
+    text: &str,
+    width: u16,
+    base: Style,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     // pulldown-cmark is infallible on any input (unclosed fences and
     // markers degrade to literal text), so there is no error path: only
     // empty output falls back to plain wrapping.
@@ -1364,6 +1354,7 @@ fn render_assistant_uncached(text: &str, width: u16, base: Style) -> Vec<Line<'s
         pos: 0,
         width: width as usize,
         base,
+        theme,
         out: Vec::new(),
         blank_queued: false,
         bq_depth: 0,
@@ -1397,6 +1388,12 @@ mod tests {
         Style::new().fg(Color::Cyan)
     }
 
+    /// The built-in palette, as a provider. Tests exercise the default
+    /// theme; theme *swapping* is covered by the epoch-keyed cache test.
+    fn theme() -> Theme {
+        Theme::default()
+    }
+
     fn plain_text(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
@@ -1417,7 +1414,7 @@ mod tests {
 
     #[test]
     fn plain_paragraph_round_trips() {
-        let lines = render_assistant("hello", 22, base());
+        let lines = render_assistant("hello", 22, base(), &theme());
         assert_eq!(plain_text(&lines), vec!["hello"]);
         // Unstyled text keeps the assistant base color.
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
@@ -1425,7 +1422,7 @@ mod tests {
 
     #[test]
     fn emphasis_markers_are_stripped_and_styled() {
-        let lines = render_assistant("*emphasis* and **strong**", 80, base());
+        let lines = render_assistant("*emphasis* and **strong**", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(!text.contains('*'), "decorators stripped: {text:?}");
         assert!(text.contains("emphasis"), "text: {text:?}");
@@ -1440,7 +1437,7 @@ mod tests {
 
     #[test]
     fn heading_renders_without_hash() {
-        let lines = render_assistant("# Title", 80, base());
+        let lines = render_assistant("# Title", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("Title"), "text: {text:?}");
         assert!(!text.starts_with('#'), "hash stripped: {text:?}");
@@ -1448,7 +1445,7 @@ mod tests {
 
     #[test]
     fn code_block_keeps_content_without_fences() {
-        let lines = render_assistant("```rust\nlet x = 1;\n```\n", 80, base());
+        let lines = render_assistant("```rust\nlet x = 1;\n```\n", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("let x = 1;"), "text: {text:?}");
         assert!(!text.contains("```"), "fences stripped: {text:?}");
@@ -1456,7 +1453,7 @@ mod tests {
 
     #[test]
     fn code_block_has_syntax_colors_and_no_background() {
-        let lines = render_assistant("```rust\nfn main() {\n    let x = 1;\n}\n```\n", 80, base());
+        let lines = render_assistant("```rust\nfn main() {\n    let x = 1;\n}\n```\n", 80, base(), &theme());
         assert!(!has_background(&lines), "no grey fill: {lines:?}");
         let fgs: std::collections::HashSet<_> = lines
             .iter()
@@ -1471,7 +1468,7 @@ mod tests {
 
     #[test]
     fn unknown_language_falls_back_without_background() {
-        let lines = render_assistant("```nosuchlang\nsome code here\n```\n", 80, base());
+        let lines = render_assistant("```nosuchlang\nsome code here\n```\n", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("some code here"), "text: {text:?}");
         assert!(!text.contains("```"), "fences stripped: {text:?}");
@@ -1480,7 +1477,7 @@ mod tests {
 
     #[test]
     fn inline_code_has_no_background() {
-        let lines = render_assistant("use `let x` here", 80, base());
+        let lines = render_assistant("use `let x` here", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("let x"), "text: {text:?}");
         assert!(!text.contains('`'), "backticks stripped: {text:?}");
@@ -1489,7 +1486,7 @@ mod tests {
 
     #[test]
     fn list_renders_items() {
-        let lines = render_assistant("- a\n- b", 80, base());
+        let lines = render_assistant("- a\n- b", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains('a'), "text: {text:?}");
         assert!(text.contains('b'), "text: {text:?}");
@@ -1502,6 +1499,7 @@ mod tests {
             "This is a long paragraph with *emphasis* that must wrap within the width.",
             20,
             base(),
+            &theme(),
         );
         assert!(lines.len() > 1, "wraps: {lines:?}");
         for line in &lines {
@@ -1517,6 +1515,7 @@ mod tests {
             "```rust\nlet very_long_variable_name = some_function_call(with_arguments);\n```\n",
             20,
             base(),
+            &theme(),
         );
         assert!(lines.len() > 1, "wraps: {lines:?}");
         for line in &lines {
@@ -1528,7 +1527,7 @@ mod tests {
 
     #[test]
     fn empty_input_yields_one_line() {
-        let lines = render_assistant("", 20, base());
+        let lines = render_assistant("", 20, base(), &theme());
         assert_eq!(lines.len(), 1);
     }
 
@@ -1537,8 +1536,8 @@ mod tests {
         // Scroll redraws hit the cache: same content and width must
         // return the same rows without re-parsing.
         let text = "```rust\nfn main() {\n    let x = 1;\n}\n```\n";
-        let first = render_assistant(text, 40, base());
-        let second = render_assistant(text, 40, base());
+        let first = render_assistant(text, 40, base(), &theme());
+        let second = render_assistant(text, 40, base(), &theme());
         assert_eq!(first, second);
     }
 
@@ -1546,18 +1545,70 @@ mod tests {
     fn cache_is_keyed_by_width() {
         // A resize must not reuse rows wrapped for another width.
         let text = "word ".repeat(20);
-        let narrow = render_assistant(&text, 20, base());
-        let wide = render_assistant(&text, 80, base());
+        let narrow = render_assistant(&text, 20, base(), &theme());
+        let wide = render_assistant(&text, 80, base(), &theme());
         assert!(narrow.len() > wide.len(), "narrow wraps more");
         // Both still served correctly on repeat.
-        assert_eq!(render_assistant(&text, 20, base()), narrow);
-        assert_eq!(render_assistant(&text, 80, base()), wide);
+        assert_eq!(render_assistant(&text, 20, base(), &theme()), narrow);
+        assert_eq!(render_assistant(&text, 80, base(), &theme()), wide);
+    }
+
+    #[test]
+    fn theme_swap_invalidates_the_render_cache() {
+        // The cache holds fully-resolved Styles, so a theme swap must
+        // retire it. This is the one place where keying on content+width
+        // alone would be a real bug: the rows would come back painted in
+        // the previous palette.
+        let text = "*emph* and `code` and text";
+        let first = Theme::default();
+
+        let mut recolored = first;
+        recolored.markdown.emphasis = Style::new().fg(ratatui::style::Color::Red);
+        recolored.markdown.link_text = Style::new().fg(ratatui::style::Color::Blue);
+
+        let a = render_assistant(text, 80, base(), &first);
+        let b = render_assistant(text, 80, base(), &recolored);
+        assert_ne!(a, b, "a new theme must not serve stale rows: {a:?}");
+
+        // Emphasis specifically moved to the new color.
+        let emph_color = |lines: &[Line]| {
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .filter(|s| s.content.as_ref() == "emph")
+                .filter_map(|s| s.style.fg)
+                .next()
+        };
+        assert_ne!(emph_color(&a), emph_color(&b));
+    }
+
+    #[test]
+    fn same_epoch_serves_identical_rows() {
+        // Control for the test above: an unchanged theme still hits cache.
+        let text = "**bold** text";
+        let t = Theme::default();
+        assert_eq!(
+            render_assistant(text, 80, base(), &t),
+            render_assistant(text, 80, base(), &t)
+        );
     }
 
     #[test]
     fn plugin_provides_renderer_through_di() {
         let ctx = Context::root();
+        // Order is irrelevant to the harness: the markdown plugin parks
+        // until the theme appears, and the theme parks until config does.
         ctx.load(MarkdownPlugin).unwrap();
+        ctx.load(harness_tui_theme::ThemePlugin).unwrap();
+        ctx.load(
+            harness_config::ConfigPlugin::from_toml(
+                "[llm]\nbase_url=\"u\"\nmodel=\"m\"\napi_key=\"k\"\nuser_agent=\"a\"\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let theme: Arc<ThemeHandle> = ctx.inject_key(KEY_THEME).unwrap();
+        assert_eq!(theme.snapshot().text.assistant, Theme::default().text.assistant);
         let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER).unwrap();
         let lines = renderer.render_assistant("**bold**", 80);
         let text: String = lines
@@ -1570,7 +1621,7 @@ mod tests {
 
     #[test]
     fn table_renders_with_borders_and_row_separators() {
-        let lines = render_assistant("| a | b |\n|---|---|\n| c | d |\n| e | f |\n", 30, base());
+        let lines = render_assistant("| a | b |\n|---|---|\n| c | d |\n| e | f |\n", 30, base(), &theme());
         let text = plain_text(&lines);
         // Top, header, separator, row, separator, row, bottom.
         assert_eq!(text.len(), 7, "rows: {text:?}");
@@ -1589,7 +1640,7 @@ mod tests {
 
     #[test]
     fn table_header_cells_are_bold() {
-        let lines = render_assistant("| Name |\n|------|\n| x |\n", 30, base());
+        let lines = render_assistant("| Name |\n|------|\n| x |\n", 30, base(), &theme());
         let header = &lines[1];
         assert!(
             header
@@ -1607,7 +1658,7 @@ mod tests {
         let text =
             "| name | description |\n|------|-------------|\n| widget | a very long description that must shrink |\n";
         // Wide enough to fit unshrunk: content is kept whole.
-        let lines = render_assistant(text, 60, base());
+        let lines = render_assistant(text, 60, base(), &theme());
         let joined = plain_text(&lines).join("\n");
         assert!(joined.contains("widget"), "content kept: {joined:?}");
         assert!(
@@ -1615,7 +1666,7 @@ mod tests {
             "content kept: {joined:?}"
         );
         // Too narrow: columns shrink proportionally but rows still fit.
-        let lines = render_assistant(text, 24, base());
+        let lines = render_assistant(text, 24, base(), &theme());
         for line in &lines {
             let w = line.spans.iter().map(|s| s.content.width()).sum::<usize>();
             assert!(w <= 24, "width {w}: {line:?}");
@@ -1624,7 +1675,7 @@ mod tests {
 
     #[test]
     fn blockquote_renders_bar_without_marker() {
-        let lines = render_assistant("> quoted text", 80, base());
+        let lines = render_assistant("> quoted text", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("▌"), "bar: {text:?}");
         assert!(text.contains("quoted text"), "text: {text:?}");
@@ -1633,7 +1684,7 @@ mod tests {
 
     #[test]
     fn link_renders_description_and_url() {
-        let lines = render_assistant("[docs](https://example.com)", 80, base());
+        let lines = render_assistant("[docs](https://example.com)", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("docs"), "desc: {text:?}");
         assert!(text.contains("https://example.com"), "url: {text:?}");
@@ -1643,7 +1694,7 @@ mod tests {
     #[test]
     fn horizontal_rule_fills_width() {
         use unicode_width::UnicodeWidthStr;
-        let lines = render_assistant("---", 20, base());
+        let lines = render_assistant("---", 20, base(), &theme());
         assert_eq!(lines.len(), 1, "one row: {lines:?}");
         let w: usize = lines[0].spans.iter().map(|s| s.content.width()).sum();
         assert_eq!(w, 20, "fills width: {lines:?}");
@@ -1655,7 +1706,7 @@ mod tests {
 
     #[test]
     fn ordered_list_numbers_items() {
-        let lines = render_assistant("1. first\n2. second", 80, base());
+        let lines = render_assistant("1. first\n2. second", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("1. first"), "numbered: {text:?}");
         assert!(text.contains("2. second"), "numbered: {text:?}");
@@ -1665,7 +1716,7 @@ mod tests {
     fn unclosed_fence_renders_as_code_without_fences() {
         // Streaming chunks often end mid-fence: the parser must degrade to
         // code lines, never blank the transcript.
-        let lines = render_assistant("```rust\nlet x = 1;\n", 80, base());
+        let lines = render_assistant("```rust\nlet x = 1;\n", 80, base(), &theme());
         let text = plain_text(&lines).join("\n");
         assert!(text.contains("let x = 1;"), "text: {text:?}");
         assert!(!text.contains("```"), "fences stripped: {text:?}");

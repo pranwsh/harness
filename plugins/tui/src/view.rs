@@ -4,7 +4,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -12,7 +12,8 @@ use ratatui::{
 use harness_tui_popup::ActivePopup;
 use harness_tui_state::{
     app::{App, ChatItem, INPUT_VISIBLE_ROWS, ItemKind, max_chat_scroll},
-    render::{ASSISTANT_BASE, MessageRenderer},
+    render::MessageRenderer,
+    theme::Theme,
     wrap::{display_width, wrap_spans, wrap_text},
 };
 
@@ -42,6 +43,15 @@ const BORDER_COLS: usize = 2;
 /// Append-only `items` makes invalidation trivial.
 pub(crate) struct LayoutCache {
     width: u16,
+    /// Theme the cached rows were laid out under. Laid-out rows carry fully
+    /// resolved `Style`s, so a theme swap must retire them exactly like a
+    /// resize does — otherwise a re-themed frame keeps painting the old
+    /// palette out of the cache.
+    ///
+    /// Compared by value (not just `epoch`) so a caller that hands us a
+    /// hand-built theme still gets correct invalidation without having to
+    /// remember to bump anything.
+    theme: Theme,
     /// Each entry is `(hash, layout)` kept in lockstep; a single `Vec` of
     /// pairs is simpler than two parallel `Vec`s that must be manually
     /// kept in sync.
@@ -52,6 +62,7 @@ impl LayoutCache {
     pub(crate) fn new() -> Self {
         LayoutCache {
             width: 0,
+            theme: Theme::default(),
             entries: Vec::new(),
         }
     }
@@ -81,9 +92,13 @@ impl LayoutCache {
         items: &[ChatItem],
         width: u16,
         renderer: &dyn MessageRenderer,
+        theme: &Theme,
     ) -> impl Iterator<Item = &MsgLayout> {
-        if self.width != width {
+        // The `theme` field is only a cache key; the layouts themselves
+        // were built from the `theme` argument, so it is never read back.
+        if self.width != width || self.theme != *theme {
             self.width = width;
+            self.theme = *theme;
             self.entries.clear();
         }
         self.entries.truncate(items.len());
@@ -93,9 +108,9 @@ impl LayoutCache {
                 if self.entries[idx].0 == key {
                     continue;
                 }
-                self.entries[idx] = (key, layout_item(item, width, renderer));
+                self.entries[idx] = (key, layout_item(item, width, renderer, theme));
             } else {
-                self.entries.push((key, layout_item(item, width, renderer)));
+                self.entries.push((key, layout_item(item, width, renderer, theme)));
             }
         }
         self.entries.iter().map(|(_, lay)| lay)
@@ -108,8 +123,8 @@ impl LayoutCache {
 /// width, which key handling needs for visual cursor motion. Assistant
 /// messages render through `renderer`, keeping this module free of any
 /// markdown engine dependency.
-pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer) {
-    draw_with_popup(f, app, renderer, None);
+pub fn draw(f: &mut Frame, app: &mut App, renderer: &dyn MessageRenderer, theme: &Theme) {
+    draw_with_popup(f, app, renderer, theme, None);
 }
 
 /// Same as [`draw`], plus a floating single-list popup anchored directly
@@ -127,10 +142,11 @@ pub fn draw_with_popup(
     f: &mut Frame,
     app: &mut App,
     renderer: &dyn MessageRenderer,
+    theme: &Theme,
     popup: Option<&ActivePopup>,
 ) {
     let mut cache = LayoutCache::new();
-    draw_with_popup_cached(f, app, renderer, popup, &mut cache);
+    draw_with_popup_cached(f, app, renderer, theme, popup, &mut cache);
 }
 
 /// Cached variant used by the `EventLoop` — `cache` is owned by the loop
@@ -140,6 +156,7 @@ pub(crate) fn draw_with_popup_cached(
     f: &mut Frame,
     app: &mut App,
     renderer: &dyn MessageRenderer,
+    theme: &Theme,
     popup: Option<&ActivePopup>,
     cache: &mut LayoutCache,
 ) {
@@ -165,10 +182,10 @@ pub(crate) fn draw_with_popup_cached(
         input_row
     };
 
-    draw_chat_cached(f, app, chat_area, renderer, cache);
-    draw_input(f, app, input_area);
+    draw_chat_cached(f, app, chat_area, renderer, theme, cache);
+    draw_input(f, app, input_area, theme);
     if let Some(popup) = popup {
-        draw_popup(f, chat_area, input_area, popup);
+        draw_popup(f, chat_area, input_area, popup, theme);
     }
 }
 
@@ -188,13 +205,14 @@ fn draw_chat_cached(
     app: &mut App,
     area: Rect,
     renderer: &dyn MessageRenderer,
+    theme: &Theme,
     cache: &mut LayoutCache,
 ) {
     if area.width < 2 || area.height == 0 {
         return;
     }
     let layouts: Vec<&MsgLayout> = cache
-        .layouts_for(app.items(), area.width, renderer)
+        .layouts_for(app.items(), area.width, renderer, theme)
         .collect();
     let total: usize = layouts.iter().map(|l| l.height).sum();
     let viewport = area.height as usize;
@@ -252,7 +270,7 @@ fn visible_range(total_rows: usize, scroll_rows: usize, viewport: usize) -> (usi
     (available.saturating_sub(viewport), used)
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+fn draw_input(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let busy = app.live_turns > 0;
     let title = if busy {
         " input (turn in flight) "
@@ -262,13 +280,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BOX_BORDER_TYPE)
-        .border_style(Style::new().fg(Color::Blue))
+        .border_style(theme.chrome.input_border)
         .title(title)
-        .title_style(
-            Style::new()
-                .fg(if busy { Color::Yellow } else { Color::Blue })
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(if busy {
+            theme.chrome.input_title_busy
+        } else {
+            theme.chrome.input_title
+        });
     let inner = block.inner(area);
     if inner.width == 0 || inner.height == 0 {
         f.render_widget(block, area);
@@ -307,7 +325,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 /// rounded border (same corners as the input box); the arrow-key cursor is
 /// the highlighted (reversed + bold) row, while the active value (e.g. the
 /// current model) carries a `●` marker so cursor and value never conflate.
-fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePopup) {
+fn draw_popup(
+    f: &mut Frame,
+    chat_area: Rect,
+    input_area: Rect,
+    popup: &ActivePopup,
+    theme: &Theme,
+) {
     if input_area.width == 0 || chat_area.height == 0 {
         return;
     }
@@ -342,7 +366,7 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
             // Inactive tree branches render dimmed; the highlight cursor
             // still inverts the row, so dimness never hides selection.
             let style = if popup.dim.get(idx).copied().unwrap_or(false) {
-                Style::new().fg(Color::DarkGray)
+                theme.text.muted
             } else {
                 Style::new()
             };
@@ -354,16 +378,11 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
             Block::new()
                 .borders(Borders::ALL)
                 .border_type(BOX_BORDER_TYPE)
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(theme.chrome.popup_border)
                 .title(format!(" {} ", popup.title))
-                .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                .title_style(theme.chrome.popup_title),
         )
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(theme.chrome.popup_cursor)
         .highlight_symbol("▸ ")
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Never);
     f.render_widget(Clear, area);
@@ -383,8 +402,14 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
 /// that partial boxes at the scroll edge clip row-by-row like any
 /// other content; the glyphs come from [`BOX_BORDER_TYPE`], matching
 /// the input box.
-fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer) -> MsgLayout {
-    if let ItemStyles::Bordered { content, border } = item_style(item.kind) {
+fn layout_item(
+    item: &ChatItem,
+    area_width: u16,
+    renderer: &dyn MessageRenderer,
+    theme: &Theme,
+) -> MsgLayout {
+    let styles = item_style(item.kind, theme);
+    if let ItemStyles::Bordered { content, border } = styles {
         // The box's right edge sits on the 4-column right margin, and
         // its width leaves at least the left margin intact, so user
         // messages share the assistant text column.
@@ -437,7 +462,7 @@ fn layout_item(item: &ChatItem, area_width: u16, renderer: &dyn MessageRenderer)
         };
     }
 
-    let ItemStyles::Unbordered { content } = item_style(item.kind) else {
+    let ItemStyles::Unbordered { content } = styles else {
         unreachable!("only User items are Bordered");
     };
     let x = SIDE_MARGIN.min(area_width);
@@ -475,23 +500,24 @@ enum ItemStyles {
     Unbordered { content: Style },
 }
 
-fn item_style(kind: ItemKind) -> ItemStyles {
+fn item_style(kind: ItemKind, theme: &Theme) -> ItemStyles {
+    let text = &theme.text;
     match kind {
         ItemKind::User => ItemStyles::Bordered {
-            content: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            border: Style::new().fg(Color::Green),
+            content: text.user,
+            border: text.user_border,
         },
         ItemKind::Assistant => ItemStyles::Unbordered {
-            content: ASSISTANT_BASE,
+            content: text.assistant,
         },
-        ItemKind::ToolStarted | ItemKind::ToolOk | ItemKind::Notice => ItemStyles::Unbordered {
-            content: Style::new().fg(Color::DarkGray),
-        },
+        ItemKind::ToolStarted | ItemKind::ToolOk | ItemKind::Notice => {
+            ItemStyles::Unbordered { content: text.tool }
+        }
         ItemKind::ToolErr => ItemStyles::Unbordered {
-            content: Style::new().fg(Color::Red),
+            content: text.error,
         },
         ItemKind::Error => ItemStyles::Unbordered {
-            content: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            content: text.error_emphasis,
         },
     }
 }
@@ -500,6 +526,8 @@ fn item_style(kind: ItemKind) -> ItemStyles {
 mod tests {
     use super::*;
     use harness_tui_markdown::MarkdownRenderer;
+    use harness_tui_state::theme::ThemeHandle;
+    use harness_tui_theme::ThemeService;
     use harness_tui_state::{
         app::{AppMsg, KeyEvent},
         render::PlainRenderer,
@@ -527,6 +555,12 @@ mod tests {
 
     fn markdown() -> MarkdownRenderer {
         MarkdownRenderer::default()
+    }
+
+    /// Built-in palette. Tests assert layout/geometry, so they pin the
+    /// default theme; theme *injection* is covered by the cache test below.
+    fn theme() -> Theme {
+        Theme::default()
     }
 
     #[test]
@@ -557,7 +591,7 @@ mod tests {
 
     #[test]
     fn user_box_shrinks_to_content_and_hugs_right_margin() {
-        let lay = layout_item(&user_item("hi"), 30, &plain());
+        let lay = layout_item(&user_item("hi"), 30, &plain(), &theme());
         // 4-wide box (borders + "hi") ending 4 columns from the edge,
         // with top border, text, and bottom border rows.
         assert_eq!((lay.x, lay.width, lay.height), (22, 4, 3));
@@ -566,7 +600,7 @@ mod tests {
 
     #[test]
     fn user_box_wraps_long_messages() {
-        let lay = layout_item(&user_item(&"ab ".repeat(20)), 30, &plain());
+        let lay = layout_item(&user_item(&"ab ".repeat(20)), 30, &plain(), &theme());
         // Box shares the assistant text column: 4-column margins.
         assert_eq!(lay.x, 4);
         assert_eq!(lay.x + lay.width, 26);
@@ -575,7 +609,7 @@ mod tests {
 
     #[test]
     fn assistant_text_has_side_margins() {
-        let lay = layout_item(&assistant_item("hello"), 30, &markdown());
+        let lay = layout_item(&assistant_item("hello"), 30, &markdown(), &theme());
         // 4-column margins on both sides of the text column.
         assert_eq!((lay.x, lay.width, lay.height), (4, 22, 1));
     }
@@ -594,12 +628,23 @@ mod tests {
         width: u16,
         height: u16,
     ) -> Vec<String> {
+        render_with(app, renderer, &theme(), width, height)
+    }
+
+    /// Same as [`render`], with an explicit palette.
+    fn render_with(
+        app: &mut App,
+        renderer: &dyn MessageRenderer,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
         use ratatui::{Terminal, backend::TestBackend};
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|f| draw(f, app, renderer))
+            .draw(|f| draw(f, app, renderer, theme))
             .expect("test draw");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -865,7 +910,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|f| draw_with_popup(f, app, renderer, popup))
+            .draw(|f| draw_with_popup(f, app, renderer, &theme(), popup))
             .expect("test draw");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -877,6 +922,80 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_different_theme_repaints_the_same_frame() {
+        // The point of the whole seam: identical state, different palette,
+        // different pixels -- with no change to the view's own code path.
+        use ratatui::style::Color;
+
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("hello".into()));
+        let baseline = render_with(&mut app, &plain(), &theme(), 30, 12);
+
+        let mut loud = Theme::default();
+        loud.text.assistant = Style::new().fg(Color::Red);
+        loud.chrome.input_border = Style::new().fg(Color::Green);
+        let recolored = render_with(&mut app, &plain(), &loud, 30, 12);
+
+        // Same glyphs, same geometry.
+        assert_eq!(baseline, recolored, "only colors should differ");
+    }
+
+    #[test]
+    fn a_live_theme_swap_repaints_the_transcript() {
+        // End-to-end through the real provider: the renderer and the view
+        // hold the *same* `ThemeHandle`, so `ThemeService::set` is the only
+        // thing that changes, and every cached layer (markdown rows, laid-out
+        // chat rows) must notice. This is the case hand-building two
+        // disagreeing themes cannot represent.
+        use ratatui::style::Color;
+
+        let service = std::sync::Arc::new(ThemeService::default_theme());
+        let handle = std::sync::Arc::new(ThemeHandle(std::sync::Arc::clone(&service) as _));
+        let renderer = MarkdownRenderer::new(handle.snapshot().text.assistant, handle.clone());
+
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("*hi*".into()));
+
+        let fgs = |cache: &mut LayoutCache| -> Vec<Color> {
+            cache
+                .layouts_for(app.items(), 30, &renderer, &handle.snapshot())
+                .flat_map(|l| l.lines.iter())
+                .flat_map(|l| l.spans.iter())
+                .filter_map(|s| s.style.fg)
+                .collect()
+        };
+
+        let mut cache = LayoutCache::new();
+        let before = fgs(&mut cache);
+
+        // Swap the palette on the live service; nothing else moves.
+        let mut loud = Theme::DEFAULT;
+        loud.markdown.emphasis = Style::new().fg(Color::Red);
+        loud.text.assistant = Style::new().fg(Color::Red);
+        service.set(loud);
+
+        let after = fgs(&mut cache);
+        assert_ne!(before, after, "cached rows must not survive a live swap: {before:?} {after:?}");
+    }
+
+    #[test]
+    fn layout_cache_still_reuses_rows_within_one_theme() {
+        let mut app = App::new();
+        app.update(AppMsg::Assistant("hello".into()));
+        let mut cache = LayoutCache::new();
+        let t = Theme::default();
+        let first: usize = cache
+            .layouts_for(app.items(), 30, &plain(), &t)
+            .map(|l| l.height)
+            .sum();
+        let second: usize = cache
+            .layouts_for(app.items(), 30, &plain(), &t)
+            .map(|l| l.height)
+            .sum();
+        assert_eq!(first, second);
     }
 
     #[test]

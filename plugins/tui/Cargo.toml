@@ -20,4 +20,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 harness-tui-markdown = { path = "../tui-markdown" }
+harness-tui-theme = { path = "../tui-theme" }
 harness-session = { path = "../session" }

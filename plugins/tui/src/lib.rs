@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use harness_contracts::{
     KEY_AGENT_LOOP, KEY_BRANCH_POPUP, KEY_COMMAND_POPUP, KEY_INPUT, KEY_MARKDOWN_RENDERER,
-    KEY_MODEL_POPUP, KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_TUI,
+    KEY_MODEL_POPUP, KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_THEME, KEY_TUI,
     SessionStoreHandle, SessionTreeHandle,
 };
 use harness_core::{Context, Result};
@@ -30,7 +30,10 @@ use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
 use harness_tui_branch::BranchPopup;
 use harness_tui_sessions::SessionPopup;
-use harness_tui_state::render::RendererHandle;
+use harness_tui_state::{
+    render::RendererHandle,
+    theme::ThemeHandle,
+};
 
 pub mod runtime;
 pub mod view;
@@ -45,6 +48,7 @@ pub struct Tui {
     sessions: Arc<SessionStoreHandle>,
     tree: Arc<SessionTreeHandle>,
     renderer: Arc<RendererHandle>,
+    theme: Arc<ThemeHandle>,
     input: Arc<Input>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
@@ -62,6 +66,7 @@ impl Tui {
         sessions: Arc<SessionStoreHandle>,
         tree: Arc<SessionTreeHandle>,
         renderer: Arc<RendererHandle>,
+        theme: Arc<ThemeHandle>,
         input: Arc<Input>,
         model_popup: Arc<ModelPopup>,
         command_popup: Arc<CommandPopup>,
@@ -76,6 +81,7 @@ impl Tui {
             sessions,
             tree,
             renderer,
+            theme,
             input,
             model_popup,
             command_popup,
@@ -95,6 +101,7 @@ impl Tui {
             self.sessions.clone(),
             self.tree.clone(),
             self.renderer.clone(),
+            self.theme.clone(),
             self.input.clone(),
             self.model_popup.clone(),
             self.command_popup.clone(),
@@ -127,6 +134,7 @@ impl harness_core::Plugin for TuiPlugin {
             .injects(KEY_AGENT_LOOP)
             .injects(KEY_SESSION_STORE)
             .injects(KEY_MARKDOWN_RENDERER)
+            .injects(KEY_THEME)
             .injects(KEY_INPUT)
             .injects(KEY_MODEL_POPUP)
             .injects(KEY_COMMAND_POPUP)
@@ -139,6 +147,7 @@ impl harness_core::Plugin for TuiPlugin {
         let agent_loop: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP)?;
         let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE)?;
         let renderer: Arc<RendererHandle> = ctx.inject_key(KEY_MARKDOWN_RENDERER)?;
+        let theme: Arc<ThemeHandle> = ctx.inject_key(KEY_THEME)?;
         let input: Arc<Input> = ctx.inject_key(KEY_INPUT)?;
         let model_popup: Arc<ModelPopup> = ctx.inject_key(KEY_MODEL_POPUP)?;
         let command_popup: Arc<CommandPopup> = ctx.inject_key(KEY_COMMAND_POPUP)?;
@@ -154,6 +163,7 @@ impl harness_core::Plugin for TuiPlugin {
                 sessions,
                 tree,
                 renderer,
+                theme,
                 input,
                 model_popup,
                 command_popup,

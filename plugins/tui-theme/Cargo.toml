@@ -1,0 +1,13 @@
+[package]
+name = "harness-tui-theme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness-contracts = { path = "../../contracts" }
+harness-core = { path = "../../core" }
+harness-tui-state = { path = "../tui-state" }
+ratatui.workspace = true
+
+[dev-dependencies]
+harness-config = { path = "../config" }

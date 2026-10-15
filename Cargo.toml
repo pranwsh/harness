@@ -20,6 +20,7 @@ members = [
     "plugins/shell",
     "plugins/mcp",
     "plugins/tui-state",
+    "plugins/tui-theme",
     "plugins/tui-markdown",
     "plugins/tui-input",
     "plugins/tui-popup",

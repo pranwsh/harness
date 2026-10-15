@@ -22,6 +22,7 @@ use harness_tui_sessions::SessionPopup;
 use harness_tui_state::{
     app::{App, AppMsg, KeyEvent},
     render::RendererHandle,
+    theme::ThemeHandle,
 };
 
 use crate::view::{self, LayoutCache};
@@ -50,6 +51,7 @@ pub async fn run(
     sessions: Arc<SessionStoreHandle>,
     tree: Arc<SessionTreeHandle>,
     renderer: Arc<RendererHandle>,
+    theme: Arc<ThemeHandle>,
     input: Arc<Input>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
@@ -65,6 +67,7 @@ pub async fn run(
         sessions,
         tree,
         renderer,
+        theme,
         input,
         model_popup,
         command_popup,
@@ -119,6 +122,10 @@ struct EventLoop {
     tree: Arc<SessionTreeHandle>,
     app: App,
     renderer: Arc<RendererHandle>,
+    /// Injected palette. Snapshotted once per frame (a `Copy` load) and
+    /// handed to the view, so a mid-frame swap cannot make two widgets in
+    /// the same frame disagree about the palette.
+    theme: Arc<ThemeHandle>,
     model_popup: Arc<ModelPopup>,
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
@@ -137,6 +144,7 @@ impl EventLoop {
         sessions: Arc<SessionStoreHandle>,
         tree: Arc<SessionTreeHandle>,
         renderer: Arc<RendererHandle>,
+        theme: Arc<ThemeHandle>,
         input: Arc<Input>,
         model_popup: Arc<ModelPopup>,
         command_popup: Arc<CommandPopup>,
@@ -157,6 +165,7 @@ impl EventLoop {
             tree,
             app: App::new(),
             renderer,
+            theme,
             model_popup,
             command_popup,
             session_popup,
@@ -181,12 +190,17 @@ impl EventLoop {
                 .or_else(|| self.session_popup.snapshot())
                 .or_else(|| self.branch_popup.snapshot())
                 .or_else(|| self.command_popup.snapshot());
+            // One palette snapshot for the whole frame: every widget in
+            // this draw sees the same styles even if the theme is swapped
+            // concurrently.
+            let theme = self.theme.snapshot();
             terminal
                 .draw(|f| {
                     view::draw_with_popup_cached(
                         f,
                         &mut self.app,
                         self.renderer.as_renderer(),
+                        &theme,
                         snapshot.as_ref(),
                         &mut self.layout_cache,
                     )
@@ -448,7 +462,10 @@ mod tests {
     use harness_core::Context;
     use harness_session::SessionLog;
     use harness_tui_state::app::ItemKind;
-    use harness_tui_state::render::{ASSISTANT_BASE, PlainRenderer};
+    use harness_tui_state::{
+        render::PlainRenderer,
+        theme::{Theme, ThemeHandle},
+    };
 
     struct Registry;
 
@@ -616,13 +633,15 @@ mod tests {
             models: vec!["m".into()],
             sessions: Mutex::new(vec![summary("past-1", "old chat")]),
         });
+        let theme = Theme::default();
         let events = EventLoop::new(
             agent_loop,
             "agent-1".to_owned(),
             "live-1".to_owned(),
             store,
             tree.clone(),
-            Arc::new(RendererHandle(Arc::new(PlainRenderer::new(ASSISTANT_BASE)))),
+            Arc::new(RendererHandle(Arc::new(PlainRenderer::new(theme.text.assistant)))),
+            Arc::new(ThemeHandle(Arc::new(theme))),
             Arc::new(Input),
             Arc::new(ModelPopup::new(
                 Arc::new(ModelCatalogHandle(catalog.clone() as Arc<dyn ModelCatalogApi>)),

@@ -14,7 +14,7 @@
 //! coupling):
 //! - TUI leaf shell (`tui`, `tui-model`, `tui-commands`, `tui-sessions`,
 //!   `tui-branch`, `tui-filter`, `tui-input`, `tui-markdown`, `tui-popup`,
-//!   `tui-state`):
+//!   `tui-state`, `tui-theme`):
 //!   the shell composes concrete TUI/loop crates it owns; e.g. `tui` → `harness-agent-loop` + `harness-tui-state`.
 //! - Hash hashing infra (`hashline-read`/`hashline-edit` → `hash-base`):
 //!   shared file-hashing library (pure line hashing + in-memory `HashStore`),
@@ -31,8 +31,8 @@ pub mod services;
 pub mod types;
 
 pub use config::{
-    AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, SessionConfig,
-    ShellConfig, SkillsConfig, default_max_iterations,
+AgentConfig, AppConfig, CodeThemeConfig, ColorSpec, ConfigError, LlmConfig, McpConfig, McpServerConfig, SessionConfig,
+ShellConfig, SkillsConfig, ThemeConfig, default_max_iterations,
 };
 pub use keys::*;
 pub use services::*;
