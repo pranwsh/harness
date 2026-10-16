@@ -1,8 +1,9 @@
 //! `hashline_read`: mmap-backed file read with stable per-line hashes.
 //!
-//! Returns a `¶path#REV:{rev}` header (plus a `lines a-b of N` suffix when
-//! paginated) then `{line}:{hash}|{content}` per line. Line numbers are
-//! absolute, so hashes work directly with `hashline_edit`.
+//! Default output is quiet: a `¶path#REV:{rev}` header (plus a
+//! `lines a-b of N` suffix when windowed) then `{line}: {content}`. Pass
+//! `hashes: true` for the edit-ready `{line}:{hash}|{content}` form used by
+//! `hashline_edit`. Line numbers are absolute in every mode.
 
 mod args;
 mod render;
@@ -47,13 +48,16 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn hashline_read_spec() -> ToolSpec {
     ToolSpec {
         name: "hashline_read".to_owned(),
-        description: "Mmap read with 4-char xxh3 line hashes. Returns ¶path#REV:{rev} header then {line}:{hash}|{content} per line. Paginate large files with 1-based offset and limit. Use hashes with hashline_edit.".to_owned(),
+        description: "Read a file (default: first 50 lines, quiet `line: content` rows). Header `¶path#REV:{rev}`; window suffix `lines a-b of N (next offset K)` when truncated. Options: offset/limit (1-based; limit<=0 = to EOF), hashes=true for edit-ready `line:hash|content` (needed for hashline_edit), grep=SUBSTR to filter, if_rev_match=REV to elide the body when unchanged. Errors clearly on directories.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Absolute or cwd-relative file path" },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based first line to render (default 1)" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Max lines to render (default all)" }
+                "limit": { "type": "integer", "description": "Max lines to render (default 50; <=0 means to EOF)" },
+                "hashes": { "type": "boolean", "description": "Emit edit-ready `line:hash|content` rows (default false)" },
+                "grep": { "type": "string", "description": "Only show lines containing this substring" },
+                "if_rev_match": { "type": "integer", "minimum": 0, "description": "Elide the body when the file rev equals this" }
             },
             "required": ["path"]
         }),
@@ -126,5 +130,19 @@ mod tests {
         };
         let err = tools.execute("a", "s", 1, call).await.unwrap_err();
         assert_eq!(err.tool, "hashline_read");
+    }
+
+    #[tokio::test]
+    async fn directory_is_a_clean_error() {
+        let ctx = ctx_with_plugins();
+        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+        let call = ToolCall {
+            id: "c4".into(),
+            name: "hashline_read".into(),
+            arguments: serde_json::json!({"path": std::env::temp_dir().display().to_string()})
+                .to_string(),
+        };
+        let err = tools.execute("a", "s", 1, call).await.unwrap_err();
+        assert!(err.message.contains("is a directory"), "got: {}", err.message);
     }
 }
