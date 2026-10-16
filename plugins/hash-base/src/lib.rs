@@ -393,8 +393,8 @@ impl HashStore {
     }
 
     /// Record a successful write: re-stat, bump the in-memory rev, report the
-    /// new head. Hashing itself is deferred to the next snapshot (untouched
-    /// lines are byte-identical).
+    /// new head (`OK path#REV:n ops=k`). Hashing itself is deferred to the next
+    /// snapshot (untouched lines are byte-identical).
     pub fn commit_write(
         &self,
         canonical: &Path,
@@ -409,6 +409,25 @@ impl HashStore {
         );
         Ok(format!(
             "OK {}#REV:{new_rev} ops={ops}",
+            canonical.display()
+        ))
+    }
+
+    /// Whole-file variant: reports `OK path#REV:n bytes=N` instead of an
+    /// op count, which is meaningless for a single wholesale write.
+    pub fn commit_write_bytes(
+        &self,
+        canonical: &Path,
+        len: u64,
+    ) -> Result<String, HashError> {
+        let meta = std::fs::metadata(canonical)?;
+        let new_rev = self.commit_rev(
+            canonical,
+            meta.modified().unwrap_or(UNIX_EPOCH),
+            meta.len(),
+        );
+        Ok(format!(
+            "OK {}#REV:{new_rev} bytes={len}",
             canonical.display()
         ))
     }

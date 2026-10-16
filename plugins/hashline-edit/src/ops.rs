@@ -1,15 +1,16 @@
 //! Batch operation envelope for `hashline_edit`.
 //!
 //! Two addressing families, serialized with an `op` discriminator:
-//!
 //! * hash ops — `set` / `insert` / `delete` / `replace`, anchored by 4-char
 //!   `hashline_read` tags (`"HEAD"` prepends for `insert`). Content-addressed:
 //!   identical lines can collide (`ambiguous`), tags shift every edit.
 //! * line ops — `set_n` / `insert_n` / `delete_n` / `replace_n`, anchored by
+//! * line ops — `set_n` / `insert_n` / `delete_n` / `replace_n`, anchored by
 //!   absolute 1-based line numbers from any `hashline_read` (quiet output has
 //!   them too). Preferred when you already know the numbers: no tag to copy,
-//!   nothing ambiguous.
-//! * `create` — new file only, fails if it exists.
+//!   nothing ambiguous. Caveat: a stale line number silently edits the wrong
+//!   line, while a stale rev/hash fails loudly — pass `rev` from your last
+//!   read when the file may be contested (another writer, long-lived numbers).
 //!
 //! Every op validates against one pre-write snapshot before anything touches
 //! disk. `rev` is optional: when present it is checked (stale-rev error on

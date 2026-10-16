@@ -48,12 +48,12 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn hashline_edit_spec() -> ToolSpec {
     ToolSpec {
         name: "hashline_edit".to_owned(),
-        description: "Edit a file atomically. Prefer line-number ops (no hashes needed): {op:set_n,line,content}|{op:insert_n,after,lines (after 0 prepends)}|{op:delete_n,start,end}|{op:replace_n,start,end,lines}. Hash ops (set/insert/delete/replace + create) take hash/after_hash/start_hash/end_hash from hashline_read. rev is optional (checked when present; omit for rev-less line edits). create makes a new file (fails if it exists). All ops validate first, apply bottom-up; rev bumps on success.".to_owned(),
+        description: "Edit a file atomically. Prefer line-number ops (no hashes needed): {op:set_n,line,content}|{op:insert_n,after,lines (after 0 prepends)}|{op:delete_n,start,end}|{op:replace_n,start,end,lines}. Hash ops (set/insert/delete/replace + create) take hash/after_hash/start_hash/end_hash from hashline_read. rev is optional (checked when present; omit for rev-less line edits). Pass rev from your last read when the file may be contested — a stale line number silently edits the wrong line, while a stale rev/hash fails loudly. create makes a new file (fails if it exists). All ops validate first, apply bottom-up; rev bumps on success.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "rev": { "type": "integer", "minimum": 0 },
+                "rev": { "type": "integer", "minimum": 0, "description": "Optional optimistic-concurrency check: must match current REV. Omit for rev-less line edits; pass it when the file may be contested" },
                 "ops": {
                     "type": "array",
                     "items": {

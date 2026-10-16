@@ -53,7 +53,7 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn file_write_spec() -> ToolSpec {
     ToolSpec {
         name: "file_write".to_owned(),
-        description: "Write a whole file atomically (no shell heredoc). Args {path, text, mode: create|overwrite (default create)}. create fails if the file exists; overwrite fails if missing (preserves mode). Parents must exist. Bumps REV; returns OK path#REV:n.".to_owned(),
+        description: "Write a whole file atomically (no shell heredoc). Args {path, text, mode: create|overwrite (default create)}. create fails if the file exists; overwrite fails if missing (preserves mode). Parents must exist. Bumps REV; returns OK path#REV:n bytes=N.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -129,7 +129,7 @@ fn write(store: &HashStore, a: &WriteArgs) -> std::result::Result<String, ToolEr
         .unwrap_or(false)
     {
         return Err(tool_err(format!(
-            "{} is a directory, not a file",
+            "{} is a directory, not a file; pass a file path (list it with `ls`)",
             a.path.display()
         )));
     }
@@ -165,12 +165,11 @@ fn write(store: &HashStore, a: &WriteArgs) -> std::result::Result<String, ToolEr
         None
     };
     let buf = a.text.as_bytes();
+    let len = buf.len() as u64;
     store
         .atomic_write(&canonical, parent, buf, perm, "file_write")
         .map_err(hash_to_tool)?;
-    store
-        .commit_write(&canonical, "file_write", 1)
-        .map_err(hash_to_tool)
+    store.commit_write_bytes(&canonical, len).map_err(hash_to_tool)
 }
 
 #[cfg(test)]
@@ -216,7 +215,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.contains("#REV:1"), "got: {out}");
+        assert!(out.contains("#REV:1 bytes=17"), "got: {out}");
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "a\nb 'quoted' $x;\n"
@@ -242,7 +241,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.contains("#REV:2"), "got: {out}");
+        assert!(out.contains("#REV:2 bytes=2"), "got: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "c\n");
         std::fs::remove_file(&p).ok();
     }
