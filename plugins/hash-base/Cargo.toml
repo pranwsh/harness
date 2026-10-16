@@ -11,3 +11,4 @@ memchr = "2"
 fs2 = "0.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror.workspace = true
+tempfile = "3"

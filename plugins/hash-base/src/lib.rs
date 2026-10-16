@@ -354,6 +354,65 @@ impl HashStore {
         Ok(f)
     }
 
+    /// Stage `buf` in a sibling temp file and rename over `canonical`, so a
+    /// crash never leaves a half-written file. Shared by `hashline_edit` and
+    /// `file_write` so both tools get the same atomicity story.
+    ///
+    /// `perm` preserves the existing mode for edits (best-effort); created
+    /// files take the umask default. `tool` names the caller for error text.
+    pub fn atomic_write(
+        &self,
+        canonical: &Path,
+        parent: &Path,
+        buf: &[u8],
+        perm: Option<std::fs::Permissions>,
+        tool: &str,
+    ) -> Result<(), HashError> {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+            HashError::WriteStage(format!(
+                "{tool}: cannot stage write in {}: {e}",
+                parent.display()
+            ))
+        })?;
+        if let Some(p) = perm
+            && let Err(e) = tmp.as_file().set_permissions(p)
+        {
+            eprintln!("{tool}: set_permissions failed (best-effort, mode may be wrong): {e}");
+        }
+        tmp.write_all(buf).map_err(|e| {
+            HashError::WriteStage(format!("{tool}: staged write failed: {e}"))
+        })?;
+        tmp.flush().map_err(|e| {
+            HashError::WriteStage(format!("{tool}: staged write failed: {e}"))
+        })?;
+        tmp.persist(canonical).map_err(|e| {
+            HashError::WriteStage(format!("{tool}: atomic rename failed: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// Record a successful write: re-stat, bump the in-memory rev, report the
+    /// new head. Hashing itself is deferred to the next snapshot (untouched
+    /// lines are byte-identical).
+    pub fn commit_write(
+        &self,
+        canonical: &Path,
+        _tool: &str,
+        ops: usize,
+    ) -> Result<String, HashError> {
+        let meta = std::fs::metadata(canonical)?;
+        let new_rev = self.commit_rev(
+            canonical,
+            meta.modified().unwrap_or(UNIX_EPOCH),
+            meta.len(),
+        );
+        Ok(format!(
+            "OK {}#REV:{new_rev} ops={ops}",
+            canonical.display()
+        ))
+    }
+
     /// Mmap + hash a file, updating the in-memory rev table (reads never
     /// bump the counter; first read creates `REV:0`).
     ///
@@ -362,6 +421,12 @@ impl HashStore {
     /// when the file is non-empty; empty files return an empty vec.
     pub fn snapshot(&self, path: &Path) -> Result<(FileSnapshot, Vec<u8>), HashError> {
         let canonical = self.canonicalize(path);
+        // On Linux `File::open` happily opens a directory and the failure only
+        // shows up later as an opaque `ENODEV` from `mmap`. Detect it here so
+        // callers get a plain "is a directory" message.
+        if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(HashError::IsDirectory(path.display().to_string()));
+        }
         let file = File::open(path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 HashError::NotFound(path.display().to_string())
@@ -506,6 +571,8 @@ pub enum HashError {
     Io(#[from] io::Error),
     #[error("file not found: {0}; check `path` and cwd")]
     NotFound(String),
+    #[error("{0} is a directory, not a file; pass a file path (list it with `ls`)")]
+    IsDirectory(String),
     #[error("invalid hash '{0}': expected 4 base62 chars [0-9A-Za-z]")]
     InvalidHash(String),
     #[error(
@@ -538,6 +605,8 @@ pub enum HashError {
         "external modification detected for {path} (mtime/len changed since last read); re-run hashline_read on \"{path}\" and retry {tool}"
     )]
     External { path: String, tool: String },
+    #[error("{0}")]
+    WriteStage(String),
 }
 
 // ---------------------------------------------------------------------------
