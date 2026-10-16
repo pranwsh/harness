@@ -79,7 +79,7 @@ Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --fla
       # Optional; omit a key (or set it to `null`) and the built-in default applies.
       session.enabled = true;
       skills.enabled = true;
-      theme.colors."text.user_border" = "green";
+      mcp.servers.fetch = { command = "npx"; args = [ "-y" "@modelcontextprotocol/server-fetch" ]; };
     };
   };
 }
