@@ -28,6 +28,14 @@
 #     at `$XDG_CONFIG_HOME/harness/config.toml` on its own, so when
 #     `settings` is set the module installs a wrapper that passes
 #     `--config <managed path>` for you.
+#
+# Secrets: anything in `settings` lands in the Nix store (world-readable),
+# so `llm.api_key` must not go there. Set `llmApiKeyFile` to a runtime
+# path instead (e.g. `/run/secrets/ninerouter_key`): the managed file then
+# carries a placeholder, and the wrapper substitutes the key into a `0600`
+# copy under `$XDG_RUNTIME_DIR` on each launch. Any `settings.llm.api_key`
+# is replaced by the placeholder before rendering, so it never reaches
+# the store -- just leave it out.
 {
   config,
   lib,
@@ -37,6 +45,17 @@
   cfg = config.programs.harness;
   toml = import ./toml.nix {inherit lib;};
   hasSettings = cfg.settings != {};
+  useKeyFile = cfg.llmApiKeyFile != null;
+
+  # Rendered as `llm.api_key` when `llmApiKeyFile` is set, so the real key
+  # never enters the Nix store. The wrapper replaces this literal string
+  # at runtime (plain string substitution, no regex).
+  apiKeyPlaceholder = "@@HARNESS_LLM_API_KEY@@";
+
+  effectiveSettings =
+    if useKeyFile
+    then lib.recursiveUpdate cfg.settings {llm.api_key = apiKeyPlaceholder;}
+    else cfg.settings;
 
   # Absolute path, so an `xdg.configHome` override is honoured instead of
   # writing to a hardcoded `~/.config`. Same directory the session/skills
@@ -45,19 +64,36 @@
 
   settingsFile =
     if hasSettings
-    then pkgs.writeText cfg.configFileName (toml cfg.settings + "\n")
+    then pkgs.writeText cfg.configFileName (toml effectiveSettings + "\n")
     else null;
 
   # Bare `harness` ignores a managed config (see header), so the package on
   # PATH is a wrapper whenever `settings` is set. `--config` is the only
   # flag the CLI accepts, and it takes a separate value, never `--config=PATH`.
   wrapped =
-    if hasSettings
+    if !hasSettings
+    then null
+    else if useKeyFile
     then
       pkgs.writeShellScriptBin "harness" ''
-        exec ${cfg.package}/bin/harness --config ${lib.escapeShellArg configPath} "$@"
+        set -u
+        template=${lib.escapeShellArg configPath}
+        keyFile=${lib.escapeShellArg cfg.llmApiKeyFile}
+        runtimeDir="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        out="$runtimeDir/harness/config.toml"
+        mkdir -p "$(dirname "$out")"
+        key="$(cat "$keyFile")" || exit 1
+        content="$(cat "$template")" || exit 1
+        content="''${content//${apiKeyPlaceholder}/$key}"
+        umask 077
+        printf '%s' "$content" > "$out.tmp"
+        mv -f "$out.tmp" "$out"
+        exec ${cfg.package}/bin/harness --config "$out" "$@"
       ''
-    else null;
+    else
+      pkgs.writeShellScriptBin "harness" ''
+        exec ${cfg.package}/bin/harness --config ${lib.escapeShellArg configPath} "$@"
+      '';
 
   installed =
     if hasSettings
@@ -75,6 +111,21 @@ in {
         The `harness` binary to install. Set automatically when importing
         the flake's `homeManagerModules.default`; set it explicitly when
         importing `modules/harness.nix` directly.
+      '';
+    };
+
+    llmApiKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/secrets/ninerouter_key";
+      description = ''
+        Runtime path to a file containing the LLM API key (e.g. a sops-nix
+        secret under `/run/secrets`). Must be a plain string: a `path`
+        value would be copied into the Nix store at eval time, defeating
+        the point. When set, `settings.llm.api_key` is replaced by a
+        placeholder before rendering (so it never reaches the store) and
+        the wrapper substitutes the key into a `0600` copy under
+        `$XDG_RUNTIME_DIR` on each launch.
       '';
     };
 
@@ -133,7 +184,9 @@ in {
         Required: `llm.base_url`, `llm.model` and `llm.api_key` have no
         serde defaults and a missing `[llm]` is a parse error, so `harness`
         exits at startup without them. Every other section defaults to
-        the built-in values and can be left out.
+        the built-in values and can be left out. When `llmApiKeyFile` is
+        set, `llm.api_key` here is replaced by a placeholder (use that
+        option instead; the value here would never reach the store).
 
         Setting this enables the generated file and the `--config`
         wrapper. Leave it at `{}` and neither is created, so `harness`
@@ -159,13 +212,18 @@ in {
         assertion = cfg.package != null;
         message = "programs.harness.package must be set: the flake's homeManagerModules.default sets it, a direct import of modules/harness.nix must set it explicitly.";
       }
+      {
+        assertion = !useKeyFile || hasSettings;
+        message = "programs.harness.llmApiKeyFile requires programs.harness.settings (the wrapper substitutes the key into the generated file).";
+      }
     ];
 
     home.packages = lib.mkIf (cfg.package != null) [installed];
 
     # `mkIf` keeps the file out of the generation entirely when `settings`
     # is unset, rather than linking an empty `config.toml` that fails to
-    # parse (`ConfigError::Empty`).
+    # parse (`ConfigError::Empty`). With `llmApiKeyFile` the file carries
+    # a placeholder; the wrapper substitutes the real key at runtime.
     xdg.configFile."harness/${cfg.configFileName}" = lib.mkIf hasSettings {
       source = settingsFile;
     };
