@@ -186,3 +186,27 @@ Consequence: interactive `sudo` (password entry) is unsupported by design.
 Use `sudo -n <cmd>` (fails fast without a prompt) or pre-auth the tty
 outside the harness. A password-popup flow (`tui-password` + `sudo -S` over
 a pipe) is possible but intentionally deferred — see issue notes.
+
+### Secrets (`llmApiKeyFile`)
+
+Anything in `settings` lands in the Nix store (world-readable), so don't
+put `llm.api_key` there. Set `programs.harness.llmApiKeyFile` to a runtime
+path (e.g. a sops-nix secret under `/run/secrets`) instead:
+
+```nix
+programs.harness = {
+  enable = true;
+  llmApiKeyFile = "/run/secrets/ninerouter_key";
+  settings.llm = {
+    base_url = "http://localhost:20128/v1";
+    model = "oc/muse-spark-1.3-contributor-free";
+    # No api_key here: the managed file carries a placeholder and the
+    # wrapper substitutes the real key into a `0600` copy under
+    # `$XDG_RUNTIME_DIR` on each launch.
+  };
+};
+```
+
+Any `settings.llm.api_key` is replaced by the placeholder before rendering,
+so it never reaches the store. `llmApiKeyFile` requires `settings` (there
+has to be a generated file to substitute into).
