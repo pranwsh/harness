@@ -14,7 +14,6 @@ tokio.workspace = true
 memmap2 = "0.9"
 memchr = "2"
 fs2 = "0.4"
-tempfile = "3"
 
 [dev-dependencies]
 harness-tools = { path = "../tools" }

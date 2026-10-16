@@ -48,7 +48,7 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn hashline_edit_spec() -> ToolSpec {
     ToolSpec {
         name: "hashline_edit".to_owned(),
-        description: "Batch edit by 4-char line hashes. Args {path, rev, ops:[{op:set,hash,content}|{op:insert,after_hash,lines}|{op:delete,start_hash,end_hash}|{op:replace,start_hash,end_hash,lines}|{op:create,lines}]}. after_hash HEAD prepends; create makes a new file (rev 0, fails if it exists). All hashes validated first, applied bottom-up atomically; rev bumps on success. Re-read on stale/unknown hash.".to_owned(),
+        description: "Edit a file atomically. Prefer line-number ops (no hashes needed): {op:set_n,line,content}|{op:insert_n,after,lines (after 0 prepends)}|{op:delete_n,start,end}|{op:replace_n,start,end,lines}. Hash ops (set/insert/delete/replace + create) take hash/after_hash/start_hash/end_hash from hashline_read. rev is optional (checked when present; omit for rev-less line edits). create makes a new file (fails if it exists). All ops validate first, apply bottom-up; rev bumps on success.".to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -59,19 +59,23 @@ pub fn hashline_edit_spec() -> ToolSpec {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "create"] },
+                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "set_n", "insert_n", "delete_n", "replace_n", "create"] },
                             "hash": { "type": "string" },
                             "content": { "type": "string" },
                             "after_hash": { "type": "string" },
                             "lines": { "type": "array", "items": { "type": "string" } },
                             "start_hash": { "type": "string" },
-                            "end_hash": { "type": "string" }
+                            "end_hash": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "after": { "type": "integer", "minimum": 0 },
+                            "start": { "type": "integer", "minimum": 1 },
+                            "end": { "type": "integer", "minimum": 1 }
                         },
                         "required": ["op"]
                     }
                 }
             },
-            "required": ["path", "rev", "ops"]
+            "required": ["path", "ops"]
         }),
     }
 }
@@ -163,6 +167,28 @@ mod tests {
         let out = tools.execute("a", "s", 1, call).await.unwrap();
         assert!(out.contains("#REV:2"), "got: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "A\nc\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn line_number_edit_without_rev_through_registry() {
+        let ctx = ctx_with_plugins();
+        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+        let p = tmpfile("reg-lineno");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        // No prior hashline_read, no rev, no hashes — just line numbers.
+        let call = ToolCall {
+            id: "c4".into(),
+            name: "hashline_edit".into(),
+            arguments: serde_json::json!({
+                "path": p.display().to_string(),
+                "ops": [{"op": "set_n", "line": 2, "content": "B"}],
+            })
+            .to_string(),
+        };
+        let out = tools.execute("a", "s", 1, call).await.unwrap();
+        assert!(out.starts_with("OK "), "got: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nB\nc\n");
         std::fs::remove_file(&p).ok();
     }
 }
