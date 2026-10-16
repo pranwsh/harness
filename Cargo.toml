@@ -14,6 +14,7 @@ members = [
     "plugins/hash-base",
     "plugins/hashline-read",
     "plugins/hashline-edit",
+    "plugins/file-write",
     "plugins/system-prompt",
     "plugins/agent-default-model",
     "plugins/agent-loop",

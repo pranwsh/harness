@@ -677,6 +677,7 @@ dependencies = [
  "harness-config",
  "harness-contracts",
  "harness-core",
+ "harness-file-write",
  "harness-hash-base",
  "harness-hashline-edit",
  "harness-hashline-read",
@@ -769,6 +770,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-file-write"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "harness-contracts",
+ "harness-core",
+ "harness-hash-base",
+ "harness-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "harness-hash-base"
 version = "0.1.0"
 dependencies = [
@@ -777,6 +792,7 @@ dependencies = [
  "harness-core",
  "memchr",
  "memmap2",
+ "tempfile",
  "thiserror 2.0.20",
  "xxhash-rust",
 ]
@@ -795,7 +811,6 @@ dependencies = [
  "memmap2",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 

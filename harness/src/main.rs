@@ -79,6 +79,11 @@ async fn run() -> Result<ExitCode> {
         "hashline-edit",
         harness_hashline_edit::HashlineEditPlugin
     );
+    load!(
+        ctx,
+        "file-write",
+        harness_file_write::FileWritePlugin
+    );
     {
         // Shell injects `config.app` + `tools.executor` via DI and parks
         // until both are ready; no ctor wiring needed.
