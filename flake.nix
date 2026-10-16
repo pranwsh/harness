@@ -19,9 +19,20 @@
     # `$XDG_CONFIG_HOME/harness/config.toml` from `programs.harness.settings`
     # and points the installed `harness` at it; see `modules/harness.nix` for
     # the caveats (the managed file is read-only, hence the `--config`
-    # wrapper). Merged into the outputs below, since `eachSystem` only emits
-    # the per-system ones.
-    hm.homeManagerModules.default = ./modules/harness.nix;
+    # wrapper). `modules/harness.nix` leaves `programs.harness.package` unset
+    # (with an assertion), so this wrapper supplies the flake package as its
+    # default. Import `modules/harness.nix` directly and you must set
+    # `programs.harness.package` yourself. Merged into the outputs below,
+    # since `eachSystem` only emits the per-system ones.
+    hm.homeManagerModules.default = {
+      config,
+      lib,
+      pkgs,
+      ...
+    }: {
+      imports = [./modules/harness.nix];
+      programs.harness.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+    };
   in
     # nixos-unstable (26.11+) dropped x86_64-darwin, so don't use eachDefaultSystem.
     flake-utils.lib.eachSystem

@@ -32,48 +32,49 @@
   config,
   lib,
   pkgs,
-  self,
   ...
 }: let
   cfg = config.programs.harness;
   toml = import ./toml.nix {inherit lib;};
+  hasSettings = cfg.settings != {};
 
-  # Absolute target, so an `xdg.configHome` override is honoured instead of
+  # Absolute path, so an `xdg.configHome` override is honoured instead of
   # writing to a hardcoded `~/.config`. Same directory the session/skills
   # plugins resolve their own dirs from.
   configPath = "${config.xdg.configHome}/harness/${cfg.configFileName}";
 
-  settingsFile = lib.mkIf (cfg.enable && cfg.settings != {}) (
-    pkgs.writeText cfg.configFileName (toml cfg.settings + "\n")
-  );
+  settingsFile =
+    if hasSettings
+    then pkgs.writeText cfg.configFileName (toml cfg.settings + "\n")
+    else null;
 
   # Bare `harness` ignores a managed config (see header), so the package on
   # PATH is a wrapper whenever `settings` is set. `--config` is the only
   # flag the CLI accepts, and it takes a separate value, never `--config=PATH`.
-  wrapped = lib.mkIf (cfg.enable && cfg.settings != {}) (
-    pkgs.writeShellScriptBin "harness" ''
-      exec ${cfg.package}/bin/harness --config ${lib.escapeShellArg configPath} "$@"
-    ''
-  );
+  wrapped =
+    if hasSettings
+    then
+      pkgs.writeShellScriptBin "harness" ''
+        exec ${cfg.package}/bin/harness --config ${lib.escapeShellArg configPath} "$@"
+      ''
+    else null;
 
-  # `mkIf` yields `false`, and a conditional would then have to type-check
-  # both arms, so select in `config` instead: the bare package when no
-  # settings are managed, the wrapper when there are.
   installed =
-    if cfg.settings == {}
-    then cfg.package
-    else wrapped;
+    if hasSettings
+    then wrapped
+    else cfg.package;
 in {
   options.programs.harness = {
     enable = lib.mkEnableOption "harness, the agent harness TUI";
 
     package = lib.mkOption {
-      type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      type = lib.types.nullOr lib.types.package;
+      default = null;
       defaultText = lib.literalExpression "harness.packages.\${pkgs.stdenv.hostPlatform.system}.default";
       description = ''
-        The `harness` binary to install. Defaults to this flake's
-        package for the host platform.
+        The `harness` binary to install. Set automatically when importing
+        the flake's `homeManagerModules.default`; set it explicitly when
+        importing `modules/harness.nix` directly.
       '';
     };
 
@@ -102,7 +103,7 @@ in {
           };
           skills = {
             enabled = true;
-            dir = "${config.xdg.configHome}/harness/skills";
+            dir = "''${config.xdg.configHome}/harness/skills";
           };
           shell = {
             default_timeout_ms = 30000;
@@ -112,14 +113,6 @@ in {
             max_jobs = 32;
             max_job_time_ms = 600000;
             max_job_output_bytes = 262144;
-          };
-          theme = {
-            colors = {
-              "text.user_border" = "green";
-              "text.error" = { fg = "red"; bg = "black"; };
-              "markdown.emphasis" = "220";
-            };
-            code.name = "base16-eighties.dark";
           };
           mcp = {
             servers = {
@@ -135,7 +128,7 @@ in {
       description = ''
         Contents of the config file, as an attrset mirroring the sections
         in `config.example.toml` (`llm`, `agent`, `session`, `skills`,
-        `shell`, `theme`, `mcp`).
+        `shell`, `mcp`).
 
         Required: `llm.base_url`, `llm.model` and `llm.api_key` have no
         serde defaults and a missing `[llm]` is a parse error, so `harness`
@@ -161,13 +154,19 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [installed];
+    assertions = [
+      {
+        assertion = cfg.package != null;
+        message = "programs.harness.package must be set: the flake's homeManagerModules.default sets it, a direct import of modules/harness.nix must set it explicitly.";
+      }
+    ];
+
+    home.packages = lib.mkIf (cfg.package != null) [installed];
 
     # `mkIf` keeps the file out of the generation entirely when `settings`
     # is unset, rather than linking an empty `config.toml` that fails to
     # parse (`ConfigError::Empty`).
-    xdg.configFile."harness/${cfg.configFileName}" = lib.mkIf (cfg.settings != {}) {
-      target = configPath;
+    xdg.configFile."harness/${cfg.configFileName}" = lib.mkIf hasSettings {
       source = settingsFile;
     };
   };
