@@ -14,28 +14,28 @@
 # `settings` is the config file as an attrset (see `config.example.toml`),
 # rendered by `modules/toml.nix`.
 #
-# Two things worth knowing before using it:
+# The generated file is a read-only *template* in the store, never the file
+# `harness` runs against: the app persists a `/model` choice by rewriting
+# `[llm] model` in place (`ConfigService::save`) and a store path is
+# read-only. The module installs a wrapper that materialises a writable
+# config from the template and points `--config` at it, so what Nix
+# declares is the source of truth for every setting *except* `model`,
+# which the app owns. Concretely:
 #
-#   * The file is managed, i.e. a symlink into the Nix store, and the model
-#     popup persists a choice by rewriting `[llm] model` in place
-#     (`ConfigService::save`). Against a store symlink that write always
-#     fails: the choice applies for the session and the notice reads
-#     "config save failed". Expected, not a bug -- set `settings.llm.model`
-#     and re-run `home-manager switch` to change it.
-#   * `harness` resolves its config as `./config.toml` in the current
-#     working directory, with no XDG fallback (see
-#     `plugins/config/src/lib.rs`). It therefore cannot find a file managed
-#     at `$XDG_CONFIG_HOME/harness/config.toml` on its own, so when
-#     `settings` is set the module installs a wrapper that passes
-#     `--config <managed path>` for you.
+#   * no `llmApiKeyFile` -- the live file is regenerated from the template
+#     on each launch (Nix edits take effect on `home-manager switch`) while
+#     the previously chosen model is carried over.
+#   * with `llmApiKeyFile` -- the key is substituted into a `0600` copy
+#     under `$XDG_RUNTIME_DIR` (tmpfs) and the app runs against that; on
+#     exit the chosen model is copied to a keyless sidecar at the config
+#     path. The key never lands on durable disk.
 #
 # Secrets: anything in `settings` lands in the Nix store (world-readable),
 # so `llm.api_key` must not go there. Set `llmApiKeyFile` to a runtime
-# path instead (e.g. `/run/secrets/ninerouter_key`): the managed file then
-# carries a placeholder, and the wrapper substitutes the key into a `0600`
-# copy under `$XDG_RUNTIME_DIR` on each launch. Any `settings.llm.api_key`
-# is replaced by the placeholder before rendering, so it never reaches
-# the store -- just leave it out.
+# path instead (e.g. `/run/secrets/ninerouter_key`): the template then
+# carries a placeholder and the wrapper substitutes the real key at
+# launch. Any `settings.llm.api_key` is replaced by the placeholder before
+# rendering, so it never reaches the store -- just leave it out.
 {
   config,
   lib,
@@ -60,8 +60,11 @@
   # Absolute path, so an `xdg.configHome` override is honoured instead of
   # writing to a hardcoded `~/.config`. Same directory the session/skills
   # plugins resolve their own dirs from.
-  configPath = "${config.xdg.configHome}/harness/${cfg.configFileName}";
+  liveConfigPath = "${config.xdg.configHome}/harness/${cfg.configFileName}";
 
+  # The generated config is a *template* in the store: read-only, carrying
+  # the key placeholder when `llmApiKeyFile` is set. It is never the file
+  # `harness` runs against (see `wrapped`).
   settingsFile =
     if hasSettings
     then pkgs.writeText cfg.configFileName (toml effectiveSettings + "\n")
@@ -70,6 +73,16 @@
   # Bare `harness` ignores a managed config (see header), so the package on
   # PATH is a wrapper whenever `settings` is set. `--config` is the only
   # flag the CLI accepts, and it takes a separate value, never `--config=PATH`.
+  #
+  # The app persists `/model` by rewriting the `model` line in the file it
+  # was given (`ConfigService::save`), so it must be handed a *writable*
+  # file, never the store: with `llmApiKeyFile` the wrapper materialises the
+  # key-substituted config under `$XDG_RUNTIME_DIR` (tmpfs, `0600`) -- the
+  # key stays off disk exactly as before -- and copies the chosen model back
+  # onto the keyless template afterwards; without it the live file is
+  # regenerated from the template (carrying the previous model) on every
+  # launch. Either way a `home-manager switch` rolls every setting except
+  # `model`, which the app owns.
   wrapped =
     if !hasSettings
     then null
@@ -77,22 +90,73 @@
     then
       pkgs.writeShellScriptBin "harness" ''
         set -u
-        template=${lib.escapeShellArg configPath}
+        template=${lib.escapeShellArg settingsFile}
+        live=${lib.escapeShellArg liveConfigPath}
         keyFile=${lib.escapeShellArg cfg.llmApiKeyFile}
         runtimeDir="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
         out="$runtimeDir/harness/config.toml"
-        mkdir -p "$(dirname "$out")"
-        key="$(cat "$keyFile")" || exit 1
+        mkdir -p "$(dirname "$out")" "$(dirname "$live")"
+
+        # sed-escape a replacement value (backslash, `&` and the `|` delimiter).
+        esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+        # Carry the last persisted `/model` choice from the sidecar onto the
+        # fresh template (the line is the durable record; only `model` moves).
+        prev=""
+        if [ -f "$live" ]; then
+          prev="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$live" | tail -n 1)"
+        fi
         content="$(cat "$template")" || exit 1
+        if [ -n "$prev" ]; then
+          p_esc="$(esc "$prev")"
+          content="$(printf '%s\n' "$content" | sed "0,/^[[:space:]]*model[[:space:]]*=[[:space:]]*.*$/s||model = \"$p_esc\"|")"
+        fi
+
+        # Key into a 0600 tmpfs copy, unchanged in posture.
+        key="$(cat "$keyFile")" || exit 1
         content="''${content//${apiKeyPlaceholder}/$key}"
         umask 077
         printf '%s' "$content" > "$out.tmp"
         mv -f "$out.tmp" "$out"
-        exec ${cfg.package}/bin/harness --config "$out" "$@"
+
+        # Run against the writable tmpfs copy so `/model` persists there.
+        ${cfg.package}/bin/harness --config "$out" "$@"
+        status=$?
+
+        # Publish the chosen model onto the keyless template; the durable
+        # sidecar never contains the key.
+        if [ -f "$out" ]; then
+          model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$out" | tail -n 1)"
+          if [ -n "$model" ]; then
+            m_esc="$(esc "$model")"
+            sed "0,/^[[:space:]]*model[[:space:]]*=[[:space:]]*.*$/s||model = \"$m_esc\"|" "$template" > "$live.tmp"
+            mv -f "$live.tmp" "$live"
+          fi
+        fi
+        exit $status
       ''
     else
       pkgs.writeShellScriptBin "harness" ''
-        exec ${cfg.package}/bin/harness --config ${lib.escapeShellArg configPath} "$@"
+        set -u
+        template=${lib.escapeShellArg settingsFile}
+        live=${lib.escapeShellArg liveConfigPath}
+        mkdir -p "$(dirname "$live")"
+
+        # Regenerate the live file from the template each launch, so Nix
+        # changes propagate; keep the previous `/model` choice, which the
+        # app owns and rewrites in place.
+        prev=""
+        if [ -f "$live" ]; then
+          prev="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$live" | tail -n 1)"
+        fi
+        content="$(cat "$template")" || exit 1
+        if [ -n "$prev" ]; then
+          p_esc="$(printf '%s' "$prev" | sed -e 's/[\\&|]/\\&/g')"
+          content="$(printf '%s\n' "$content" | sed "0,/^[[:space:]]*model[[:space:]]*=[[:space:]]*.*$/s||model = \"$p_esc\"|")"
+        fi
+        printf '%s' "$content" > "$live.tmp" && mv -f "$live.tmp" "$live"
+
+        exec ${cfg.package}/bin/harness --config "$live" "$@"
       '';
 
   installed =
@@ -125,7 +189,8 @@ in {
         the point. When set, `settings.llm.api_key` is replaced by a
         placeholder before rendering (so it never reaches the store) and
         the wrapper substitutes the key into a `0600` copy under
-        `$XDG_RUNTIME_DIR` on each launch.
+        `$XDG_RUNTIME_DIR` that the app runs against; the persisted model
+        is copied back to a keyless copy at the config path on exit.
       '';
     };
 
@@ -188,9 +253,12 @@ in {
         set, `llm.api_key` here is replaced by a placeholder (use that
         option instead; the value here would never reach the store).
 
-        Setting this enables the generated file and the `--config`
-        wrapper. Leave it at `{}` and neither is created, so `harness`
-        keeps reading `./config.toml` from the cwd.
+        Setting this installs the `--config` wrapper and a generated
+        template; the file the app runs against is materialised from the
+        template at launch (see the module header), so Nix stays the
+        source of truth for every setting except `model`. Leave this at
+        `{}` and no wrapper or file is created, so `harness` keeps reading
+        `./config.toml` from the cwd.
       '';
     };
 
@@ -220,12 +288,11 @@ in {
 
     home.packages = lib.mkIf (cfg.package != null) [installed];
 
-    # `mkIf` keeps the file out of the generation entirely when `settings`
-    # is unset, rather than linking an empty `config.toml` that fails to
-    # parse (`ConfigError::Empty`). With `llmApiKeyFile` the file carries
-    # a placeholder; the wrapper substitutes the real key at runtime.
-    xdg.configFile."harness/${cfg.configFileName}" = lib.mkIf hasSettings {
-      source = settingsFile;
-    };
+    # No `xdg.configFile` here: the config path is deliberately *not*
+    # managed. The app rewrites `model` in place (`ConfigService::save`)
+    # and a store symlink is read-only, while home-manager would clobber
+    # a writable file on every switch. The wrapper materialises the live
+    # file from the store template instead (see `wrapped`), so a switch
+    # rolls every setting except the app-owned `model`.
   };
 }

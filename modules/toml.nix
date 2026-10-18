@@ -31,11 +31,19 @@
   delChar = builtins.fromJSON "\"\\u007f\"";
   fixDel = s: builtins.replaceStrings [delChar] ["\\u007F"] s;
 
-  # Always quoted, so a key means exactly what it says. Unquoted,
-  # `text.user_border` would be read as a nested `text` table and the
-  # whole config would fail to parse.
+  # `builtins.toJSON`-style quoting for string *values* (see above). Keys
+  # get the same escaping only when they must be quoted.
   quoteString = v: fixDel (builtins.toJSON v);
-  quoteKey = k: quoteString k;
+
+  # TOML bare keys are `[A-Za-z0-9_-]+`. Emit those bare so the in-place
+  # `model` writer (`plugins/config/src/lib.rs`) can find a literal `[llm]`
+  # header and `model = …` line; quote anything else, where an unquoted key
+  # would be read as a dotted path (`text.user_border` -> nested table).
+  bareKeyRe = "[A-Za-z0-9_-]+";
+  renderKey = k:
+    if builtins.match bareKeyRe k != null
+    then k
+    else quoteString k;
 
   isScalar = v: builtins.isString v || builtins.isInt v || builtins.isFloat v || builtins.isBool v;
 
@@ -74,8 +82,8 @@
     subtables = builtins.filter (e: builtins.isAttrs e.value) entries;
     unsupported = builtins.filter (e: !(isScalar e.value || builtins.isList e.value || builtins.isAttrs e.value)) entries;
     badLists = builtins.filter (e: !isListOfScalars e.value) lists;
-    ownScalars = lib.map (e: "${quoteKey e.name} = ${renderScalar e.value}") scalars;
-    ownLists = lib.map (e: "${quoteKey e.name} = ${renderList e.value}") lists;
+    ownScalars = lib.map (e: "${renderKey e.name} = ${renderScalar e.value}") scalars;
+    ownLists = lib.map (e: "${renderKey e.name} = ${renderList e.value}") lists;
     own =
       if unsupported != []
       then throw "harness: cannot render `${(builtins.head unsupported).name}` as TOML (unsupported ${builtins.typeOf (builtins.head unsupported).value}; expected string, int, float, bool, list of those, or table)"
@@ -92,7 +100,7 @@
     result =
       if path == [] || (own == "" && children != [])
       then body
-      else "[${lib.concatStringsSep "." (lib.map quoteKey path)}]\n${body}";
+      else "[${lib.concatStringsSep "." (lib.map renderKey path)}]\n${body}";
   in
     result;
 in
