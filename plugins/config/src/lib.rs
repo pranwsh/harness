@@ -11,10 +11,35 @@ use harness_core::{Context, Plugin};
 // `use harness_contracts::AppConfig`.
 pub use harness_contracts::{AgentConfig, AppConfig, ConfigError, LlmConfig, McpConfig, McpServerConfig, SessionConfig, ShellConfig, SkillsConfig};
 
+/// Fallback when no home directory is resolvable (relative to cwd).
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
-/// Config lives at `./config.toml` (cwd-relative) only.
+/// Resolves the config file: `$XDG_CONFIG_HOME/harness/config.toml`, else
+/// `$HOME/.config/harness/config.toml`, else `./config.toml` (cwd-relative)
+/// when neither env var is usable. Overridable with `harness --config PATH`.
 pub fn config_path() -> String {
+    config_path_from(
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Pure half of [`config_path`], so the precedence is unit-testable without
+/// mutating the process environment. Empty values count as unset (a bare
+/// `XDG_CONFIG_HOME=` in the environment must not resolve to `harness/`).
+pub fn config_path_from(xdg_config_home: Option<String>, home: Option<String>) -> String {
+    if let Some(xdg) = xdg_config_home.filter(|d| !d.is_empty()) {
+        return PathBuf::from(xdg)
+            .join("harness/config.toml")
+            .to_string_lossy()
+            .into_owned();
+    }
+    if let Some(home) = home.filter(|d| !d.is_empty()) {
+        return PathBuf::from(home)
+            .join(".config/harness/config.toml")
+            .to_string_lossy()
+            .into_owned();
+    }
     DEFAULT_CONFIG_PATH.to_owned()
 }
 
@@ -283,6 +308,24 @@ max_iterations = 3
         let cfg = AppConfig::from_toml(RAW, "test").unwrap();
         assert_eq!(cfg.llm.model, "test-model");
         assert_eq!(cfg.agent.max_iterations, 3);
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_then_home_then_cwd() {
+        assert_eq!(
+            config_path_from(Some("/xdg".into()), Some("/home/u".into())),
+            "/xdg/harness/config.toml"
+        );
+        assert_eq!(
+            config_path_from(None, Some("/home/u".into())),
+            "/home/u/.config/harness/config.toml"
+        );
+        // Empty values count as unset rather than resolving to `harness/`.
+        assert_eq!(
+            config_path_from(Some(String::new()), Some("/home/u".into())),
+            "/home/u/.config/harness/config.toml"
+        );
+        assert_eq!(config_path_from(None, None), DEFAULT_CONFIG_PATH);
     }
 
     #[test]

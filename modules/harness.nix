@@ -257,8 +257,10 @@ in {
         template; the file the app runs against is materialised from the
         template at launch (see the module header), so Nix stays the
         source of truth for every setting except `model`. Leave this at
-        `{}` and no wrapper or file is created, so `harness` keeps reading
-        `./config.toml` from the cwd.
+        `{}` and no wrapper or file is created; `harness` then reads
+        `$XDG_CONFIG_HOME/harness/config.toml` (else
+        `$HOME/.config/harness/config.toml`, else `./config.toml`) on its
+        own.
       '';
     };
 

@@ -266,7 +266,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .title_style(
             Style::new()
-                .fg(if busy { Color::Yellow } else { Color::Blue })
+                .fg(if busy { Color::Red } else { Color::Blue })
                 .add_modifier(Modifier::BOLD),
         );
     let inner = block.inner(area);
@@ -838,7 +838,6 @@ mod tests {
         assert!(input[1].contains("ab"), "first line: {input:?}");
         assert!(input[2].contains("cd"), "second line: {input:?}");
     }
-
 
     #[test]
     fn input_box_has_one_column_side_margins() {

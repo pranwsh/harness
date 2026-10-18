@@ -89,7 +89,7 @@ Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --fla
 
 Two things worth knowing:
 
-- **`harness` is wrapped.** The app resolves config as `./config.toml` in the *current directory*, with no XDG fallback (`plugins/config/src/lib.rs`), so it cannot find a file managed at `$XDG_CONFIG_HOME/harness/config.toml` on its own. The module installs a wrapper that passes `--config` for you. Unset `settings` and you get the plain binary plus no managed file.
+- **`harness` is wrapped.** The app resolves config as `$XDG_CONFIG_HOME/harness/config.toml`, else `$HOME/.config/harness/config.toml`, with a `./config.toml` cwd fallback when neither env var is usable (`plugins/config/src/lib.rs`). A file managed at `$XDG_CONFIG_HOME/harness/config.toml` is found on its own, but the module still installs a wrapper that passes the explicit `--config` (so a custom `xdg.configHome` and a non-default `configFileName` are honoured). Unset `settings` and you get the plain binary plus no managed file.
 - **`settings` is the source of truth for everything except `model`.** The generated file is a read-only *template* in the store; the wrapper materialises a writable live file from it at launch, so the model popup's in-place `[llm] model` rewrite (which a store path would reject) lands on a real file. A `/model` pick persists across restarts, and a `home-manager switch` rolls every other setting while keeping your chosen model. Without `llmApiKeyFile` the live file is `$XDG_CONFIG_HOME/harness/config.toml`; with it, the app runs against a `0600` copy under `$XDG_RUNTIME_DIR` (the key stays off disk) and the chosen model is copied back to a keyless copy at the config path.
 
 With `settings` unset the module changes nothing beyond installing the package, which is the same as the `home.packages` snippet above.
@@ -127,13 +127,14 @@ Checks: `nix flake check` (build + clippy `--deny warnings` + tests).
 
 Configure:
 
-```sh
-cp config.example.toml ./config.toml
-# then edit ./config.toml
+mkdir -p ~/.config/harness
+cp config.example.toml ~/.config/harness/config.toml
+# then edit ~/.config/harness/config.toml
 ```
 
-Config resolution: `./config.toml` (cwd-relative) by default, or pass an
-explicit path:
+Config resolution: `$XDG_CONFIG_HOME/harness/config.toml`, else
+`$HOME/.config/harness/config.toml`, else `./config.toml` (cwd-relative),
+or pass an explicit path:
 
 ```sh
 harness --config PATH

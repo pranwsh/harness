@@ -66,8 +66,8 @@ async fn run() -> Result<ExitCode> {
     );
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
-    load!(ctx, "skills", harness_skills::SkillsPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);
+    load!(ctx, "skills", harness_skills::SkillsPlugin);
     load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
     load!(
         ctx,
@@ -79,11 +79,7 @@ async fn run() -> Result<ExitCode> {
         "hashline-edit",
         harness_hashline_edit::HashlineEditPlugin
     );
-    load!(
-        ctx,
-        "file-write",
-        harness_file_write::FileWritePlugin
-    );
+    load!(ctx, "file-write", harness_file_write::FileWritePlugin);
     {
         // Shell injects `config.app` + `tools.executor` via DI and parks
         // until both are ready; no ctor wiring needed.
@@ -112,21 +108,13 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "tui-popup", harness_tui_popup::TuiPopupPlugin);
     load!(ctx, "tui-model", harness_tui_model::TuiModelPlugin);
     load!(ctx, "tui-commands", harness_tui_commands::TuiCommandsPlugin);
-    load!(
-        ctx,
-        "tui-sessions",
-        harness_tui_sessions::TuiSessionsPlugin
-    );
+    load!(ctx, "tui-sessions", harness_tui_sessions::TuiSessionsPlugin);
     load!(ctx, "tui-branch", harness_tui_branch::TuiBranchPlugin);
     // Fresh session every launch; past sessions resume via `/sessions`.
     // The id is minted at the composition root so the TUI and any future
     // headless front-ends share one generation point.
     let session_id = harness_session::SessionLog::fresh_id();
-    load!(
-        ctx,
-        "tui",
-        harness_tui::TuiPlugin::new(done_tx, session_id)
-    );
+    load!(ctx, "tui", harness_tui::TuiPlugin::new(done_tx, session_id));
 
     let tui: Arc<harness_tui::Tui> = ctx.inject_key(KEY_TUI)?;
 
