@@ -87,10 +87,10 @@ Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --fla
 
 `settings` mirrors the sections in `config.example.toml`. Only `llm.base_url`, `llm.model` and `llm.api_key` are required — a missing `[llm]` is a parse error and `harness` exits at startup.
 
-Two caveats:
+Two things worth knowing:
 
-- **The generated file is read-only.** It is a symlink into the Nix store, and the model popup persists a choice by rewriting `[llm] model` in place. That write fails against a store path; the choice still applies for the session and the notice reads `config save failed`. Change `settings.llm.model` and re-run `home-manager switch` to persist it.
-- **`harness` is wrapped.** The app resolves config as `./config.toml` in the *current directory*, with no XDG fallback (`plugins/config/src/lib.rs`), so it cannot find a file managed at `$XDG_CONFIG_HOME/harness/config.toml` on its own. The module therefore installs a wrapper that passes `--config` for you. Unset `settings` and you get the plain binary plus no managed file.
+- **`harness` is wrapped.** The app resolves config as `./config.toml` in the *current directory*, with no XDG fallback (`plugins/config/src/lib.rs`), so it cannot find a file managed at `$XDG_CONFIG_HOME/harness/config.toml` on its own. The module installs a wrapper that passes `--config` for you. Unset `settings` and you get the plain binary plus no managed file.
+- **`settings` is the source of truth for everything except `model`.** The generated file is a read-only *template* in the store; the wrapper materialises a writable live file from it at launch, so the model popup's in-place `[llm] model` rewrite (which a store path would reject) lands on a real file. A `/model` pick persists across restarts, and a `home-manager switch` rolls every other setting while keeping your chosen model. Without `llmApiKeyFile` the live file is `$XDG_CONFIG_HOME/harness/config.toml`; with it, the app runs against a `0600` copy under `$XDG_RUNTIME_DIR` (the key stays off disk) and the chosen model is copied back to a keyless copy at the config path.
 
 With `settings` unset the module changes nothing beyond installing the package, which is the same as the `home.packages` snippet above.
 
