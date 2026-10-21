@@ -164,13 +164,8 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         ));
     }
 
-    // 1. External-modification guard *before* re-hashing, plus the optional
-    //    optimistic-concurrency check: `rev` supplied => must match.
-    if let Some(want) = a.rev {
-        store
-            .check_rev(&canonical, want, "hashline_edit")
-            .map_err(hash_to_tool)?;
-    }
+    // 1. External-modification guard *before* re-hashing: did the bytes move
+    //    under us since we last looked?
     let disk_meta = std::fs::metadata(&canonical).map_err(|e| {
         hash_to_tool(if e.kind() == std::io::ErrorKind::NotFound {
             HashError::NotFound(canonical.display().to_string())
@@ -184,13 +179,46 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         .check_external(&canonical, disk_mtime, disk_len, "hashline_edit")
         .map_err(hash_to_tool)?;
 
-    // 2. Fresh snapshot (re-hashes; updates mtime/len, keeps rev).
+    // 2. Remember the rev a caller's line numbers were most likely read at.
+    //    Reading it *before* the snapshot matters: snapshotting marks a fresh
+    //    caller-visible view, which would erase the very gap we want to catch.
+    let read_rev = store.read_rev(&canonical);
+    //    Fresh snapshot. This is the authoritative revision: it re-hashes the
+    //    bytes we are about to edit, so both the `rev` check and the
+    //    line-number guard compare against what we actually see.
     let (snap, bytes) = store.snapshot(&canonical).map_err(hash_to_tool)?;
     if let Some(want) = a.rev {
+        store
+            .check_rev(&canonical, want, "hashline_edit")
+            .map_err(hash_to_tool)?;
         debug_assert_eq!(snap.rev, want);
     }
 
-    // 3. Resolve + validate every op before touching disk.
+    // 3. Line-number ops are addressed against whatever the caller last read.
+    //    If we have edited since then, those numbers may point at the wrong
+    //    lines and nothing else would catch it (our own writes keep the
+    //    external-modification guard quiet). Fail loudly instead of
+    //    silently editing the wrong line.
+    let uses_line_numbers = a.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::SetN { .. } | Op::InsertN { .. } | Op::DeleteN { .. } | Op::ReplaceN { .. }
+        )
+    });
+    if uses_line_numbers
+        && let Some(seen) = read_rev
+        && seen != snap.rev
+    {
+        return Err(crate::tool_err(format!(
+            "line-number ops are addressed against a read at REV:{seen}, \
+             but {path} is now REV:{rev}; re-read the file and retry with fresh numbers, \
+             or address the lines by hash instead",
+            path = canonical.display(),
+            rev = snap.rev,
+        )));
+    }
+
+    // 4. Resolve + validate every op before touching disk.
     let mut resolved: Vec<Resolved> = Vec::with_capacity(a.ops.len());
     for op in &a.ops {
         match op {
@@ -456,6 +484,9 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
     let parent = canonical
         .parent()
         .ok_or_else(|| crate::tool_err("path has no parent"))?;
+    // Fold exactly the bytes we are writing, so the rev table agrees with the
+    // next read instead of needing a re-hash to notice a change.
+    let digest = store.fold_bytes(&buf);
     store
         .atomic_write(
             &canonical,
@@ -466,7 +497,7 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         )
         .map_err(hash_to_tool)?;
     store
-        .commit_write(&canonical, "hashline_edit", a.ops.len())
+        .commit_write(&canonical, digest, buf.len() as u64, a.ops.len())
         .map_err(hash_to_tool)
 }
 
@@ -510,11 +541,12 @@ fn create(store: &HashStore, canonical: &Path, a: &Args) -> std::result::Result<
             "file already exists: create is only for new files",
         ));
     }
+    let digest = store.fold_bytes(&buf);
     store
         .atomic_write(canonical, parent, &buf, None, "hashline_edit")
         .map_err(hash_to_tool)?;
     store
-        .commit_write(canonical, "hashline_edit", 1)
+        .commit_write(canonical, digest, buf.len() as u64, 1)
         .map_err(hash_to_tool)
 }
 #[cfg(test)]
@@ -929,6 +961,90 @@ mod tests {
         let err = apply(&store, &stale).unwrap_err();
         assert!(err.message.contains("stale"), "got: {}", err.message);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "b\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The silent-mis-edit case: read, edit, then reuse the *old* line
+    /// numbers with no `rev`. The bytes moved under those numbers, so this
+    /// must fail loudly rather than edit line 1 of a file it never saw.
+    #[test]
+    fn line_number_ops_after_a_prior_edit_are_refused() {
+        let store = HashStore::new();
+        let p = tmpfile("lineno-reread");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        // Read establishes REV:0 and makes the caller's numbers "current".
+        store.snapshot(&p).unwrap();
+
+        // First edit lands fine (addressed against REV:0).
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::InsertN {
+                    after: 0,
+                    lines: vec!["top".into()],
+                }],
+            },
+        )
+        .unwrap();
+
+        // Second edit reuses the pre-insert numbering (line 2 == "b"), which
+        // now points at "a". Without the guard this would silently corrupt.
+        let stale_numbers = Args {
+            path: p.display().to_string(),
+            rev: None,
+            ops: vec![Op::SetN {
+                line: 2,
+                content: "B".into(),
+            }],
+        };
+        let err = apply(&store, &stale_numbers).unwrap_err();
+        assert!(err.message.contains("REV:0"), "got: {}", err.message);
+        assert!(
+            err.message.contains("re-read"),
+            "the error must say how to recover: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "top\na\nb\nc\n",
+            "the refused batch must not touch the file"
+        );
+
+        // Re-reading re-synchronizes the numbers and the edit goes through.
+        store.snapshot(&p).unwrap();
+        apply(&store, &stale_numbers).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "top\nB\nb\nc\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Two edits back to back: the second must not trip the
+    /// external-modification guard on our own first write.
+    #[test]
+    fn consecutive_edits_do_not_look_external() {
+        let store = HashStore::new();
+        let p = tmpfile("consecutive");
+        std::fs::write(&p, "a\n").unwrap();
+        store.snapshot(&p).unwrap();
+        for (i, want) in [(1u32, "b\n"), (2, "c\n")] {
+            apply(
+                &store,
+                &Args {
+                    path: p.display().to_string(),
+                    rev: None,
+                    ops: vec![Op::ReplaceN {
+                        start: 1,
+                        end: 1,
+                        lines: vec![want.trim().to_owned()],
+                    }],
+                },
+            )
+            .unwrap_or_else(|e| panic!("edit {i} failed: {}", e.message));
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
+            // Each successful write is visible to a read before the next edit.
+            assert_eq!(store.snapshot(&p).unwrap().0.rev, i as u64);
+        }
         std::fs::remove_file(&p).ok();
     }
 }

@@ -166,10 +166,15 @@ fn write(store: &HashStore, a: &WriteArgs) -> std::result::Result<String, ToolEr
     };
     let buf = a.text.as_bytes();
     let len = buf.len() as u64;
+    // Fold the bytes we are about to write, so the rev table records what
+    // the next read will see without hashing the file back off disk.
+    let digest = store.fold_bytes(buf);
     store
         .atomic_write(&canonical, parent, buf, perm, "file_write")
         .map_err(hash_to_tool)?;
-    store.commit_write_bytes(&canonical, len).map_err(hash_to_tool)
+    store
+        .commit_write_bytes(&canonical, digest, len)
+        .map_err(hash_to_tool)
 }
 
 #[cfg(test)]

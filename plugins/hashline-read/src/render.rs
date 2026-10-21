@@ -291,4 +291,26 @@ mod tests {
         assert_eq!(out.lines().count(), 1, "out: {out}");
         std::fs::remove_file(&path).ok();
     }
+
+    /// `if_rev_match` is a promise that the body did not change. An out-of-band
+    /// write must break that promise by advancing the rev, not by silently
+    /// eliding a body that no longer matches what the caller last saw.
+    #[test]
+    fn if_rev_match_does_not_elide_after_an_external_write() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-rev-ext.txt", std::process::id()));
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let store = HashStore::new();
+        let _ = render(&store, &test_args(&path, 1, None)).unwrap();
+
+        // Somebody else rewrites the file.
+        std::fs::write(&path, "a\nZZZ\n").unwrap();
+
+        let mut args = test_args(&path, 1, None);
+        args.if_rev_match = Some(0);
+        let out = render(&store, &args).unwrap();
+        assert!(!out.contains("UNCHANGED"), "stale rev must not elide: {out}");
+        assert!(out.contains("ZZZ"), "the new body must be rendered: {out}");
+        std::fs::remove_file(&path).ok();
+    }
 }
