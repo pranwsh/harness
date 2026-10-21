@@ -139,6 +139,47 @@ fn single_lines(lines: &[String], what: &str) -> std::result::Result<Vec<Vec<u8>
     Ok(out)
 }
 
+/// The line ending a file already uses, so an edit does not silently rewrite
+/// every line in the file.
+///
+/// Mixed endings are reported rather than guessed at: normalizing them would
+/// be a whole-file diff disguised as a one-line change, and any choice we
+/// made would be wrong for half the file.
+fn detect_eol(bytes: &[u8]) -> std::result::Result<&'static str, ToolError> {
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    let lf = bytes
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| **b == b'\n' && (*i == 0 || bytes[i - 1] != b'\r'))
+        .count();
+    match (crlf, lf) {
+        (0, _) => Ok("\n"),
+        (_, 0) => Ok("\r\n"),
+        _ => Err(crate::tool_err(format!(
+            "file mixes CRLF ({crlf} lines) and LF ({lf} lines) endings; \
+             normalize it first (e.g. with `sed`) so an edit cannot rewrite them all"
+        ))),
+    }
+}
+
+/// Refuse to line-edit content that is not text.
+///
+/// Splitting a binary file on `\\n` and writing it back is data loss, and the
+/// caller almost certainly meant a different path.
+fn guard_text(bytes: &[u8], path: &Path) -> std::result::Result<(), ToolError> {
+    // A NUL in the leading 8 KiB is the same heuristic `git` uses for
+    // "binary": cheap, no decoding, no false positives on real source.
+    let head = &bytes[..bytes.len().min(8192)];
+    if head.contains(&0) {
+        return Err(crate::tool_err(format!(
+            "{} looks like a binary file (NUL byte in the first 8 KiB); \
+             hashline_edit only edits text",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, ToolError> {
     // Serialize edits in-process for clean retry semantics; reads proceed
     // concurrently. Hold for the whole validate+write transaction.
@@ -187,6 +228,7 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
     //    bytes we are about to edit, so both the `rev` check and the
     //    line-number guard compare against what we actually see.
     let (snap, bytes) = store.snapshot(&canonical).map_err(hash_to_tool)?;
+    guard_text(&bytes, &canonical)?;
     if let Some(want) = a.rev {
         store
             .check_rev(&canonical, want, "hashline_edit")
@@ -379,11 +421,16 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
 
     // 5. Materialize lines (owned) and apply bottom-up.
     let had_trailing_nl = bytes.is_empty() || bytes.ends_with(b"\n");
+    // How this file ends its lines. Rewriting every line ending because one
+    // line changed is exactly the kind of invisible churn that makes a
+    // one-line edit look like a whole-file diff, so round-trip it instead.
+    let eol = detect_eol(&bytes)?;
     let mut lines: Vec<Vec<u8>> = line_ranges(&bytes)
         .iter()
         .map(|(s, e)| bytes[*s..*e].to_vec())
         .collect();
-    // Strip CR from CRLF for round-trip stability.
+    // Strip CR from CRLF so hashing, matching, and splicing all speak in
+    // bare lines; `eol` puts the ending back on the way out.
     for l in &mut lines {
         if l.last() == Some(&b'\r') {
             l.pop();
@@ -469,16 +516,17 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         }
     }
 
-    // 6. Serialize + atomic persist (temp in same dir + rename).
+    // 6. Serialize + atomic persist (temp in same dir + rename), re-applying
+    //    the file's own line ending.
     let mut buf = Vec::with_capacity(bytes.len() + 1024);
     for (i, l) in lines.iter().enumerate() {
         if i > 0 {
-            buf.push(b'\n');
+            buf.extend_from_slice(eol.as_bytes());
         }
         buf.extend_from_slice(l);
     }
     if !lines.is_empty() && had_trailing_nl {
-        buf.push(b'\n');
+        buf.extend_from_slice(eol.as_bytes());
     }
 
     let parent = canonical
@@ -1045,6 +1093,95 @@ mod tests {
             // Each successful write is visible to a read before the next edit.
             assert_eq!(store.snapshot(&p).unwrap().0.rev, i as u64);
         }
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A one-line edit in a CRLF file must stay a one-line diff.
+    #[test]
+    fn crlf_line_endings_round_trip() {
+        let store = HashStore::new();
+        let p = tmpfile("crlf");
+        std::fs::write(&p, "a\r\nb\r\nc\r\n").unwrap();
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::SetN {
+                    line: 2,
+                    content: "B".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nB\r\nc\r\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn lf_line_endings_are_not_converted_to_crlf() {
+        let store = HashStore::new();
+        let p = tmpfile("lf");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::SetN {
+                    line: 2,
+                    content: "B".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nB\nc\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn mixed_line_endings_are_refused_rather_than_normalized() {
+        let store = HashStore::new();
+        let p = tmpfile("mixed-eol");
+        std::fs::write(&p, "a\r\nb\nc\n").unwrap();
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::SetN {
+                    line: 1,
+                    content: "A".into(),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("mixes CRLF"), "got: {}", err.message);
+        // Untouched.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nb\nc\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn binary_content_is_refused() {
+        let store = HashStore::new();
+        let p = tmpfile("binary");
+        let original: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        std::fs::write(&p, original).unwrap();
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::SetN {
+                    line: 1,
+                    content: "x".into(),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("binary"), "got: {}", err.message);
+        assert_eq!(std::fs::read(&p).unwrap(), original, "bytes must be intact");
         std::fs::remove_file(&p).ok();
     }
 }
