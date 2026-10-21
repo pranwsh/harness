@@ -863,6 +863,18 @@ pub enum HashError {
         path: String,
         rev: u64,
     },
+    /// A hash tag exists in the file but not on the line the caller named:
+    /// the tag comes from a different revision of the file.
+    #[error(
+        "hash '{hash}' is not on line {line} in {path}#REV:{rev} (it is on {lines:?}); re-run hashline_read on \"{path}\" and retry"
+    )]
+    TagLineMismatch {
+        hash: String,
+        line: u32,
+        lines: Vec<u32>,
+        path: String,
+        rev: u64,
+    },
     #[error(
         "stale revision for {path}: {tool} sent REV:{got} but current is REV:{expected}; re-run hashline_read on \"{path}\" and retry with REV:{expected}"
     )]

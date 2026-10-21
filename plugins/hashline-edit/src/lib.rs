@@ -53,7 +53,9 @@ pub fn hashline_edit_spec() -> ToolSpec {
             mistaken old is refused instead of corrupting the line). Whole-line ops by number: \
             {op:set_n,line,content}|{op:insert_n,after (0 prepends),lines}|{op:delete_n,start,end}|\
             {op:replace_n,start,end,lines}. Hash-anchored ops (from hashline_read's `line:hash|content` rows): \
-            set/insert/delete/replace, plus create for a new file and revert (must be the only op) to undo \
+            set/insert/delete/replace, each of which may also carry the row's line number to disambiguate \
+            a tag shared by identical lines (and to turn a stale tag into an error), plus create for a new \
+            file and revert (must be the only op) to undo \
             the previous edit. `rev` is an optional optimistic check: pass \
             your last read (the numbers would be stale), so re-read and retry. All ops validate first, apply \
             bottom-up, and write atomically; each op must carry only the keys its shape uses. \
@@ -77,7 +79,9 @@ pub fn hashline_edit_spec() -> ToolSpec {
                             "lines": { "type": "array", "items": { "type": "string" }, "description": "Whole lines to insert, one per element" },
                             "start_hash": { "type": "string" },
                             "end_hash": { "type": "string" },
-                            "line": { "type": "integer", "minimum": 1, "description": "1-based line number" },
+                            "start_line": { "type": "integer", "minimum": 1, "description": "Optional line number for start_hash, to disambiguate duplicate tags" },
+                            "end_line": { "type": "integer", "minimum": 1, "description": "Optional line number for end_hash" },
+                            "line": { "type": "integer", "minimum": 1, "description": "1-based line number; with `hash`/`after_hash` it disambiguates a duplicate tag" },
                             "after": { "type": "integer", "minimum": 0, "description": "Insert after this line; 0 prepends" },
                             "start": { "type": "integer", "minimum": 1 },
                             "end": { "type": "integer", "minimum": 1 },

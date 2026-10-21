@@ -64,10 +64,41 @@ enum ResolvedKind {
     },
 }
 
-fn resolve_one(snap: &FileSnapshot, hash: &str) -> std::result::Result<u32, HashError> {
+/// Resolve a hash tag to exactly one line.
+///
+/// `line` is an optional composite anchor: with it, a tag shared by several
+/// identical lines resolves to the named line (if the tag is there at all),
+/// so duplicates stop being an `ambiguous` dead end. It also makes a stale
+/// tag a loud mismatch instead of a silent wrong-line edit.
+fn resolve_one(
+    snap: &FileSnapshot,
+    hash: &str,
+    line: Option<u32>,
+) -> std::result::Result<u32, HashError> {
     let short = parse_short(hash)?;
     let path = snap.canonical.display().to_string();
     let hits = snap.resolve(&short);
+    if let Some(want) = line {
+        return if hits.contains(&want) {
+            Ok(want)
+        } else if hits.is_empty() {
+            Err(HashError::UnknownHash {
+                hash: hash.to_owned(),
+                path,
+                rev: snap.rev,
+            })
+        } else {
+            // The tag exists, just not on the line the caller named: the
+            // read is stale relative to this file.
+            Err(HashError::TagLineMismatch {
+                hash: hash.to_owned(),
+                line: want,
+                lines: hits,
+                path,
+                rev: snap.rev,
+            })
+        };
+    }
     match hits.as_slice() {
         [] => Err(HashError::UnknownHash {
             hash: hash.to_owned(),
@@ -326,13 +357,17 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
     let mut resolved: Vec<Resolved> = Vec::with_capacity(a.ops.len());
     for op in &a.ops {
         match op {
-            Op::Set { hash, content } => {
+            Op::Set {
+                hash,
+                line,
+                content,
+            } => {
                 if content.contains('\n') || content.contains('\r') {
                     return Err(crate::tool_err(
                         "set.content must be a single line without newline",
                     ));
                 }
-                let n = resolve_one(&snap, hash).map_err(hash_to_tool)?;
+                let n = resolve_one(&snap, hash, *line).map_err(hash_to_tool)?;
                 resolved.push(Resolved {
                     anchor: n,
                     kind: ResolvedKind::Set {
@@ -341,12 +376,16 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
                     },
                 });
             }
-            Op::Insert { after_hash, lines } => {
+            Op::Insert {
+                after_hash,
+                line,
+                lines,
+            } => {
                 let ins = single_lines(lines, "insert.lines")?;
                 let after = if after_hash == "HEAD" {
                     0
                 } else {
-                    resolve_one(&snap, after_hash).map_err(hash_to_tool)?
+                    resolve_one(&snap, after_hash, *line).map_err(hash_to_tool)?
                 };
                 resolved.push(Resolved {
                     anchor: after,
@@ -355,10 +394,12 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
             }
             Op::Delete {
                 start_hash,
+                start_line,
                 end_hash,
+                end_line,
             } => {
-                let s = resolve_one(&snap, start_hash).map_err(hash_to_tool)?;
-                let e = resolve_one(&snap, end_hash).map_err(hash_to_tool)?;
+                let s = resolve_one(&snap, start_hash, *start_line).map_err(hash_to_tool)?;
+                let e = resolve_one(&snap, end_hash, *end_line).map_err(hash_to_tool)?;
                 if s > e {
                     return Err(crate::tool_err(format!(
                         "delete range inverted: {start_hash}(line {s}) > {end_hash}(line {e})"
@@ -371,12 +412,14 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
             }
             Op::Replace {
                 start_hash,
+                start_line,
                 end_hash,
+                end_line,
                 lines,
             } => {
                 let ins = single_lines(lines, "replace.lines")?;
-                let s = resolve_one(&snap, start_hash).map_err(hash_to_tool)?;
-                let e = resolve_one(&snap, end_hash).map_err(hash_to_tool)?;
+                let s = resolve_one(&snap, start_hash, *start_line).map_err(hash_to_tool)?;
+                let e = resolve_one(&snap, end_hash, *end_line).map_err(hash_to_tool)?;
                 if s > e {
                     return Err(crate::tool_err(format!(
                         "replace range inverted: {start_hash}(line {s}) > {end_hash}(line {e})"
@@ -446,7 +489,7 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
                 // Anchor by number or by hash — whichever the caller has.
                 let n = match (line, hash) {
                     (Some(l), _) => check_lineno(&snap, *l, "sub.line")?,
-                    (None, Some(h)) => resolve_one(&snap, h).map_err(hash_to_tool)?,
+                    (None, Some(h)) => resolve_one(&snap, h, None).map_err(hash_to_tool)?,
                     (None, None) => {
                         return Err(crate::tool_err(
                             "sub needs a `line` or a `hash` to say which line to change",
@@ -800,6 +843,7 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Set {
                 hash: h[1].clone(),
+                line: None,
                 content: "B".into(),
             }],
         };
@@ -823,11 +867,14 @@ mod tests {
             ops: vec![
                 Op::Set {
                     hash: h[0].clone(),
+                    line: None,
                     content: "one".into(),
                 },
                 Op::Delete {
                     start_hash: h[2].clone(),
+                    start_line: None,
                     end_hash: h[3].clone(),
+                end_line: None,
                 },
             ],
         };
@@ -848,6 +895,7 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Insert {
                 after_hash: "HEAD".into(),
+                line: None,
                 lines: vec!["a".into()],
             }],
         };
@@ -871,6 +919,7 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Set {
                 hash: h[0].clone(),
+                line: None,
                 content: "b".into(),
             }],
         };
@@ -882,6 +931,7 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Set {
                 hash: h2[0].clone(),
+                line: None,
                 content: "c".into(),
             }],
         };
@@ -909,10 +959,12 @@ mod tests {
             ops: vec![
                 Op::Set {
                     hash: h[0].clone(),
+                    line: None,
                     content: "A".into(),
                 },
                 Op::Set {
                     hash: "ZZZZ".into(),
+                    line: None,
                     content: "nope".into(),
                 },
             ],
@@ -936,7 +988,9 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Replace {
                 start_hash: h[1].clone(),
+                start_line: None,
                 end_hash: h[2].clone(),
+                end_line: None,
                 lines: vec!["B1".into(), "B2".into(), "B3".into()],
             }],
         };
@@ -958,7 +1012,9 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Replace {
                 start_hash: h[2].clone(),
+                start_line: None,
                 end_hash: h[0].clone(),
+                end_line: None,
                 lines: vec!["x".into()],
             }],
         };
@@ -973,11 +1029,14 @@ mod tests {
             ops: vec![
                 Op::Set {
                     hash: h[0].clone(),
+                    line: None,
                     content: "A".into(),
                 },
                 Op::Replace {
                     start_hash: h[0].clone(),
+                    start_line: None,
                     end_hash: h[1].clone(),
+                    end_line: None,
                     lines: vec!["x".into()],
                 },
             ],
@@ -1028,6 +1087,7 @@ mod tests {
             dry_run: false,
             ops: vec![Op::Set {
                 hash: "aaaa".into(),
+                line: None,
                 content: "x".into(),
             }],
         };
@@ -1045,6 +1105,7 @@ mod tests {
                 },
                 Op::Set {
                     hash: "aaaa".into(),
+                    line: None,
                     content: "x".into(),
                 },
             ],
@@ -1647,6 +1708,7 @@ mod tests {
                 dry_run: false,
                 ops: vec![Op::Set {
                     hash: h[0].clone(),
+                    line: None,
                     content: "x".into(),
                 }],
             },
@@ -1709,6 +1771,61 @@ mod tests {
             assert!(err.message.contains("empty"), "got: {}", err.message);
         }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A hash alone cannot address one of several identical lines. Pairing it
+    /// with the line number makes the anchor unambiguous without giving up the
+    /// content check the hash provides.
+    #[test]
+    fn a_line_number_disambiguates_a_duplicate_hash() {
+        let store = HashStore::new();
+        let p = tmpfile("composite");
+        std::fs::write(&p, "same\nsame\nsame\n").unwrap();
+        let h = read_hashes(&store, &p);
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Set {
+                    hash: h[1].clone(),
+                    line: Some(2),
+                    content: "two".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "same\ntwo\nsame\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Pairing a hash with a line it is *not* on means the read is stale —
+    /// exactly the case a bare hash would have silently resolved elsewhere.
+    #[test]
+    fn a_mismatched_hash_and_line_fails_loudly() {
+        let store = HashStore::new();
+        let p = tmpfile("composite-bad");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        let h = read_hashes(&store, &p);
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Set {
+                    hash: h[0].clone(),
+                    line: Some(2),
+                    content: "x".into(),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("not on line"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\nbeta\n");
         std::fs::remove_file(&p).ok();
     }
 }

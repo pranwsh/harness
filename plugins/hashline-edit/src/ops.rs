@@ -3,7 +3,10 @@
 //! Two addressing families, serialized with an `op` discriminator:
 //! * hash ops — `set` / `insert` / `delete` / `replace`, anchored by 4-char
 //!   `hashline_read` tags (`"HEAD"` prepends for `insert`). Content-addressed:
-//!   identical lines can collide (`ambiguous`), tags shift every edit.
+//!   identical lines collide (`ambiguous`), and tags shift every edit. Each of
+//!   these ops may also carry the row's line number (`line` / `start_line` /
+//!   `end_line`), which selects among duplicates and turns a stale tag into a
+//!   loud error rather than a silent wrong-line edit.
 //! * line ops — `set_n` / `insert_n` / `delete_n` / `replace_n`, anchored by
 //! * line ops — `set_n` / `insert_n` / `delete_n` / `replace_n`, anchored by
 //!   absolute 1-based line numbers from any `hashline_read` (quiet output has
@@ -25,19 +28,34 @@ use harness_contracts::ToolError;
 pub(crate) enum Op {
     Set {
         hash: String,
+        /// Optional line-number hint. Disambiguates a hash shared by
+        /// identical lines, and turns a stale hash into a loud error
+        /// instead of a silent wrong-line edit.
+        #[serde(default)]
+        line: Option<u32>,
         content: String,
     },
     Insert {
         after_hash: String,
+        #[serde(default)]
+        line: Option<u32>,
         lines: Vec<String>,
     },
     Delete {
         start_hash: String,
+        #[serde(default)]
+        start_line: Option<u32>,
         end_hash: String,
+        #[serde(default)]
+        end_line: Option<u32>,
     },
     Replace {
         start_hash: String,
+        #[serde(default)]
+        start_line: Option<u32>,
         end_hash: String,
+        #[serde(default)]
+        end_line: Option<u32>,
         lines: Vec<String>,
     },
     /// Replace one line by number (1-based). No hash, no rev dance.
@@ -96,10 +114,17 @@ pub(crate) struct Args {
 const TOP_KEYS: &[&str] = &["path", "rev", "ops", "dry_run"];
 /// Ops that write lines (so `lines` and `content` are meaningful).
 const WRITE_KEYS: &[&str] = &["op", "lines", "content"];
-const SET_KEYS: &[&str] = &["op", "hash", "content"];
-const RANGE_KEYS: &[&str] = &["op", "start_hash", "end_hash"];
-const RANGE_WRITE_KEYS: &[&str] = &["op", "start_hash", "end_hash", "lines"];
-const INSERT_KEYS: &[&str] = &["op", "after_hash", "lines"];
+const SET_KEYS: &[&str] = &["op", "hash", "line", "content"];
+const RANGE_KEYS: &[&str] = &["op", "start_hash", "start_line", "end_hash", "end_line"];
+const RANGE_WRITE_KEYS: &[&str] = &[
+    "op",
+    "start_hash",
+    "start_line",
+    "end_hash",
+    "end_line",
+    "lines",
+];
+const INSERT_KEYS: &[&str] = &["op", "after_hash", "line", "lines"];
 const SET_N_KEYS: &[&str] = &["op", "line", "content"];
 const RANGE_N_KEYS: &[&str] = &["op", "start", "end"];
 const RANGE_N_WRITE_KEYS: &[&str] = &["op", "start", "end", "lines"];
@@ -235,10 +260,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("does not take"), "got: {}", err.message);
+        // `line` on a hash op is the composite anchor, not a foreign key:
+        // it disambiguates duplicate tags instead of being silently dropped.
         assert!(parse_args(
-            r#"{"path":"f","ops":[{"op":"set","hash":"aaaa","content":"x","line":3}]}"#,
+            r#"{"path":"f","ops":[{"op":"set","hash":"aaaa","content":"x","line":3}]}"#
         )
-        .is_err());
+        .is_ok());
+        // A key that belongs to neither family is still refused.
+        let err = parse_args(
+            r#"{"path":"f","ops":[{"op":"set","hash":"aaaa","content":"x","start_line":3}]}"#
+        )
+        .unwrap_err();
+        assert!(err.message.contains("does not take"), "got: {}", err.message);
     }
 
     #[test]
