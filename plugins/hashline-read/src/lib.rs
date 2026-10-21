@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_is_a_clean_error() {
+    async fn directory_lists_through_registry() {
         let ctx = ctx_with_plugins();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
         let call = ToolCall {
@@ -151,7 +151,7 @@ mod tests {
             arguments: serde_json::json!({"path": std::env::temp_dir().display().to_string()})
                 .to_string(),
         };
-        let err = tools.execute("a", "s", 1, call).await.unwrap_err();
-        assert!(err.message.contains("is a directory"), "got: {}", err.message);
+        let out = tools.execute("a", "s", 1, call).await.unwrap();
+        assert!(out.contains("directory"), "got: {out}");
     }
 }

@@ -54,15 +54,16 @@ pub fn hashline_edit_spec() -> ToolSpec {
             {op:set_n,line,content}|{op:insert_n,after (0 prepends),lines}|{op:delete_n,start,end}|\
             {op:replace_n,start,end,lines}. Hash-anchored ops (from hashline_read's `line:hash|content` rows): \
             set/insert/delete/replace, plus create for a new file. `rev` is an optional optimistic check: pass \
-            it when the file may be contended. Line-number ops are refused if you have edited the file since \
             your last read (the numbers would be stale), so re-read and retry. All ops validate first, apply \
-            bottom-up, and write atomically; each op must carry only the keys its shape uses."
+            bottom-up, and write atomically; each op must carry only the keys its shape uses. \
+            Set dry_run:true to validate the batch and return the would-be diff instead of writing."
             .to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
                 "rev": { "type": "integer", "minimum": 0, "description": "Optional optimistic-concurrency check: must match current REV" },
+                "dry_run": { "type": "boolean", "description": "Validate and report the would-be diff without writing (default false)" },
                 "ops": {
                     "type": "array",
                     "items": {

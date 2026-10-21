@@ -82,10 +82,13 @@ pub(crate) struct Args {
     #[serde(default)]
     pub rev: Option<u64>,
     pub ops: Vec<Op>,
+    /// Report the would-be result instead of writing.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Top-level keys accepted by `hashline_edit`.
-const TOP_KEYS: &[&str] = &["path", "rev", "ops"];
+const TOP_KEYS: &[&str] = &["path", "rev", "ops", "dry_run"];
 /// Ops that write lines (so `lines` and `content` are meaningful).
 const WRITE_KEYS: &[&str] = &["op", "lines", "content"];
 const SET_KEYS: &[&str] = &["op", "hash", "content"];

@@ -139,6 +139,48 @@ fn single_lines(lines: &[String], what: &str) -> std::result::Result<Vec<Vec<u8>
     Ok(out)
 }
 
+/// Compact line diff of a would-be edit: `(-)`/`(+)` on changed spans only.
+///
+/// Returns the rendered hunks plus added/removed counts. Unchanged runs are
+/// shown as their line count, so a one-line change in a 2000-line file is a
+/// three-line reply rather than a 2000-line one.
+fn summarize_diff(before: &[String], after: &[String]) -> (String, usize, usize) {
+    // Trim the common head and tail, then diff the middle by simple LCS-free
+    // pairing: this is for human confirmation, not patch application.
+    let mut head = 0;
+    while head < before.len() && head < after.len() && before[head] == after[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < before.len() - head
+        && tail < after.len() - head
+        && before[before.len() - 1 - tail] == after[after.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let removed_span = &before[head..before.len() - tail];
+    let added_span = &after[head..after.len() - tail];
+
+    let mut out = String::new();
+    if head > 0 {
+        out.push_str(&format!("  {head} unchanged\n"));
+    }
+    for l in removed_span {
+        out.push('-');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in added_span {
+        out.push('+');
+        out.push_str(l);
+        out.push('\n');
+    }
+    if tail > 0 {
+        out.push_str(&format!("  {tail} unchanged\n"));
+    }
+    (out, added_span.len(), removed_span.len())
+}
+
 /// The line ending a file already uses, so an edit does not silently rewrite
 /// every line in the file.
 ///
@@ -580,6 +622,35 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         buf.extend_from_slice(eol.as_bytes());
     }
 
+    // What the caller would see change. Computed for every batch because it
+    // is also the dry-run payload; cheap relative to the write itself.
+    let before: Vec<String> = line_ranges(&bytes)
+        .iter()
+        .map(|(s, e)| {
+            String::from_utf8_lossy(bytes[*s..*e].strip_suffix(b"\r").unwrap_or(&bytes[*s..*e]))
+                .to_string()
+        })
+        .collect();
+    let after: Vec<String> = lines
+        .iter()
+        .map(|l| String::from_utf8_lossy(l).to_string())
+        .collect();
+    let (diff, added, removed) = summarize_diff(&before, &after);
+
+    // Dry run stops here: everything above validated exactly as a real batch
+    // would, so the diff shown is the edit that would have landed.
+    if a.dry_run {
+        return Ok(format!(
+            "DRY RUN {}#REV:{rev} ops={ops} (+{added}/-{removed} lines)\n{diff}",
+            canonical.display(),
+            rev = snap.rev,
+            ops = a.ops.len(),
+            added = added,
+            removed = removed,
+            diff = diff,
+        ));
+    }
+
     let parent = canonical
         .parent()
         .ok_or_else(|| crate::tool_err("path has no parent"))?;
@@ -675,6 +746,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Set {
                 hash: h[1].clone(),
                 content: "B".into(),
@@ -695,6 +767,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             // Deliberately ordered top-down; application must go bottom-up.
             ops: vec![
                 Op::Set {
@@ -721,6 +794,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Insert {
                 after_hash: "HEAD".into(),
                 lines: vec!["a".into()],
@@ -743,6 +817,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Set {
                 hash: h[0].clone(),
                 content: "b".into(),
@@ -753,6 +828,7 @@ mod tests {
         let retry = Args {
             path: p.display().to_string(),
             rev: Some(0), // stale
+            dry_run: false,
             ops: vec![Op::Set {
                 hash: h2[0].clone(),
                 content: "c".into(),
@@ -778,6 +854,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![
                 Op::Set {
                     hash: h[0].clone(),
@@ -805,6 +882,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Replace {
                 start_hash: h[1].clone(),
                 end_hash: h[2].clone(),
@@ -826,6 +904,7 @@ mod tests {
         let inverted = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Replace {
                 start_hash: h[2].clone(),
                 end_hash: h[0].clone(),
@@ -839,6 +918,7 @@ mod tests {
         let overlapping = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![
                 Op::Set {
                     hash: h[0].clone(),
@@ -865,6 +945,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Create {
                 lines: vec!["a".into(), "b".into()],
             }],
@@ -893,6 +974,7 @@ mod tests {
         let set = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Set {
                 hash: "aaaa".into(),
                 content: "x".into(),
@@ -905,6 +987,7 @@ mod tests {
         let mixed = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![
                 Op::Create {
                     lines: vec!["a".into()],
@@ -922,6 +1005,7 @@ mod tests {
         let bad_rev = Args {
             path: p.display().to_string(),
             rev: Some(3),
+            dry_run: false,
             ops: vec![Op::Create {
                 lines: vec!["a".into()],
             }],
@@ -943,6 +1027,7 @@ mod tests {
         let orphan_args = Args {
             path: orphan.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::Create {
                 lines: vec!["a".into()],
             }],
@@ -963,6 +1048,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: None, // no hashline_read needed at all
+            dry_run: false,
             ops: vec![
                 Op::SetN {
                     line: 2,
@@ -985,6 +1071,7 @@ mod tests {
         let args = Args {
             path: p.display().to_string(),
             rev: None,
+            dry_run: false,
             ops: vec![
                 Op::ReplaceN {
                     start: 1,
@@ -1021,6 +1108,7 @@ mod tests {
             let args = Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops,
             };
             let err = apply(&store, &args).unwrap_err();
@@ -1042,6 +1130,7 @@ mod tests {
         let ok = Args {
             path: p.display().to_string(),
             rev: None,
+            dry_run: false,
             ops: vec![Op::SetN {
                 line: 1,
                 content: "b".into(),
@@ -1052,6 +1141,7 @@ mod tests {
         let stale = Args {
             path: p.display().to_string(),
             rev: Some(0),
+            dry_run: false,
             ops: vec![Op::SetN {
                 line: 1,
                 content: "c".into(),
@@ -1080,6 +1170,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::InsertN {
                     after: 0,
                     lines: vec!["top".into()],
@@ -1093,6 +1184,7 @@ mod tests {
         let stale_numbers = Args {
             path: p.display().to_string(),
             rev: None,
+            dry_run: false,
             ops: vec![Op::SetN {
                 line: 2,
                 content: "B".into(),
@@ -1132,6 +1224,7 @@ mod tests {
                 &Args {
                     path: p.display().to_string(),
                     rev: None,
+                    dry_run: false,
                     ops: vec![Op::ReplaceN {
                         start: 1,
                         end: 1,
@@ -1158,6 +1251,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::SetN {
                     line: 2,
                     content: "B".into(),
@@ -1179,6 +1273,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::SetN {
                     line: 2,
                     content: "B".into(),
@@ -1200,6 +1295,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::SetN {
                     line: 1,
                     content: "A".into(),
@@ -1224,6 +1320,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::SetN {
                     line: 1,
                     content: "x".into(),
@@ -1247,6 +1344,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::Sub {
                     line: Some(1),
                     hash: None,
@@ -1276,6 +1374,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::Sub {
                     line: None,
                     hash: Some(h[0].clone()),
@@ -1295,6 +1394,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::Sub {
                     line: None,
                     hash: Some(h[0].clone()),
@@ -1319,6 +1419,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::Sub {
                     line: None,
                     hash: None,
@@ -1336,6 +1437,7 @@ mod tests {
             &Args {
                 path: p.display().to_string(),
                 rev: None,
+                dry_run: false,
                 ops: vec![Op::Sub {
                     line: Some(1),
                     hash: None,
@@ -1348,6 +1450,63 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("line break"), "got: {}", err.message);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A dry run validates everything and reports the would-be change without
+    /// touching the file — the difference between hoping an edit landed and
+    /// knowing what it would do.
+    #[test]
+    fn dry_run_reports_a_diff_and_writes_nothing() {
+        let store = HashStore::new();
+        let p = tmpfile("dry-run");
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        store.snapshot(&p).unwrap();
+        let out = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: true,
+                ops: vec![Op::SetN {
+                    line: 2,
+                    content: "TWO".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(out.starts_with("DRY RUN"), "got: {out}");
+        assert!(out.contains("+1/-1"), "got: {out}");
+        assert!(out.contains("-two"), "diff must show the old line: {out}");
+        assert!(out.contains("+TWO"), "diff must show the new line: {out}");
+        assert!(out.contains("1 unchanged"), "got: {out}");
+        // Nothing was written and no rev was consumed.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\ntwo\nthree\n");
+        assert_eq!(store.current_rev(&store.canonicalize(&p)), Some(0));
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A dry run must still reject a bad batch: it is a validation pass, not a
+    /// lint.
+    #[test]
+    fn dry_run_still_validates() {
+        let store = HashStore::new();
+        let p = tmpfile("dry-run-bad");
+        std::fs::write(&p, "a\n").unwrap();
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: true,
+                ops: vec![Op::SetN {
+                    line: 9,
+                    content: "x".into(),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("out of bounds"), "got: {}", err.message);
         std::fs::remove_file(&p).ok();
     }
 }

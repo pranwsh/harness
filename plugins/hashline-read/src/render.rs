@@ -31,18 +31,67 @@ pub(crate) fn hashline_read_handler(
     }
 }
 
+
+/// Files larger than this are refused rather than hashed whole, because the
+/// snapshot cost is O(file) even for a 50-line window.
+pub(crate) const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Render a directory as a listing instead of an error.
+///
+/// One tool call answers "what is here", which is what the caller wanted when
+/// they pointed a file reader at a directory.
+fn list_dir(
+    path: &std::path::Path,
+    needle: Option<&str>,
+    ignore_case: bool,
+) -> std::result::Result<String, ToolError> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| crate::tool_err(format!("cannot list {}: {e}", path.display())))?;
+    let mut names: Vec<(bool, String)> = Vec::new();
+    for e in entries.flatten() {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = e.file_name().to_string_lossy().to_string();
+        let keep = match needle {
+            Some(n) if ignore_case => name.to_lowercase().contains(&n.to_lowercase()),
+            Some(n) => name.contains(n),
+            None => true,
+        };
+        if keep {
+            // Trailing separator marks a directory, as `ls -p` does.
+            names.push((is_dir, if is_dir { format!("{name}/") } else { name }));
+        }
+    }
+    names.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out = format!("¶{}/ (directory, {} entries)\n", path.display(), names.len());
+    for (_, name) in names {
+        out.push_str(&name);
+        out.push('\n');
+    }
+    Ok(out)
+}
 /// Render the requested window. Hashing always covers the whole file (see
 /// [`HashStore::snapshot`]); `offset`/`limit`/`grep` only trim the output.
 pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<String, ToolError> {
-    // Directory guard: on Linux `File::open` succeeds for a directory and the
-    // failure only surfaces later as an opaque `ENODEV` from `mmap`. Detect it
-    // up front and say so plainly.
+    // A directory is not an error worth a round-trip to `ls`: list it. The
+    // caller asked what is there, and one tool call answers that.
     if let Ok(meta) = std::fs::metadata(&a.path)
         && meta.is_dir()
     {
+        return list_dir(&a.path, a.grep.as_deref(), a.ignore_case);
+    }
+
+    // Guard before hashing: `snapshot` hashes (and copies) the whole file
+    // regardless of the window, so an accidental read of a multi-GB log would
+    // cost a full scan and a full copy for 50 lines of output.
+    if let Ok(meta) = std::fs::metadata(&a.path)
+        && meta.len() > MAX_READ_BYTES
+    {
         return Err(crate::tool_err(format!(
-            "{} is a directory, not a file; pass a file path (list it with `ls`)",
-            a.path.display()
+            "{} is {} bytes, over the {} byte read limit; \
+             use `offset`/`limit` with `shell` (e.g. `sed -n '1,50p'`) or `grep` instead",
+            a.path.display(),
+            meta.len(),
+            MAX_READ_BYTES
         )));
     }
 
@@ -56,8 +105,10 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     if let Some(want) = a.if_rev_match
         && rev == want
     {
+        // Name what did not change, so the reply is self-contained.
         return Ok(format!(
-            "¶{canonical}#REV:{rev} UNCHANGED (rev {want} matches; body elided)"
+            "¶{canonical}#REV:{rev} lines={} UNCHANGED (rev {want} matches; body elided)",
+            snap.entries.len()
         ));
     }
 
@@ -261,12 +312,37 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Pointing a file reader at a directory answers the question instead of
+    /// making the caller spend a round-trip on `ls`.
     #[test]
-    fn directory_is_a_clean_error() {
+    fn directory_renders_a_listing() {
+        let dir = std::env::temp_dir().join(format!("hashline-read-{}-dir", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         let store = HashStore::new();
-        let dir = std::env::temp_dir();
-        let err = render(&store, &test_args(&dir, 1, None)).unwrap_err();
-        assert!(err.message.contains("is a directory"), "got: {}", err.message);
+        let out = render(&store, &test_args(&dir, 1, None)).unwrap();
+        assert!(out.contains("directory"), "out: {out}");
+        assert!(out.contains("b.txt"), "out: {out}");
+        assert!(out.contains("sub/"), "directories marked: {out}");
+        // Listed in a stable order, with the file before the directory.
+        let listing: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(listing, vec!["b.txt", "sub/"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_files_are_refused_before_hashing() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-big.txt", std::process::id()));
+        // Sparse-ish: just enough to trip the limit without writing 32 MiB.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+        drop(f);
+        let store = HashStore::new();
+        let err = render(&store, &test_args(&path, 1, None)).unwrap_err();
+        assert!(err.message.contains("over the"), "got: {}", err.message);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
