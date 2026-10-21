@@ -223,15 +223,11 @@ fn guard_text(bytes: &[u8], path: &Path) -> std::result::Result<(), ToolError> {
 }
 
 pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, ToolError> {
-    // Serialize edits in-process for clean retry semantics; reads proceed
-    // concurrently. Hold for the whole validate+write transaction.
-    let _edit = store.lock_edit();
     let canonical = store.canonicalize(&PathBuf::from(&a.path));
-
-    // Cross-process mutual exclusion (blocking) via per-file lockfile.
-    let _fs = store
-        .exclusive_file_lock(&canonical)
-        .map_err(hash_to_tool)?;
+    // Per-file exclusion (threads and processes) held for the whole
+    // validate+write transaction. Reads never take it, and edits to other
+    // files proceed in parallel.
+    let _edit = store.lock_edit(&canonical).map_err(hash_to_tool)?;
 
     // Missing file: only a lone `create` op (rev 0) can materialize it.
     match std::fs::metadata(&canonical) {

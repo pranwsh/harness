@@ -170,7 +170,6 @@ pub fn fold_digest(entries: &[LineEntry], trailing_nl: bool) -> u64 {
     acc.mix(u64::from(trailing_nl));
     acc.finish(entries.len())
 }
-
 /// The single fold that both `fold_digest` (hashing on read) and
 /// [`HashStore::fold_bytes`] (hashing what we are about to write) go
 /// through, so the two can never disagree about whether content changed.
@@ -268,11 +267,45 @@ struct RevState {
 /// Threshold above which line hashing fans out over `thread::scope`.
 pub const PARALLEL_MIN_BYTES: usize = 256 * 1024;
 
+/// Handle held for the duration of an edit transaction.
+/// Best-effort file name for a lockfile: the final path component with
+/// anything awkward for a filename replaced, and bounded in length.
+fn file_stem_lossy(p: &Path) -> String {
+    let raw = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "root".to_owned());
+    raw.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Open (creating if needed) a lockfile in the temp dir.
+fn open_temp_lock(name: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(std::env::temp_dir().join(name))
+}
+///
+/// Owns the per-file lockfile; dropping it releases the lock.
+pub struct EditGuard {
+    _file: File,
+}
+
 /// Shared hashing service. Clone via `Arc<HashStore>`.
 pub struct HashStore {
     hasher: Arc<dyn LineHasher>,
     state: Mutex<HashMap<PathBuf, RevState>>,
-    edit_mu: Mutex<()>,
 }
 
 impl std::fmt::Debug for HashStore {
@@ -298,7 +331,6 @@ impl HashStore {
         HashStore {
             hasher: Arc::new(h),
             state: Mutex::new(HashMap::new()),
-            edit_mu: Mutex::new(()),
         }
     }
 
@@ -346,9 +378,16 @@ impl HashStore {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Serialize whole edit transactions in-process. Reads never take this.
-    pub fn lock_edit(&self) -> MutexGuard<'_, ()> {
-        self.edit_mu.lock().unwrap_or_else(|e| e.into_inner())
+    /// Serialize a whole edit transaction for one file.
+    ///
+    /// Returns a guard holding the per-file lockfile; dropping it releases the
+    /// lock. Each call opens its own descriptor, so `flock` excludes other
+    /// *threads* as well as other processes — no separate in-process mutex is
+    /// needed, and edits to different files never contend.
+    pub fn lock_edit(&self, canonical: &Path) -> Result<EditGuard, HashError> {
+        Ok(EditGuard {
+            _file: self.exclusive_file_lock(canonical)?,
+        })
     }
 
     /// Current in-memory revision, if this process has read the file before.
@@ -439,21 +478,36 @@ impl HashStore {
         Ok(())
     }
 
-    /// Per-file cross-process exclusive lock (blocking) via a temp lockfile.
+    /// Per-file cross-process exclusive lock (blocking) via a lockfile.
+    ///
+    /// The lockfile lives beside the target (`.name.<hash>.lock`) rather than
+    /// in `$TMPDIR`: naming it after a *whitespace-trimmed* hash of the path
+    /// let two paths that differ only in surrounding whitespace collide, and
+    /// temp files accumulated one per path forever with nothing to clean them
+    /// up. A sibling lockfile is also self-explanatory to anyone looking at the
+    /// directory.
+    ///
+    /// Falls back to the temp dir when the target's directory is not writable,
+    /// which is the only case where a sibling lock cannot be created.
     pub fn exclusive_file_lock(&self, canonical: &Path) -> Result<File, HashError> {
-        let mut h = self
-            .hasher
-            .hash_normalized(canonical.as_os_str().as_encoded_bytes());
-        // Mix length to avoid trivial collisions across similar prefixes.
+        // Hash the canonical path bytes verbatim: two distinct paths must
+        // never share a lock.
+        let mut h = xxhash_rust::xxh3::xxh3_64(canonical.as_os_str().as_encoded_bytes());
         h ^= canonical.as_os_str().len() as u64;
-        let name = format!("hashline-{:016x}.lock", h);
-        let lock_path = std::env::temp_dir().join(name);
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
+        let name = format!(".{}.{:08x}.lock", file_stem_lossy(canonical), h & 0xffff_ffff);
+        let f = match canonical.parent().map(|d| d.join(&name)) {
+            Some(p) => match OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&p)
+            {
+                Ok(f) => f,
+                Err(_) => open_temp_lock(&name)?,
+            },
+            None => open_temp_lock(&name)?,
+        };
         f.lock_exclusive()?;
         Ok(f)
     }
@@ -926,6 +980,7 @@ mod tests {
     /// Our own write must not look like somebody else's afterwards, or the
     /// second edit in a row would trip the external-modification guard.
     #[test]
+
     fn a_write_does_not_trip_its_own_external_guard() {
         let store = HashStore::new();
         let p = tmp("self-guard");
@@ -960,6 +1015,76 @@ mod tests {
         // Nothing observed yet: REV:0 is the honest answer, not a contradiction.
         assert!(store.check_rev(&canonical, 0, "test").is_ok());
         assert!(store.check_rev(&canonical, 3, "test").is_err());
+    }
+    /// The per-file lock must exclude other *threads* in this process too,
+    /// not just other processes: two concurrent edits in one harness would
+    /// otherwise both pass validation against the same snapshot.
+    #[test]
+    fn lock_edit_excludes_threads_and_different_files_do_not_contend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(HashStore::new());
+        // Work in a subdirectory so the sibling lockfile is somewhere we can
+        // assert about, rather than mixed into the system temp dir.
+        let dir = std::env::temp_dir().join(format!("hash-base-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        let canonical = store.canonicalize(&p);
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let inside = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let canonical = canonical.clone();
+            let overlap = Arc::clone(&overlap);
+            let inside = Arc::clone(&inside);
+            handles.push(std::thread::spawn(move || {
+                let _g = store.lock_edit(&canonical).unwrap();
+                if inside.fetch_add(1, Ordering::SeqCst) == 1 {
+                    overlap.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                inside.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(overlap.load(Ordering::SeqCst), 0, "two threads held the same file lock");
+
+        // A different file is not blocked by a held lock.
+        let q = dir.join("b.txt");
+        std::fs::write(&q, "b\n").unwrap();
+        let other = store.canonicalize(&q);
+        let held = store.lock_edit(&canonical).unwrap();
+        let start = std::time::Instant::now();
+        let _second = store.lock_edit(&other).unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a different file's lock blocked on an unrelated edit"
+        );
+        drop(held);
+
+        // The lockfile lives beside the target, not in the temp dir.
+        let siblings: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".lock"))
+            .collect();
+        assert!(
+            siblings.iter().all(|n| n.starts_with('.')),
+            "lockfiles should be hidden siblings of the target: {siblings:?}"
+        );
+        let temp_lockfiles = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".hash-base-lock-") && n.ends_with(".lock"))
+            .count();
+        assert_eq!(temp_lockfiles, 0, "lockfiles should not accumulate in $TMPDIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

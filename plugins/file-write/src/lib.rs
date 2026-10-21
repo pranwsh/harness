@@ -115,14 +115,11 @@ fn hash_to_tool(e: HashError) -> ToolError {
     tool_err(e.to_string())
 }
 
-/// Whole-file write under the same locks as `hashline_edit`: in-process edit
-/// mutex plus the per-file lockfile, directory guard, then atomic persist.
+/// Whole-file write under the same locks as `hashline_edit`: the per-file
+/// lock, directory guard, then atomic persist.
 fn write(store: &HashStore, a: &WriteArgs) -> std::result::Result<String, ToolError> {
-    let _edit = store.lock_edit();
     let canonical = store.canonicalize(&a.path);
-    let _fs = store
-        .exclusive_file_lock(&canonical)
-        .map_err(hash_to_tool)?;
+    let _edit = store.lock_edit(&canonical).map_err(hash_to_tool)?;
 
     if std::fs::metadata(&canonical)
         .map(|m| m.is_dir())
