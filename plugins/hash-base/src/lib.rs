@@ -296,16 +296,28 @@ fn open_temp_lock(name: &str) -> io::Result<File> {
         .write(true)
         .open(std::env::temp_dir().join(name))
 }
+/// Handle held for the duration of an edit transaction.
 ///
 /// Owns the per-file lockfile; dropping it releases the lock.
 pub struct EditGuard {
     _file: File,
 }
 
+/// The content a file had before our most recent edit to it.
+struct UndoSlot {
+    bytes: Vec<u8>,
+    /// Rev the file was at *before* that edit.
+    rev: u64,
+}
+
 /// Shared hashing service. Clone via `Arc<HashStore>`.
 pub struct HashStore {
     hasher: Arc<dyn LineHasher>,
     state: Mutex<HashMap<PathBuf, RevState>>,
+    /// One-step undo per path: the bytes an edit replaced. Kept in memory only
+    /// (a restart is not an editing session), and overwritten by the next edit
+    /// to the same path, so this is "undo the last thing I did", not history.
+    undo: Mutex<HashMap<PathBuf, UndoSlot>>,
 }
 
 impl std::fmt::Debug for HashStore {
@@ -331,6 +343,7 @@ impl HashStore {
         HashStore {
             hasher: Arc::new(h),
             state: Mutex::new(HashMap::new()),
+            undo: Mutex::new(HashMap::new()),
         }
     }
 
@@ -388,6 +401,26 @@ impl HashStore {
         Ok(EditGuard {
             _file: self.exclusive_file_lock(canonical)?,
         })
+    }
+
+    /// Remember the bytes an edit is about to replace, so it can be undone.
+    pub fn stash_undo(&self, canonical: &Path, bytes: &[u8], rev: u64) {
+        let mut u = self.undo.lock().unwrap_or_else(|e| e.into_inner());
+        u.insert(
+            canonical.to_path_buf(),
+            UndoSlot {
+                bytes: bytes.to_vec(),
+                rev,
+            },
+        );
+    }
+
+    /// Bytes to restore for a one-step undo, and the rev they belong to.
+    pub fn take_undo(&self, canonical: &Path) -> Option<(Vec<u8>, u64)> {
+        let mut u = self.undo.lock().unwrap_or_else(|e| e.into_inner());
+        // Consume it: one undo per edit, so a second `revert` says so plainly
+        // instead of silently replaying an older state.
+        u.remove(canonical).map(|s| (s.bytes, s.rev))
     }
 
     /// Current in-memory revision, if this process has read the file before.

@@ -237,6 +237,15 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         Err(e) => return Err(hash_to_tool(HashError::Io(e))),
         Ok(_) => {}
     }
+    // `revert` restores the whole file, so it must stand alone.
+    if a.ops.iter().any(|op| matches!(op, Op::Revert)) {
+        let [Op::Revert] = a.ops.as_slice() else {
+            return Err(crate::tool_err(
+                "revert must be the only op in the batch; it replaces the whole file",
+            ));
+        };
+        return revert(store, &canonical, a);
+    }
     if a.ops.iter().any(|op| matches!(op, Op::Create { .. })) {
         return Err(crate::tool_err(
             "file already exists: create is only for new files",
@@ -469,6 +478,12 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
                     "file already exists: create is only for new files",
                 ));
             }
+            Op::Revert => {
+                // Unreachable: `revert` returns before op resolution.
+                return Err(crate::tool_err(
+                    "revert must be the only op in the batch; it replaces the whole file",
+                ));
+            }
         }
     }
 
@@ -653,6 +668,8 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
     // Fold exactly the bytes we are writing, so the rev table agrees with the
     // next read instead of needing a re-hash to notice a change.
     let digest = store.fold_bytes(&buf);
+    // Keep what we are replacing so the caller can undo one step.
+    store.stash_undo(&canonical, &bytes, snap.rev);
     store
         .atomic_write(
             &canonical,
@@ -669,6 +686,41 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
 
 /// Materialize a missing file. Only a lone `create` op with `rev: 0` is
 /// accepted; anything else is a caller error, not a creation request.
+/// Restore the file to the bytes the last edit replaced.
+///
+/// Consumes the undo slot: a second `revert` reports that there is nothing to
+/// restore rather than replaying an older state. The restore itself goes
+/// through the same atomic write, and the caller's `rev` is still checked so
+/// an interleaved external edit is not silently clobbered.
+fn revert(
+    store: &HashStore,
+    canonical: &Path,
+    a: &Args,
+) -> std::result::Result<String, ToolError> {
+    if let Some(want) = a.rev {
+        store
+            .check_rev(canonical, want, "hashline_edit")
+            .map_err(hash_to_tool)?;
+    }
+    let Some((bytes, _old_rev)) = store.take_undo(canonical) else {
+        return Err(crate::tool_err(format!(
+            "nothing to revert for {}: no edit recorded in this session (or it was already undone)",
+            canonical.display()
+        )));
+    };
+    let parent = canonical
+        .parent()
+        .ok_or_else(|| crate::tool_err("path has no parent"))?;
+    let perm = std::fs::metadata(canonical).ok().map(|m| m.permissions());
+    let digest = store.fold_bytes(&bytes);
+    store
+        .atomic_write(canonical, parent, &bytes, perm, "hashline_edit")
+        .map_err(hash_to_tool)?;
+    let out = store
+        .commit_write(canonical, digest, bytes.len() as u64, 1)
+        .map_err(hash_to_tool)?;
+    Ok(out.replacen("ops=1", "ops=1 reverted", 1))
+}
 fn create(store: &HashStore, canonical: &Path, a: &Args) -> std::result::Result<String, ToolError> {
     let [Op::Create { lines }] = a.ops.as_slice() else {
         return Err(crate::tool_err(
@@ -1503,6 +1555,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("out of bounds"), "got: {}", err.message);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The safety net for an agent-driven editor: a bad edit is one call away
+    /// from being undone, without reaching for `git`.
+    #[test]
+    fn revert_restores_the_previous_content() {
+        let store = HashStore::new();
+        let p = tmpfile("revert");
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        store.snapshot(&p).unwrap();
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::DeleteN { start: 1, end: 3 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+
+        let out = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Revert],
+            },
+        )
+        .unwrap();
+        assert!(out.contains("reverted"), "got: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\ntwo\nthree\n");
+
+        // The undo slot is consumed: a second revert says so.
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Revert],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("nothing to revert"), "got: {}", err.message);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn revert_must_stand_alone() {
+        let store = HashStore::new();
+        let p = tmpfile("revert-mixed");
+        std::fs::write(&p, "a\n").unwrap();
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Revert, Op::SetN { line: 1, content: "b".into() }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("only op"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\n");
         std::fs::remove_file(&p).ok();
     }
 }

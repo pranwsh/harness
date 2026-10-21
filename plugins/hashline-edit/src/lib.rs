@@ -53,7 +53,8 @@ pub fn hashline_edit_spec() -> ToolSpec {
             mistaken old is refused instead of corrupting the line). Whole-line ops by number: \
             {op:set_n,line,content}|{op:insert_n,after (0 prepends),lines}|{op:delete_n,start,end}|\
             {op:replace_n,start,end,lines}. Hash-anchored ops (from hashline_read's `line:hash|content` rows): \
-            set/insert/delete/replace, plus create for a new file. `rev` is an optional optimistic check: pass \
+            set/insert/delete/replace, plus create for a new file and revert (must be the only op) to undo \
+            the previous edit. `rev` is an optional optimistic check: pass \
             your last read (the numbers would be stale), so re-read and retry. All ops validate first, apply \
             bottom-up, and write atomically; each op must carry only the keys its shape uses. \
             Set dry_run:true to validate the batch and return the would-be diff instead of writing."
@@ -69,7 +70,7 @@ pub fn hashline_edit_spec() -> ToolSpec {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "sub", "set_n", "insert_n", "delete_n", "replace_n", "create"] },
+                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "sub", "set_n", "insert_n", "delete_n", "replace_n", "create", "revert"] },
                             "hash": { "type": "string", "description": "4-char tag from hashline_read" },
                             "content": { "type": "string", "description": "Replacement text for one line (no newline)" },
                             "after_hash": { "type": "string", "description": "Tag to insert after, or \"HEAD\" to prepend" },

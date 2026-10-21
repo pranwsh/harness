@@ -74,6 +74,11 @@ pub(crate) enum Op {
     Create {
         lines: Vec<String>,
     },
+    /// Restore the file to its content before the most recent edit.
+    ///
+    /// Must be the only op in the batch: it replaces the whole file, so
+    /// mixing it with line ops has no coherent meaning.
+    Revert,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -103,6 +108,7 @@ const INSERT_N_KEYS: &[&str] = &["op", "after", "lines"];
 const SUB_KEYS: &[&str] = &["op", "line", "hash", "old", "new", "count"];
 
 const CREATE_KEYS: &[&str] = WRITE_KEYS;
+const REVERT_KEYS: &[&str] = &["op"];
 
 /// The key set an op of this name may carry.
 fn allowed_keys(op: &str) -> &'static [&'static str] {
@@ -117,6 +123,7 @@ fn allowed_keys(op: &str) -> &'static [&'static str] {
         "replace_n" => RANGE_N_WRITE_KEYS,
         "sub" => SUB_KEYS,
         "create" => CREATE_KEYS,
+        "revert" => REVERT_KEYS,
         // Unknown op: leave the diagnosis to the real parse, which names it.
         _ => &["op"],
     }
