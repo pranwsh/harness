@@ -169,7 +169,7 @@ right distribution mechanism. Fully static linking is possible with crane via
 - **plugins:**
   - infra: `config` (toml loading), `session` (conversation log, journaled to `$XDG_DATA_HOME/harness/sessions` — see `[session]` in `config.example.toml`), `skills` (Agent Skills registry over `$XDG_CONFIG_HOME/harness/skills` — see `[skills]` in `config.example.toml`)
   - llm/agent: `model` (HTTP transport), `model-headers` (header waterfall), `agent`, `agent-default-model`, `agent-loop`, `system-prompt`
-  - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `mcp` (MCP stdio bridge: `mcp__<server>__<tool>`), `hash-base`, `hashline-read`, `hashline-edit` (incl. rev-less `set_n`/`insert_n`/`delete_n`/`replace_n`), `file-write`
+  - tools: `tools` (registry/executor), `shell` (`shell_exec/start/poll/stop`), `mcp` (MCP stdio bridge: `mcp__<server>__<tool>`), `hash-base`, `hashline-read` (hashed rows by default, `grep` with `ignore_case`/`context`, directory listings), `hashline-edit` (hash and line ops, `sub`, `dry_run`, one-step `revert`), `file-write`
   - tui: `tui` (runner), `tui-state`, `tui-input`, `tui-markdown`, `tui-popup`, `tui-filter` (shared filter-popup behavior), `tui-commands` (slash completion), `tui-model` (model search), `tui-sessions` (`/sessions` picker: list past sessions, resume on select), `tui-branch` (`/branch` navigator: rewind the current session to any turn, branch from there)
 
 ## Shell + sudo note
