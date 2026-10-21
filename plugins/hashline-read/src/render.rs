@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use harness_contracts::ToolError;
-use harness_hash_base::{HashStore, line_ranges, short_str};
+use harness_hash_base::{HashStore, short_str};
 
 use super::args::ReadArgs;
 
@@ -123,9 +123,10 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     }
 
     let total = snap.entries.len();
-    let ranges = line_ranges(&bytes);
+    // Ranges come from the snapshot: hashing already split the file, so
+    // re-scanning here would be a second full pass for the same answer.
     let line_text = |i: usize| -> std::borrow::Cow<'_, str> {
-        let (s, t) = ranges[i];
+        let (s, t) = snap.ranges[i];
         let raw = bytes[s..t].strip_suffix(b"\r").unwrap_or(&bytes[s..t]);
         String::from_utf8_lossy(raw)
     };

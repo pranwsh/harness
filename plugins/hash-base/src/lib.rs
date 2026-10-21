@@ -236,6 +236,10 @@ pub struct FileSnapshot {
     pub canonical: PathBuf,
     pub rev: u64,
     pub entries: Vec<LineEntry>,
+    /// Byte ranges of each line, parallel to `entries`. Hashing already had
+    /// to find every newline; carrying the ranges out means renderers do not
+    /// have to scan the whole file a second time just to slice lines.
+    pub ranges: Vec<(usize, usize)>,
     pub mtime: SystemTime,
     pub len: u64,
 }
@@ -687,6 +691,7 @@ impl HashStore {
                     canonical,
                     rev,
                     entries: Vec::new(),
+                    ranges: Vec::new(),
                     mtime,
                     len,
                 },
@@ -699,7 +704,10 @@ impl HashStore {
         // as callers need owned content — hashing itself is zero-copy over
         // the mapping).
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let entries = self.hash_all(&mmap);
+        // Split once: the same ranges drive hashing and (via the snapshot)
+        // the caller's slicing, instead of scanning for newlines twice.
+        let ranges = line_ranges(&mmap);
+        let entries = self.hash_all_with_ranges(&mmap, &ranges);
         let digest = fold_digest(&entries, mmap.ends_with(b"\n") || mmap.ends_with(b"\r"));
         let bytes = mmap[..].to_vec();
         // Shared lock releases on `file` drop here.
@@ -709,6 +717,7 @@ impl HashStore {
                 canonical,
                 rev,
                 entries,
+                ranges,
                 mtime,
                 len,
             },
@@ -774,33 +783,41 @@ impl HashStore {
 
     /// Hash every line in `data`, fanning out for large inputs.
     pub fn hash_all(&self, data: &[u8]) -> Vec<LineEntry> {
+        self.hash_all_with_ranges(data, &line_ranges(data))
+    }
+
+    /// Hash every line, reusing line ranges the caller already computed.
+    ///
+    /// `snapshot` splits the file to know where the lines are; handing those
+    /// ranges over keeps a read from scanning the whole file a second time.
+    pub fn hash_all_with_ranges(&self, data: &[u8], ranges: &[(usize, usize)]) -> Vec<LineEntry> {
         if data.len() >= PARALLEL_MIN_BYTES
-            && let Some(entries) = self.hash_all_parallel(data)
+            && let Some(entries) = self.hash_all_parallel(data, ranges)
         {
             return entries;
         }
-        self.hash_all_serial(data)
+        self.hash_all_serial(data, ranges)
     }
-    fn hash_all_serial(&self, data: &[u8]) -> Vec<LineEntry> {
-        // One entry per newline is the exact upper bound; avoids regrowth on
-        // the small-file path, which is the common one.
-        let mut out = Vec::with_capacity(memchr::memchr_iter(b'\n', data).count() + 1);
-        let mut lineno: u32 = 0;
-        for_each_line(data, |line| {
-            lineno += 1;
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+    fn hash_all_serial(&self, data: &[u8], ranges: &[(usize, usize)]) -> Vec<LineEntry> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for (i, (s, e)) in ranges.iter().enumerate() {
+            let line = data[*s..*e].strip_suffix(b"\r").unwrap_or(&data[*s..*e]);
             let full = self.hasher.hash_normalized(line);
             out.push(LineEntry {
-                lineno,
+                lineno: (i + 1) as u32,
                 short: short62(full),
                 full,
             });
-        });
+        }
         out
     }
 
-    fn hash_all_parallel(&self, data: &[u8]) -> Option<Vec<LineEntry>> {
-        let ranges = line_ranges(data);
+    fn hash_all_parallel(
+        &self,
+        data: &[u8],
+        ranges: &[(usize, usize)],
+    ) -> Option<Vec<LineEntry>> {
         if ranges.is_empty() {
             return Some(Vec::new());
         }
@@ -1152,9 +1169,9 @@ mod tests {
         for i in 0..5000 {
             data.extend_from_slice(format!("line {i}  \n").as_bytes());
         }
-        // Force parallel path regardless of threshold via direct call.
-        let serial = store.hash_all_serial(&data);
-        let parallel = store.hash_all_parallel(&data).expect("parallel");
+        let ranges = line_ranges(&data);
+        let serial = store.hash_all_serial(&data, &ranges);
+        let parallel = store.hash_all_parallel(&data, &ranges).expect("parallel");
         assert_eq!(serial, parallel);
     }
 }
