@@ -70,54 +70,59 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     };
 
     // Candidate line indices after the optional substring filter.
-    let selected: Vec<usize> = match &a.grep {
-        Some(needle) => (0..total).filter(|&i| line_text(i).contains(needle.as_str())).collect(),
-        None => (0..total).collect(),
+    let needle = a.grep.as_deref();
+    let matches = |text: &str| match needle {
+        Some(n) if a.ignore_case => text.to_lowercase().contains(&n.to_lowercase()),
+        Some(n) => text.contains(n),
+        None => true,
     };
+    let selected: Vec<usize> = (0..total).filter(|&i| matches(&line_text(i))).collect();
     let shown_total = selected.len();
 
-    // Header first so empty files (and empty windows) still report REV.
-    let mut out = String::with_capacity(bytes.len() + total * 8 + 64);
-    out.push('¶');
-    out.push_str(&canonical);
-    out.push_str("#REV:");
-    out.push_str(&rev.to_string());
-
-    if total == 0 {
-        return Ok(out);
-    }
-
+    // Window is an index range into the selected rows; resolve it before
+    // building the string so the buffer can be sized to the window.
     let start = (a.offset - 1) as usize;
-    if start >= shown_total {
+    // Search terms can legitimately match nothing: that is an empty result,
+    // not a bad offset. Only a real line offset out of range is an error.
+    if start >= shown_total && needle.is_none() && total > 0 {
         return Err(crate::tool_err(format!(
-            "offset {} beyond EOF ({shown_total} lines{})",
-            a.offset,
-            if a.grep.is_some() {
-                format!(" matching, of {total} total")
-            } else {
-                String::new()
-            }
+            "offset {} beyond EOF ({total} lines)",
+            a.offset
         )));
     }
+    let start = start.min(shown_total);
     let end = match a.limit {
         Some(l) => start.saturating_add(l as usize),
         None => shown_total,
     }
     .min(shown_total);
+    let shown = if total == 0 { &selected[0..0] } else { &selected[start..end] };
 
-    let windowed = a.offset != 1 || end < shown_total;
-    if windowed {
-        out.push_str(&format!(" lines {}-{end} of {shown_total}", a.offset));
-        if end < shown_total {
-            out.push_str(&format!(" (next offset {})", end + 1));
-        }
+    // Header: `¶path#REV:rev lines=N` plus only the keys that apply, so a
+    // caller can parse it without prose-suffix guessing.
+    let mut out = String::with_capacity(64 + shown.len() * 80);
+    out.push('¶');
+    out.push_str(&canonical);
+    out.push_str("#REV:");
+    out.push_str(&rev.to_string());
+    out.push_str(&format!(" lines={total}"));
+    if needle.is_some() {
+        out.push_str(&format!(" matches={shown_total}"));
     }
-    if let Some(needle) = &a.grep {
-        out.push_str(&format!(" grep={needle:?} ({shown_total} of {total} lines)"));
+    if a.offset != 1 || end < shown_total {
+        // Real file line numbers, not positions within the filtered list.
+        let span = match (shown.first(), shown.last()) {
+            (Some(f), Some(l)) => format!("{}-{}", snap.entries[*f].lineno, snap.entries[*l].lineno),
+            _ => "none".to_owned(),
+        };
+        out.push_str(&format!(" window={span}"));
+        if end < shown_total {
+            out.push_str(&format!(" next={}", end + 1));
+        }
     }
     out.push('\n');
 
-    for &i in &selected[start..end] {
+    for &i in shown {
         let e = &snap.entries[i];
         out.push_str(&e.lineno.to_string());
         if a.hashes {
@@ -146,6 +151,7 @@ mod tests {
             hashes: true,
             if_rev_match: None,
             grep: None,
+            ignore_case: false,
         }
     }
 
@@ -157,6 +163,7 @@ mod tests {
             hashes: false,
             if_rev_match: None,
             grep: None,
+            ignore_case: false,
         }
     }
 
@@ -171,8 +178,9 @@ mod tests {
         let header = lines.next().unwrap();
         assert!(header.starts_with('¶'), "header: {header}");
         assert!(header.contains("#REV:0"), "header: {header}");
-        // Unpaginated header carries no window suffix.
-        assert!(!header.contains("lines"), "header: {header}");
+        // Unpaginated header reports the size but carries no window key.
+        assert!(header.contains("lines=2"), "header: {header}");
+        assert!(!header.contains("window="), "header: {header}");
         let l1 = lines.next().unwrap();
         let l2 = lines.next().unwrap();
         assert!(l1.starts_with("1:"), "l1: {l1}");
@@ -217,8 +225,9 @@ mod tests {
         let out = render(&store, &test_args(&path, 2, Some(2))).unwrap();
         let mut lines = out.lines();
         let header = lines.next().unwrap();
-        assert!(header.contains("lines 2-3 of 5"), "header: {header}");
-        assert!(header.contains("next offset 4"), "header: {header}");
+        assert!(header.contains("lines=5"), "header: {header}");
+        assert!(header.contains("window=2-3"), "header: {header}");
+        assert!(header.contains("next=4"), "header: {header}");
         let body: Vec<&str> = lines.collect();
         assert_eq!(body.len(), 2, "body: {body:?}");
         assert!(body[0].starts_with("2:"), "row: {}", body[0]);
@@ -235,8 +244,9 @@ mod tests {
         let store = HashStore::new();
         let out = render(&store, &test_args(&path, 2, Some(100))).unwrap();
         let header = out.lines().next().unwrap();
-        assert!(header.contains("lines 2-2 of 2"), "header: {header}");
-        assert!(!header.contains("next offset"), "header: {header}");
+        assert!(header.contains("lines=2"), "header: {header}");
+        assert!(header.contains("window=2-2"), "header: {header}");
+        assert!(!header.contains("next="), "header: {header}");
         std::fs::remove_file(&path).ok();
     }
 
@@ -269,10 +279,45 @@ mod tests {
         args.grep = Some("a".to_owned());
         let out = render(&store, &args).unwrap();
         let header = out.lines().next().unwrap();
-        assert!(header.contains("grep="), "header: {header}");
-        assert!(header.contains("3 of 3 lines"), "header: {header}");
+        assert!(header.contains("lines=3"), "header: {header}");
+        assert!(header.contains("matches=3"), "header: {header}");
         let body: Vec<&str> = out.lines().skip(1).collect();
         assert_eq!(body.len(), 3, "body: {body:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// In grep mode the header's window must report real file line numbers,
+    /// not positions within the filtered list — a caller edits by the former.
+    #[test]
+    fn grep_window_reports_real_line_numbers() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-grep-ln.txt", std::process::id()));
+        std::fs::write(&path, "no\nhit one\nno\nhit two\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, Some(1));
+        args.grep = Some("hit".to_owned());
+        let out = render(&store, &args).unwrap();
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("matches=2"), "header: {header}");
+        // First match shown, and the window names its real line (2), not 1.
+        assert!(header.contains("window=2-2"), "header: {header}");
+        assert!(out.contains("|hit one"), "out: {out}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn grep_can_ignore_case() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-grep-i.txt", std::process::id()));
+        std::fs::write(&path, "Alpha\nbeta\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, None);
+        args.grep = Some("alpha".to_owned());
+        // Case-sensitive by default: no match.
+        assert_eq!(render(&store, &args).unwrap().lines().count(), 1);
+        args.ignore_case = true;
+        let out = render(&store, &args).unwrap();
+        assert!(out.contains("Alpha"), "out: {out}");
         std::fs::remove_file(&path).ok();
     }
 

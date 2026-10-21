@@ -241,10 +241,19 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
     //    lines and nothing else would catch it (our own writes keep the
     //    external-modification guard quiet). Fail loudly instead of
     //    silently editing the wrong line.
+    //    `sub` counts when it anchors by number; by hash it is safe like any
+    //    other hash op.
     let uses_line_numbers = a.ops.iter().any(|op| {
         matches!(
             op,
-            Op::SetN { .. } | Op::InsertN { .. } | Op::DeleteN { .. } | Op::ReplaceN { .. }
+            Op::SetN { .. }
+                | Op::InsertN { .. }
+                | Op::DeleteN { .. }
+                | Op::ReplaceN { .. }
+                | Op::Sub {
+                    hash: None,
+                    ..
+                }
         )
     });
     if uses_line_numbers
@@ -371,6 +380,48 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
                         start: st,
                         end: en,
                         lines: ins,
+                    },
+                });
+            }
+            Op::Sub {
+                line,
+                hash,
+                old,
+                new,
+                count,
+            } => {
+                // Anchor by number or by hash — whichever the caller has.
+                let n = match (line, hash) {
+                    (Some(l), _) => check_lineno(&snap, *l, "sub.line")?,
+                    (None, Some(h)) => resolve_one(&snap, h).map_err(hash_to_tool)?,
+                    (None, None) => {
+                        return Err(crate::tool_err(
+                            "sub needs a `line` or a `hash` to say which line to change",
+                        ));
+                    }
+                };
+                let want = count.unwrap_or(1).max(1);
+                let idx = (n - 1) as usize;
+                let (s, e) = line_ranges(&bytes)[idx];
+                let text = String::from_utf8_lossy(&bytes[s..e]).to_string();
+                let found = text.matches(old.as_str()).count();
+                if found != want as usize {
+                    return Err(crate::tool_err(format!(
+                        "sub.line {n}: expected {want} occurrence(s) of {old:?} but found {found}; \
+                         nothing was changed"
+                    )));
+                }
+                let updated = text.replacen(old.as_str(), new, want as usize);
+                if updated.contains('\n') || updated.contains('\r') {
+                    return Err(crate::tool_err(
+                        "sub.new must not introduce a line break; use replace lines instead",
+                    ));
+                }
+                resolved.push(Resolved {
+                    anchor: n,
+                    kind: ResolvedKind::Set {
+                        lineno: n,
+                        content: updated.into_bytes(),
                     },
                 });
             }
@@ -1182,6 +1233,121 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("binary"), "got: {}", err.message);
         assert_eq!(std::fs::read(&p).unwrap(), original, "bytes must be intact");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sub_replaces_a_substring_in_place() {
+        let store = HashStore::new();
+        let p = tmpfile("sub");
+        let long = format!("let {} = call({}, {});", "x", "1", "2");
+        std::fs::write(&p, format!("{long}\n")).unwrap();
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::Sub {
+                    line: Some(1),
+                    hash: None,
+                    old: "1".into(),
+                    new: "42".into(),
+                    count: None,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            format!("let x = call(42, 2);\n")
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sub_can_anchor_by_hash_and_honours_count() {
+        let store = HashStore::new();
+        let p = tmpfile("sub-hash");
+        std::fs::write(&p, "a a a\nb\n").unwrap();
+        let h = read_hashes(&store, &p);
+        // Wrong count is refused and nothing is written.
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::Sub {
+                    line: None,
+                    hash: Some(h[0].clone()),
+                    old: "a".into(),
+                    new: "z".into(),
+                    count: Some(2),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("found 3"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a a a\nb\n");
+
+        // Correct count goes through.
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::Sub {
+                    line: None,
+                    hash: Some(h[0].clone()),
+                    old: "a".into(),
+                    new: "z".into(),
+                    count: Some(3),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "z z z\nb\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sub_requires_an_anchor_and_rejects_multiline_new() {
+        let store = HashStore::new();
+        let p = tmpfile("sub-bad");
+        std::fs::write(&p, "a\n").unwrap();
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::Sub {
+                    line: None,
+                    hash: None,
+                    old: "a".into(),
+                    new: "b".into(),
+                    count: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("needs a `line` or a `hash`"), "got: {}", err.message);
+
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                ops: vec![Op::Sub {
+                    line: Some(1),
+                    hash: None,
+                    old: "a".into(),
+                    new: "b\nc".into(),
+                    count: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("line break"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\n");
         std::fs::remove_file(&p).ok();
     }
 }

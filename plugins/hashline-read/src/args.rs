@@ -28,10 +28,16 @@ pub(crate) struct ReadArgs {
     pub hashes: bool,
     pub if_rev_match: Option<u64>,
     pub grep: Option<String>,
+    /// Case-insensitive substring match for `grep`.
+    pub ignore_case: bool,
 }
 
 pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
     #[derive(serde::Deserialize)]
+    // Unknown keys are rejected: `{"path":..., "hash":true}` used to be
+    // silently ignored, which then surfaced as a mysterious `unknown hash`
+    // one tool call later.
+    #[serde(deny_unknown_fields)]
     struct Raw {
         path: String,
         #[serde(default)]
@@ -44,6 +50,8 @@ pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
         if_rev_match: Option<u64>,
         #[serde(default)]
         grep: Option<String>,
+        #[serde(default)]
+        ignore_case: Option<bool>,
     }
     let raw: Raw = serde_json::from_str(args)
         .map_err(|e| crate::tool_err(format!("invalid arguments: {e}")))?;
@@ -65,9 +73,13 @@ pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
         path: PathBuf::from(raw.path),
         offset,
         limit,
-        hashes: raw.hashes.unwrap_or(false),
+        // Hashes are on by default: they are what makes the output editable,
+        // and needing a second read (or a failed edit) to get them costs more
+        // than the four bytes per line they add.
+        hashes: raw.hashes.unwrap_or(true),
         if_rev_match: raw.if_rev_match,
         grep,
+        ignore_case: raw.ignore_case.unwrap_or(false),
     })
 }
 
@@ -76,13 +88,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_a_fifty_line_quiet_window() {
+    fn defaults_to_a_fifty_line_hashed_window() {
         let a = parse_args(r#"{"path":"f.txt"}"#).unwrap();
         assert_eq!(a.offset, 1);
         assert_eq!(a.limit, Some(DEFAULT_LIMIT));
-        assert!(!a.hashes);
+        // Hashes default on: they are what makes the rows editable.
+        assert!(a.hashes);
         assert!(a.if_rev_match.is_none());
         assert!(a.grep.is_none());
+        assert!(!a.ignore_case);
+    }
+
+    #[test]
+    fn hashes_are_opt_out() {
+        assert!(!parse_args(r#"{"path":"f","hashes":false}"#).unwrap().hashes);
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected_not_ignored() {
+        // A typo'd key used to be dropped silently, turning a hashed read into
+        // a quiet one and surfacing later as `unknown hash`.
+        assert!(parse_args(r#"{"path":"f","hash":true}"#).is_err());
+        assert!(parse_args(r#"{"path":"f","nope":1}"#).is_err());
     }
 
     #[test]
@@ -99,11 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_hashes_rev_and_grep() {
-        let a = parse_args(r#"{"path":"f","hashes":true,"if_rev_match":3,"grep":"x"}"#).unwrap();
+    fn parses_hashes_rev_grep_and_ignore_case() {
+        let a = parse_args(
+            r#"{"path":"f","hashes":true,"if_rev_match":3,"grep":"x","ignore_case":true}"#,
+        )
+        .unwrap();
         assert!(a.hashes);
         assert_eq!(a.if_rev_match, Some(3));
         assert_eq!(a.grep.as_deref(), Some("x"));
+        assert!(a.ignore_case);
         // Empty grep is treated as absent.
         assert!(parse_args(r#"{"path":"f","grep":""}"#).unwrap().grep.is_none());
     }

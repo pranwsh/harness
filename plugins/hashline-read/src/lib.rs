@@ -1,9 +1,10 @@
 //! `hashline_read`: mmap-backed file read with stable per-line hashes.
 //!
-//! Default output is quiet: a `¶path#REV:{rev}` header (plus a
-//! `lines a-b of N` suffix when windowed) then `{line}: {content}`. Pass
-//! `hashes: true` for the edit-ready `{line}:{hash}|{content}` form used by
-//! `hashline_edit`. Line numbers are absolute in every mode.
+//! Default output is edit-ready: a `¶path#REV:{rev} lines=N` header (plus
+//! `matches=`/`window=a-b`/`next=K` when they apply) then
+//! `{line}:{hash}|{content}` rows usable directly by `hashline_edit`. Pass
+//! `hashes: false` for the quieter `{line}: {content}` form. Line numbers are
+//! absolute in every mode, so a paginated hashed read is still editable.
 
 mod args;
 mod render;
@@ -48,18 +49,25 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn hashline_read_spec() -> ToolSpec {
     ToolSpec {
         name: "hashline_read".to_owned(),
-        description: "Read a file (default: first 50 lines, quiet `line: content` rows). Header `¶path#REV:{rev}`; window suffix `lines a-b of N (next offset K)` when truncated. Options: offset/limit (1-based; limit<=0 = to EOF), hashes=true for edit-ready `line:hash|content` (needed for hashline_edit), grep=SUBSTR to filter, if_rev_match=REV to elide the body when unchanged. Errors clearly on directories.".to_owned(),
+        description: "Read a file (default: first 50 lines, edit-ready `line:hash|content` rows). \
+            Header `¶path#REV:{rev} lines=N` plus `matches=N`/`window=a-b`/`next=K` when they apply. \
+            Options: offset/limit (1-based; limit<=0 = to EOF), hashes=false for quiet `line: content` rows, \
+            grep=SUBSTR (+ignore_case) to filter, if_rev_match=REV to elide the body when unchanged. \
+            Hashes are what hashline_edit anchors on; a bare read is read-only. Errors clearly on directories."
+            .to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Absolute or cwd-relative file path" },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based first line to render (default 1)" },
                 "limit": { "type": "integer", "description": "Max lines to render (default 50; <=0 means to EOF)" },
-                "hashes": { "type": "boolean", "description": "Emit edit-ready `line:hash|content` rows (default false)" },
+                "hashes": { "type": "boolean", "description": "Emit edit-ready `line:hash|content` rows (default true; false for quiet rows)" },
                 "grep": { "type": "string", "description": "Only show lines containing this substring" },
+                "ignore_case": { "type": "boolean", "description": "Case-insensitive grep (default false)" },
                 "if_rev_match": { "type": "integer", "minimum": 0, "description": "Elide the body when the file rev equals this" }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         }),
     }
 }
@@ -113,7 +121,8 @@ mod tests {
             arguments: serde_json::json!({"path": path.display().to_string(), "offset": 3}).to_string(),
         };
         let out = tools.execute("a", "s", 1, call).await.unwrap();
-        assert!(out.contains("lines 3-3 of 3"), "got: {out}");
+        assert!(out.contains("lines=3"), "got: {out}");
+        assert!(out.contains("window=3-3"), "got: {out}");
         assert!(out.contains("3:"), "got: {out}");
         assert!(!out.contains("1:"), "got: {out}");
         std::fs::remove_file(&path).ok();
