@@ -87,10 +87,13 @@ fn resolve_one(snap: &FileSnapshot, hash: &str) -> std::result::Result<u32, Hash
 /// Bounds-check a 1-based line number against the snapshot.
 fn check_lineno(snap: &FileSnapshot, n: u32, what: &str) -> std::result::Result<u32, ToolError> {
     let total = snap.entries.len() as u32;
-    if n < 1 || n > total.max(1) {
-        return Err(crate::tool_err(format!(
-            "{what}={n} out of bounds ({total} lines)"
-        )));
+    // An empty file has no line 1: say that instead of letting `n` pass here
+    // and failing later with a different message from the splice.
+    if total == 0 {
+        return Err(crate::tool_err(format!("file is empty; {what} has no line to address")));
+    }
+    if n < 1 || n > total {
+        return Err(crate::tool_err(format!("{what}={n} out of bounds ({total} lines)")));
     }
     Ok(n)
 }
@@ -118,7 +121,10 @@ fn check_range(
     what: &str,
 ) -> std::result::Result<(u32, u32), ToolError> {
     let total = snap.entries.len() as u32;
-    if start < 1 || end < 1 || start > end || end > total.max(1) {
+    if total == 0 {
+        return Err(crate::tool_err(format!("file is empty; {what} has no lines to range over")));
+    }
+    if start < 1 || end < 1 || start > end || end > total {
         return Err(crate::tool_err(format!(
             "{what} range {start}-{end} invalid ({total} lines)"
         )));
@@ -503,9 +509,8 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
         ranges.sort();
         for w in ranges.windows(2) {
             if w[0].1 >= w[1].0 {
-                return Err(crate::tool_err(
-                    "overlapping ops in one batch; split into separate edits or re-read",
-                ));
+                let (a, b) = (&w[0], &w[1]);
+                return Err(crate::tool_err(format!("overlapping ops in one batch (lines {}-{} and {}-{}); split into separate edits or re-read", a.0, a.1, b.0, b.1)));
             }
         }
         // Insert anchored inside a deleted/replaced range is ambiguous.
@@ -514,9 +519,7 @@ pub(crate) fn apply(store: &HashStore, a: &Args) -> std::result::Result<String, 
                 for (s, e) in &ranges {
                     if *after >= *s && *after < *e {
                         // `after == e` is fine (append after the range).
-                        return Err(crate::tool_err(
-                            "insert anchor lies inside a deleted range; re-read and retry",
-                        ));
+                        return Err(crate::tool_err(format!("insert anchor line {after} lies inside the deleted/replaced range {s}-{e}; re-read and retry")));
                     }
                 }
             }
@@ -1623,6 +1626,89 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("only op"), "got: {}", err.message);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A hash shared by two identical lines is content-addressing working as
+    /// designed: the anchor is genuinely ambiguous, so say so instead of
+    /// silently picking one. Line-number ops are the escape hatch.
+    #[test]
+    fn ambiguous_hash_is_reported_with_the_candidate_lines() {
+        let store = HashStore::new();
+        let p = tmpfile("ambiguous");
+        std::fs::write(&p, "same\nsame\nsame\n").unwrap();
+        let h = read_hashes(&store, &p);
+        assert_eq!(h[0], h[1], "identical lines must hash identically");
+        let err = apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::Set {
+                    hash: h[0].clone(),
+                    content: "x".into(),
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("ambiguous"), "got: {}", err.message);
+        assert!(err.message.contains("1, 2, 3"), "got: {}", err.message);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "same\nsame\nsame\n");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A file without a trailing newline must stay that way: adding one is a
+    /// diff on the last line the caller never asked for.
+    #[test]
+    fn missing_trailing_newline_is_preserved() {
+        let store = HashStore::new();
+        let p = tmpfile("no-trailing-nl");
+        std::fs::write(&p, "a\nb\nc").unwrap();
+        apply(
+            &store,
+            &Args {
+                path: p.display().to_string(),
+                rev: None,
+                dry_run: false,
+                ops: vec![Op::SetN {
+                    line: 2,
+                    content: "B".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nB\nc");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Line ops on an empty file have nothing to address; the message must say
+    /// that rather than reporting a nonsensical range.
+    #[test]
+    fn line_ops_on_an_empty_file_say_so() {
+        let store = HashStore::new();
+        let p = tmpfile("empty-lineno");
+        std::fs::write(&p, "").unwrap();
+        for ops in [
+            vec![Op::SetN {
+                line: 1,
+                content: "x".into(),
+            }],
+            vec![Op::DeleteN { start: 1, end: 1 }],
+        ] {
+            let err = apply(
+                &store,
+                &Args {
+                    path: p.display().to_string(),
+                    rev: None,
+                    dry_run: false,
+                    ops,
+                },
+            )
+            .unwrap_err();
+            assert!(err.message.contains("empty"), "got: {}", err.message);
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
         std::fs::remove_file(&p).ok();
     }
 }

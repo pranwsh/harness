@@ -123,11 +123,10 @@ pub fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         ranges.push((start, nl));
         start = nl + 1;
     }
-    if start < data.len() || data.is_empty() && ranges.is_empty() {
-        // Non-empty tail without trailing newline, or empty file -> 0 lines.
-        if start < data.len() {
-            ranges.push((start, data.len()));
-        }
+    // A tail without a trailing newline is its own line; an empty file has
+    // no lines at all (so this stays false for `data.is_empty()`).
+    if start < data.len() {
+        ranges.push((start, data.len()));
     }
     ranges
 }
@@ -771,7 +770,9 @@ impl HashStore {
         self.hash_all_serial(data)
     }
     fn hash_all_serial(&self, data: &[u8]) -> Vec<LineEntry> {
-        let mut out = Vec::new();
+        // One entry per newline is the exact upper bound; avoids regrowth on
+        // the small-file path, which is the common one.
+        let mut out = Vec::with_capacity(memchr::memchr_iter(b'\n', data).count() + 1);
         let mut lineno: u32 = 0;
         for_each_line(data, |line| {
             lineno += 1;
