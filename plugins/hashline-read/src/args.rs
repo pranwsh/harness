@@ -30,6 +30,8 @@ pub(crate) struct ReadArgs {
     pub grep: Option<String>,
     /// Case-insensitive substring match for `grep`.
     pub ignore_case: bool,
+    /// Lines of context to include around each grep match.
+    pub context: usize,
 }
 
 pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
@@ -52,6 +54,8 @@ pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
         grep: Option<String>,
         #[serde(default)]
         ignore_case: Option<bool>,
+        #[serde(default)]
+        context: Option<u32>,
     }
     let raw: Raw = serde_json::from_str(args)
         .map_err(|e| crate::tool_err(format!("invalid arguments: {e}")))?;
@@ -80,6 +84,7 @@ pub(crate) fn parse_args(args: &str) -> Result<ReadArgs, ToolError> {
         if_rev_match: raw.if_rev_match,
         grep,
         ignore_case: raw.ignore_case.unwrap_or(false),
+        context: raw.context.unwrap_or(0) as usize,
     })
 }
 

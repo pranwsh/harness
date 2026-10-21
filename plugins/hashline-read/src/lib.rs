@@ -52,7 +52,8 @@ pub fn hashline_read_spec() -> ToolSpec {
         description: "Read a file (default: first 50 lines, edit-ready `line:hash|content` rows). \
             Header `¶path#REV:{rev} lines=N` plus `matches=N`/`window=a-b`/`next=K` when they apply. \
             Options: offset/limit (1-based; limit<=0 = to EOF), hashes=false for quiet `line: content` rows, \
-            grep=SUBSTR (+ignore_case) to filter, if_rev_match=REV to elide the body when unchanged. \
+            grep=SUBSTR (+ignore_case) to filter, context=K to include K lines around each hit, \
+            if_rev_match=REV to elide the body when unchanged. \
             Hashes are what hashline_edit anchors on; a bare read is read-only. Errors clearly on directories."
             .to_owned(),
         parameters: serde_json::json!({
@@ -62,7 +63,8 @@ pub fn hashline_read_spec() -> ToolSpec {
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based first line to render (default 1)" },
                 "limit": { "type": "integer", "description": "Max lines to render (default 50; <=0 means to EOF)" },
                 "hashes": { "type": "boolean", "description": "Emit edit-ready `line:hash|content` rows (default true; false for quiet rows)" },
-                "grep": { "type": "string", "description": "Only show lines containing this substring" },
+                "ignore_case": { "type": "boolean", "description": "Case-insensitive grep (default false)" },
+                "context": { "type": "integer", "minimum": 0, "description": "Lines of context around each grep match (default 0)" },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive grep (default false)" },
                 "if_rev_match": { "type": "integer", "minimum": 0, "description": "Elide the body when the file rev equals this" }
             },

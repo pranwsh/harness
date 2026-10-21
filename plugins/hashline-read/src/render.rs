@@ -138,7 +138,32 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
         Some(n) => text.contains(n),
         None => true,
     };
-    let selected: Vec<usize> = (0..total).filter(|&i| matches(&line_text(i))).collect();
+    let matched: Vec<usize> = (0..total).filter(|&i| matches(&line_text(i))).collect();
+
+    // With `context`, a match drags its neighbours into the output. Rows keep
+    // the same `line:hash|content` shape, so the extra lines stay editable and
+    // the header's `matches=` still reports only the real hits.
+    let display: Vec<usize> = if needle.is_some() && a.context > 0 && !matched.is_empty() {
+        let mut out: Vec<usize> = Vec::with_capacity(matched.len() * (a.context * 2 + 1));
+        let mut last: Option<usize> = None;
+        for &m in &matched {
+            let lo = m.saturating_sub(a.context);
+            let hi = (m + a.context).min(total.saturating_sub(1));
+            // Never re-emit a line two nearby matches both pull in.
+            let lo = match last {
+                Some(l) if l >= lo => l + 1,
+                _ => lo,
+            };
+            for i in lo..=hi {
+                out.push(i);
+                last = Some(i);
+            }
+        }
+        out
+    } else {
+        matched.clone()
+    };
+    let selected = &display;
     let shown_total = selected.len();
 
     // Window is an index range into the selected rows; resolve it before
@@ -169,7 +194,8 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     out.push_str(&rev.to_string());
     out.push_str(&format!(" lines={total}"));
     if needle.is_some() {
-        out.push_str(&format!(" matches={shown_total}"));
+        // Real hits, not the context rows we padded in around them.
+        out.push_str(&format!(" matches={}", matched.len()));
     }
     if a.offset != 1 || end < shown_total {
         // Real file line numbers, not positions within the filtered list.
@@ -214,6 +240,7 @@ mod tests {
             if_rev_match: None,
             grep: None,
             ignore_case: false,
+            context: 0,
         }
     }
 
@@ -226,6 +253,7 @@ mod tests {
             if_rev_match: None,
             grep: None,
             ignore_case: false,
+            context: 0,
         }
     }
 
@@ -459,6 +487,28 @@ mod tests {
         let err = render(&store, &test_args(&path, 1, None)).unwrap_err();
         assert!(err.message.contains("binary"), "got: {}", err.message);
         assert_eq!(std::fs::read(&path).unwrap(), original, "bytes stay intact");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Context rows make a grep hit readable in place; `matches=` still
+    /// counts only the real hits, not the padding.
+    #[test]
+    fn grep_context_includes_neighbours() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-ctx.txt", std::process::id()));
+        std::fs::write(&path, "one\ntwo\nHIT\nfour\nfive\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, None);
+        args.grep = Some("HIT".to_owned());
+        args.context = 1;
+        let out = render(&store, &args).unwrap();
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("matches=1"), "header: {header}");
+        let body: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(body.len(), 3, "body: {body:?}");
+        assert!(body[0].contains("|two"), "body: {body:?}");
+        assert!(body[1].contains("|HIT"), "body: {body:?}");
+        assert!(body[2].contains("|four"), "body: {body:?}");
         std::fs::remove_file(&path).ok();
     }
 }
