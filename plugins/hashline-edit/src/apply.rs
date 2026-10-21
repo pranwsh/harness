@@ -246,10 +246,7 @@ fn detect_eol(bytes: &[u8]) -> std::result::Result<&'static str, ToolError> {
 /// Splitting a binary file on `\\n` and writing it back is data loss, and the
 /// caller almost certainly meant a different path.
 fn guard_text(bytes: &[u8], path: &Path) -> std::result::Result<(), ToolError> {
-    // A NUL in the leading 8 KiB is the same heuristic `git` uses for
-    // "binary": cheap, no decoding, no false positives on real source.
-    let head = &bytes[..bytes.len().min(8192)];
-    if head.contains(&0) {
+    if harness_hash_base::looks_binary(bytes) {
         return Err(crate::tool_err(format!(
             "{} looks like a binary file (NUL byte in the first 8 KiB); \
              hashline_edit only edits text",

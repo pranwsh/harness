@@ -98,6 +98,16 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     let (snap, bytes) = store
         .snapshot(&a.path)
         .map_err(|e| crate::tool_err(e.to_string()))?;
+    // Refuse binary: splitting a PNG on `\n` and hashing the pieces yields
+    // tags that address nothing a caller can meaningfully edit, and dumping
+    // the bytes into the transcript is worse than the error.
+    if harness_hash_base::looks_binary(&bytes) {
+        return Err(crate::tool_err(format!(
+            "{} looks like a binary file (NUL byte in the first 8 KiB); \
+             hashline_read only reads text",
+            a.path.display()
+        )));
+    }
     let canonical = snap.canonical.display().to_string();
     let rev = snap.rev;
 
@@ -432,6 +442,22 @@ mod tests {
         let out = render(&store, &args).unwrap();
         assert!(!out.contains("UNCHANGED"), "stale rev must not elide: {out}");
         assert!(out.contains("ZZZ"), "the new body must be rendered: {out}");
+        assert!(out.contains("ZZZ"), "the new body must be rendered: {out}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A binary file has no lines a caller can edit meaningfully, and the
+    /// bytes should not land in the transcript. Say so instead.
+    #[test]
+    fn binary_files_are_refused() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-bin.txt", std::process::id()));
+        let original: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        std::fs::write(&path, original).unwrap();
+        let store = HashStore::new();
+        let err = render(&store, &test_args(&path, 1, None)).unwrap_err();
+        assert!(err.message.contains("binary"), "got: {}", err.message);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "bytes stay intact");
         std::fs::remove_file(&path).ok();
     }
 }

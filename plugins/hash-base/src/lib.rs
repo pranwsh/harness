@@ -144,6 +144,18 @@ pub fn for_each_line(data: &[u8], mut f: impl FnMut(&[u8])) {
 }
 
 
+/// Does `data` look like binary, by the same NUL-in-the-leading-8-KiB
+/// heuristic `git` uses?
+///
+/// A tool that splits on `\n` (read or edit) must refuse binary input:
+/// hashing a PNG line-by-line produces nonsense tags, and writing the split
+/// lines back is data loss. Cheap, no decoding, and effectively no false
+/// positives on real source.
+pub fn looks_binary(data: &[u8]) -> bool {
+    data[..data.len().min(8192)].contains(&0)
+}
+
+
 /// Digest of an empty file. `fold_digest` short-circuits to this, and
 /// `snapshot` records it for zero-length files.
 pub const EMPTY_DIGEST: u64 = 0x9E37_79B9_7F4A_7C15;
