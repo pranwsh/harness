@@ -490,14 +490,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+        let snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
         assert!(snap.contains("running=true"), "got: {snap}");
         let stopped = mgr.stop(&id).await.unwrap();
         assert!(
             stopped.contains("stopped") || stopped.contains("running=false"),
             "{stopped}"
         );
-        let snap2 = mgr.poll(&id, None, Some(0)).await.unwrap();
+        let snap2 = mgr.poll(&id, None, Some(1_000)).await.unwrap();
         assert!(snap2.contains("running=false"), "got: {snap2}");
         mgr.shutdown().await;
     }
@@ -520,7 +520,7 @@ mod tests {
         // Wait bounded for natural exit.
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+            snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -563,6 +563,42 @@ mod tests {
         mgr.shutdown().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_kills_job_descendants() {
+        let cfg = test_config();
+        let mgr = JobManager::new(JobLimits::from_config(&cfg));
+        let id = mgr
+            .start(
+                &cfg,
+                "bash".to_owned(),
+                vec![
+                    "bash".to_owned(),
+                    "-c".to_owned(),
+                    "sleep 30 & echo $!; wait".to_owned(),
+                ],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
+        let pid: i32 = snap
+            .lines()
+            .find_map(|line| line.trim().parse().ok())
+            .expect("child pid");
+        mgr.stop(&id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // SAFETY: kill(pid, 0) only probes process existence.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "job descendant survived stop"
+        );
+        mgr.shutdown().await;
+    }
+
     #[tokio::test]
     async fn expiry_kills_long_job() {
         let mut cfg = test_config();
@@ -585,7 +621,7 @@ mod tests {
             .unwrap();
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+            snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -637,7 +673,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+        let snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
         // Status header always; no scaffolding for empty streams and no
         // command repeat (the start call in history already shows it).
         assert!(snap.contains("running=true"), "got: {snap}");
@@ -664,7 +700,7 @@ mod tests {
             .unwrap();
         let mut snap = String::new();
         for _ in 0..50 {
-            snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+            snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
             if snap.contains("running=false") {
                 break;
             }
@@ -761,7 +797,7 @@ mod tests {
             .await
             .unwrap();
         let start = Instant::now();
-        let snap = mgr.poll(&id, None, Some(0)).await.unwrap();
+        let snap = mgr.poll(&id, None, Some(1_000)).await.unwrap();
         assert!(snap.contains("running=true"), "got: {snap}");
         assert!(
             start.elapsed() < Duration::from_secs(2),
