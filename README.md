@@ -44,10 +44,96 @@ Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --fla
 
 ### Config from Home Manager
 
-`programs.harness` generates the config file for you. Import the module:
+The Home Manager module exposes every option in `config.example.toml` through
+`programs.harness.settings`: `llm`, `agent`, `session`, `skills`, `shell`, and
+`mcp.servers.<name>`. The following is a complete practical configuration,
+based on a local NixOS setup. Adjust the endpoint, model, secret path, and MCP
+server environment for your machine:
 
 ```nix
-# flake.nix
+# home/dev/harness.nix
+{ inputs, ... }:
+{
+  imports = [ inputs.harness.homeManagerModules.default ];
+
+  programs.harness = {
+    enable = true;
+
+    # Keep API keys out of settings: Nix settings are stored in the world-readable
+    # Nix store. This file should be provisioned by your secret manager.
+    llmApiKeyFile = "/run/secrets/ninerouter_key";
+
+    settings = {
+      llm = {
+        base_url = "http://localhost:20128/v1";
+        model = "oc/muse-spark-1.3-contributor-free";
+        # Optional LLM options, if needed:
+        # user_agent = "my-client/1.0";
+        # headers = { HTTP-Referer = "https://example.org"; X-Title = "my harness"; };
+        # responses_models = [ "some-responses-only-model" ];
+      };
+
+      agent.max_iterations = 128;
+
+      # Optional session persistence; enabled by default. `dir` can override
+      # the XDG data directory.
+      session = {
+        enabled = true;
+        # dir = "/home/alice/.local/share/harness/sessions";
+      };
+
+      # Optional Agent Skills catalog; enabled by default. `dir` can override
+      # the XDG config directory containing skill subdirectories.
+      skills = {
+        enabled = true;
+        # dir = "/home/alice/.config/harness/skills";
+      };
+
+      # Shell resource limits (these are limits, not command allowlists).
+      shell = {
+        default_timeout_ms = 30000;
+        max_timeout_ms = 120000;
+        max_output_bytes = 65536;
+        max_capture_bytes = 1048576;
+        max_jobs = 32;
+        max_job_time_ms = 600000;
+        max_job_output_bytes = 262144;
+      };
+
+      # Each named MCP server is started as a persistent stdio child process.
+      # The example starts mcp-searxng through Nix's Node package; configure
+      # server-specific variables for your local SearXNG instance.
+      mcp.servers.searxng = {
+        command = "nix";
+        args = [
+          "shell"
+          "nixpkgs#nodejs_22"
+          "--command"
+          "npx"
+          "-y"
+          "mcp-searxng"
+        ];
+        env = {
+          SEARXNG_URL = "http://127.0.0.1:8888";
+          SEARXNG_FANOUT = "false";
+          SEARXNG_TIMEOUT_MS = "10000";
+          SEARXNG_MAX_RESULTS = "5";
+          SEARXNG_HTML_FALLBACK = "false";
+          NO_PROXY = "127.0.0.1,localhost";
+        };
+        # Optional per-tool-call timeout and disable switch:
+        # timeout_ms = 30000;
+        # disabled = false;
+      };
+    };
+  };
+}
+```
+
+Import `inputs.harness.homeManagerModules.default` in your Home Manager module
+and provide `inputs` to it. For example, in a flake-based Home Manager setup:
+
+```nix
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -56,43 +142,32 @@ Then rebuild (`sudo nixos-rebuild switch --flake .` / `home-manager switch --fla
 }
 ```
 
-```nix
-# home.nix
-{ inputs, pkgs, ... }:
-{
-  imports = [ inputs.harness.homeManagerModules.default ];
+The required LLM settings are `llm.base_url` and `llm.model`. Normally set
+`llmApiKeyFile` and leave `llm.api_key` out of `settings`: values in `settings`
+are rendered into the Nix store. If you intentionally use a non-secret key,
+you may set `llm.api_key` in `settings` instead. The optional LLM fields are
+`user_agent`, `headers`, and `responses_models`; see `config.example.toml` for
+details.
 
-  programs.harness = {
-    enable = true;
-    settings = {
-      llm = {
-        base_url = "https://opencode.ai/zen/v1";
-        model = "muse-spark-1.3-contributor-free";
-        api_key = "public";
-        user_agent = "opencode/1.18.18";
-        headers = {
-          HTTP-Referer = "https://opencode.ai/";
-          X-Title = "opencode";
-        };
-      };
-      agent.max_iterations = 128;
-      # Optional; omit a key (or set it to `null`) and the built-in default applies.
-      session.enabled = true;
-      skills.enabled = true;
-      mcp.servers.fetch = { command = "npx"; args = [ "-y" "@modelcontextprotocol/server-fetch" ]; };
-    };
-  };
-}
-```
+All fields have defaults where documented in `config.example.toml`; omit
+optional fields to use those defaults. Session persistence and Skills are on by
+default. MCP server options are `command` (required), `args`, `env`, optional
+`timeout_ms`, and `disabled`.
 
-`settings` mirrors the sections in `config.example.toml`. Only `llm.base_url`, `llm.model` and `llm.api_key` are required — a missing `[llm]` is a parse error and `harness` exits at startup.
+Two implementation details:
 
-Two things worth knowing:
+- **The managed config is writable at runtime.** Nix generates a read-only
+template, while the wrapper materializes a writable live file so the `/model`
+picker can persist model selections. The chosen model survives restarts and
+Home Manager switches; other settings follow the Nix declaration. With
+`llmApiKeyFile`, the app uses a `0600` runtime copy under `$XDG_RUNTIME_DIR` so
+the key is not written to durable config.
+- **The wrapper passes `--config` explicitly.** This honours custom
+`xdg.configHome` and `programs.harness.configFileName`. Without `settings`, the
+module just installs the binary and does not generate or manage a config file.
 
-- **`harness` is wrapped.** The app resolves config as `$XDG_CONFIG_HOME/harness/config.toml`, else `$HOME/.config/harness/config.toml`, with a `./config.toml` cwd fallback when neither env var is usable (`plugins/config/src/lib.rs`). A file managed at `$XDG_CONFIG_HOME/harness/config.toml` is found on its own, but the module still installs a wrapper that passes the explicit `--config` (so a custom `xdg.configHome` and a non-default `configFileName` are honoured). Unset `settings` and you get the plain binary plus no managed file.
-- **`settings` is the source of truth for everything except `model`.** The generated file is a read-only *template* in the store; the wrapper materialises a writable live file from it at launch, so the model popup's in-place `[llm] model` rewrite (which a store path would reject) lands on a real file. A `/model` pick persists across restarts, and a `home-manager switch` rolls every other setting while keeping your chosen model. Without `llmApiKeyFile` the live file is `$XDG_CONFIG_HOME/harness/config.toml`; with it, the app runs against a `0600` copy under `$XDG_RUNTIME_DIR` (the key stays off disk) and the chosen model is copied back to a keyless copy at the config path.
-
-With `settings` unset the module changes nothing beyond installing the package, which is the same as the `home.packages` snippet above.
+After adding or changing settings, rebuild with `home-manager switch --flake .`
+or `sudo nixos-rebuild switch --flake .` (for NixOS-integrated Home Manager).
 
 ## Development
 
