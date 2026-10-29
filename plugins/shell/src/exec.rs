@@ -301,6 +301,38 @@ mod tests {
         assert!(out.contains("timed_out=true"), "got: {out}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendants_in_the_command_process_group() {
+        let cfg = ShellConfig::default();
+        let req = resolve_request(
+            &cfg,
+            "bash".to_owned(),
+            vec![
+                "bash".to_owned(),
+                "-c".to_owned(),
+                "sleep 30 & child=$!; echo $child; wait".to_owned(),
+            ],
+            None,
+            Some(300),
+            None,
+        )
+        .unwrap();
+        let output = run_once(&cfg, req).await.unwrap();
+        assert!(output.contains("timed_out=true"), "{output}");
+        let child_pid: i32 = output
+            .lines()
+            .find_map(|line| line.trim().parse().ok())
+            .expect("child pid captured");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // SAFETY: kill(pid, 0) only checks process existence.
+        assert_eq!(
+            unsafe { libc::kill(child_pid, 0) },
+            -1,
+            "background child survived timeout"
+        );
+    }
+
     #[tokio::test]
     async fn huge_output_is_bounded() {
         let cfg = ShellConfig::default();
