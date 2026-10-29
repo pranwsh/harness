@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
-use crate::env::detach_tty;
+use crate::env::{detach_tty, kill_process_group};
 use crate::exec::Ring;
 
 /// Process-wide nonce counter: temp files and markers must be unique
@@ -67,6 +67,7 @@ impl BashSession {
     pub async fn shutdown(&self) {
         let mut guard = self.state.lock().await;
         if let Some(mut state) = guard.take() {
+            kill_process_group(state.child.id());
             let _ = state.child.start_kill();
             let _ = state.child.wait().await;
         }
@@ -150,6 +151,7 @@ impl BashSession {
     /// Kill errors are ignored (already-dead child).
     fn kill_slot(slot: &mut Option<SessionState>) {
         if let Some(mut state) = slot.take() {
+            kill_process_group(state.child.id());
             let _ = state.child.start_kill();
         }
     }
@@ -316,28 +318,25 @@ async fn take_partial_stdout(stdout: &mut BufReader<ChildStdout>, cap: usize) ->
     ring.snapshot_with_omitted()
 }
 
-    /// Reads the per-call stderr file's tail, bounded by `cap`.
-    async fn read_capped_tail(path: &Path, cap: usize) -> (Vec<u8>, u64) {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let cap = cap.max(1024);
-        let Ok(mut file) = tokio::fs::File::open(path).await else {
-            return (Vec::new(), 0);
-        };
-        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        // Over-read slightly so the UTF-8 boundary fixup never eats content.
-        let start = len.saturating_sub(cap as u64 + 4);
-        let mut buf = Vec::new();
-        if file
-            .seek(std::io::SeekFrom::Start(start))
-            .await
-            .is_err()
-            || file.read_to_end(&mut buf).await.is_err()
-        {
-            return (Vec::new(), 0);
-        }
-        let tail = crate::output::tail_truncate(&buf, cap);
-        (tail.text.into_bytes(), start + tail.omitted_bytes)
+/// Reads the per-call stderr file's tail, bounded by `cap`.
+async fn read_capped_tail(path: &Path, cap: usize) -> (Vec<u8>, u64) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let cap = cap.max(1024);
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return (Vec::new(), 0);
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // Over-read slightly so the UTF-8 boundary fixup never eats content.
+    let start = len.saturating_sub(cap as u64 + 4);
+    let mut buf = Vec::new();
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err()
+        || file.read_to_end(&mut buf).await.is_err()
+    {
+        return (Vec::new(), 0);
     }
+    let tail = crate::output::tail_truncate(&buf, cap);
+    (tail.text.into_bytes(), start + tail.omitted_bytes)
+}
 
 /// Builds the wrapper sent to the session shell. Grouped in `{ }` so the
 /// redirections cover multi-command scripts; subshelled only for an

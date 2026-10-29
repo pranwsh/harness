@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
-use crate::env::{apply_env, detach_tty};
+use crate::env::{apply_env, detach_tty, kill_process_group};
 use crate::output::format_shell_result;
 use harness_contracts::ShellConfig;
 
@@ -165,6 +165,7 @@ pub async fn run_once(cfg: &ShellConfig, req: ExecRequest) -> Result<String, Str
             // Timeout: kill, reap (grace 2s), partial tails survive in rings.
             timed_out = true;
             exit_code = None;
+            kill_process_group(child.id());
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }

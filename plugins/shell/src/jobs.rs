@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify};
 
-use crate::env::{apply_env, detach_tty};
+use crate::env::{apply_env, detach_tty, kill_process_group};
 use crate::exec::{Ring, drain_into, resolve_workdir};
 use crate::output::tail_truncate;
 use harness_contracts::ShellConfig;
@@ -369,6 +369,7 @@ async fn waiter_task(
     match outcome {
         Outcome::Exited => {}
         Outcome::Killed => {
+            kill_process_group(child.id());
             let _ = child.start_kill();
             let code = tokio::time::timeout(Duration::from_secs(2), child.wait())
                 .await
@@ -384,6 +385,7 @@ async fn waiter_task(
             });
         }
         Outcome::Expired => {
+            kill_process_group(child.id());
             let _ = child.start_kill();
             let code = tokio::time::timeout(Duration::from_secs(2), child.wait())
                 .await
