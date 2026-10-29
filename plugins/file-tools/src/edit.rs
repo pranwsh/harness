@@ -399,10 +399,13 @@ impl Editor {
         }
         validate(&before, &after, &args, &mut notes)?;
         let id = uuid::Uuid::new_v4().to_string();
-        let report = report(&id, &before, &after, args.dry_run, &notes)?;
+        let mut report = report(&id, &before, &after, args.dry_run, &notes)?;
         if !args.dry_run {
-            publish(store, &before, &after)?;
+            // Acquire bookkeeping before publication: never report a failed edit
+            // after successfully changing bytes because the history mutex failed.
             let mut history = self.history.lock().map_err(|_| "undo history poisoned")?;
+            let warnings = publish(store, &before, &after)?;
+            report.push_str(&warnings);
             history.push_back(Undo { id, before, after });
             while history.len() > 32
                 || history.iter().map(undo_size).sum::<usize>() > 64 * 1024 * 1024
@@ -436,7 +439,7 @@ impl Editor {
             }
         }
         let new_id = uuid::Uuid::new_v4().to_string();
-        let response = report(
+        let mut response = report(
             &new_id,
             &current,
             &record.before,
@@ -444,8 +447,8 @@ impl Editor {
             &[format!("undo_of={id}")],
         )?;
         if !args.dry_run {
-            publish(store, &current, &record.before)?;
             let mut history = self.history.lock().map_err(|_| "undo history poisoned")?;
+            response.push_str(&publish(store, &current, &record.before)?);
             history.retain(|r| r.id != id);
             history.push_back(Undo {
                 id: new_id,
@@ -648,7 +651,15 @@ fn publish(
     store: &HashStore,
     before: &BTreeMap<PathBuf, State>,
     after: &BTreeMap<PathBuf, State>,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    publish_checked(store, before, after, |_| Ok(()))
+}
+fn publish_checked(
+    store: &HashStore,
+    before: &BTreeMap<PathBuf, State>,
+    after: &BTreeMap<PathBuf, State>,
+    check: impl Fn(&Path) -> Result<(), String>,
+) -> Result<String, String> {
     let mut stages = BTreeMap::new();
     for (path, state) in after {
         if state.bytes == before[path].bytes {
@@ -671,16 +682,18 @@ fn publish(
         if state.bytes == before[path].bytes {
             continue;
         }
-        let result = if state.bytes.is_some() {
-            stages
-                .remove(path)
-                .expect("staged")
-                .persist(path)
-                .map(|_| ())
-                .map_err(|e| e.error.to_string())
-        } else {
-            fs::remove_file(path).map_err(|e| e.to_string())
-        };
+        let result = check(path).and_then(|()| {
+            if state.bytes.is_some() {
+                stages
+                    .remove(path)
+                    .expect("staged")
+                    .persist(path)
+                    .map(|_| ())
+                    .map_err(|e| e.error.to_string())
+            } else {
+                fs::remove_file(path).map_err(|e| e.to_string())
+            }
+        });
         if let Err(error) = result {
             let mut failures = Vec::new();
             for p in applied.iter().rev() {
@@ -724,13 +737,14 @@ fn publish(
             warnings.push(format!("{}: {e}", parent.display()));
         }
     }
-    if !warnings.is_empty() {
-        eprintln!(
-            "edit committed, directory sync warning: {}",
+    if warnings.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(
+            "warning: edit committed but directory sync failed: {}\n",
             warnings.join("; ")
-        );
+        ))
     }
-    Ok(())
 }
 fn stage(
     path: &Path,
@@ -788,22 +802,35 @@ fn report(
             .map(text::version)
             .unwrap_or_else(|| "missing".into());
         out.push_str(&format!("¶{} version={version}\n", path.display()));
-        let diff = similar::TextDiff::from_lines(old.as_str(), content);
-        out.push_str(
-            &diff
-                .unified_diff()
-                .context_radius(2)
-                .header("before", "after")
-                .to_string(),
-        );
+        let diff = similar::TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(250))
+            .diff_lines(old.as_str(), content);
+        // Never build an unbounded diff before enforcing the response budget.
+        let mut rendered = LimitedBuffer {
+            bytes: Vec::new(),
+            limit: 128 * 1024,
+        };
+        if diff
+            .unified_diff()
+            .context_radius(2)
+            .header("before", "after")
+            .to_writer(&mut rendered)
+            .is_ok()
+        {
+            out.push_str(&String::from_utf8_lossy(&rendered.bytes));
+        } else {
+            out.push_str("[overflow: diff exceeds 128 KiB; fresh anchors below]\n");
+        }
         if let Some(doc) = &new {
             let mut selected = BTreeSet::new();
             let total = doc.ranges().len();
-            for change in diff.iter_all_changes() {
-                if change.tag() != similar::ChangeTag::Equal
-                    && let Some(i) = change.new_index()
-                {
-                    selected.extend((i + 1).saturating_sub(2).max(1)..=(i + 3).min(total));
+            for op in diff.ops() {
+                if op.tag() != similar::DiffTag::Equal {
+                    let range = op.new_range();
+                    selected.extend(
+                        range.start.saturating_sub(2).max(1)
+                            ..=range.end.saturating_add(2).min(total),
+                    );
                 }
             }
             if selected.is_empty() {
@@ -813,4 +840,55 @@ fn report(
         }
     }
     Ok(out)
+}
+
+struct LimitedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl Write for LimitedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buf.len()) > self.limit {
+            return Err(std::io::Error::other("diff output limit"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    #[test]
+    fn publish_failure_restores_already_published_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        fs::write(&a, "old a").unwrap();
+        fs::write(&b, "old b").unwrap();
+        let before = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|p| {
+                let s = load(&p).unwrap();
+                (p, s)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut after = before.clone();
+        after.get_mut(&a).unwrap().bytes = Some(b"new a".to_vec());
+        after.get_mut(&b).unwrap().bytes = Some(b"new b".to_vec());
+        let err = publish_checked(&HashStore::new(), &before, &after, |p| {
+            if p == b {
+                Err("injected second publication failure".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("all published changes rolled back"));
+        assert_eq!(fs::read(&a).unwrap(), b"old a");
+        assert_eq!(fs::read(&b).unwrap(), b"old b");
+    }
 }

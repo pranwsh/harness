@@ -115,10 +115,15 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
     for path in paths {
         let path = PathBuf::from(path);
         if path.is_dir() && args.search.is_some() {
-            for entry in walkdir::WalkDir::new(&path)
+            for (visited, entry) in walkdir::WalkDir::new(&path)
                 .follow_links(false)
                 .max_depth(64)
+                .into_iter()
+                .enumerate()
             {
+                if visited >= 100000 {
+                    return Err("search exceeds 100000 traversed entries; narrow path".into());
+                }
                 let entry = entry.map_err(|e| e.to_string())?;
                 if entry.file_type().is_file()
                     && glob.as_ref().is_none_or(|g| {
@@ -148,6 +153,10 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
     }
     let mut scanned_bytes = 0usize;
     for path in files {
+        if output.len() > max_tokens.saturating_mul(32) {
+            output.push_str("[overflow: output budget reached; remaining paths not read]\n");
+            break;
+        }
         let canonical =
             std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if !seen.insert(canonical.clone()) {
@@ -156,6 +165,7 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
         if canonical.is_dir() {
             let mut entries = std::fs::read_dir(&canonical)
                 .map_err(|e| e.to_string())?
+                .take(1001)
                 .map(|e| {
                     e.map(|e| {
                         format!(
@@ -168,6 +178,9 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             entries.sort();
+            if entries.len() > 1000 {
+                output.push_str("[overflow: directory listing capped at 1000 entries]\n");
+            }
             output.push_str(&format!(
                 "¶{} directory entries={}\n{}\n",
                 canonical.display(),
@@ -178,11 +191,6 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
-            continue;
-        }
-        if glob.as_ref().is_some_and(|g| {
-            !g.is_match(&path) && !g.is_match(path.file_name().unwrap_or_default())
-        }) {
             continue;
         }
         let _guard = store.lock_edit(&canonical).map_err(|e| e.to_string())?;
@@ -207,7 +215,7 @@ pub(crate) fn run(store: &harness_hash_base::HashStore, args: Args) -> Result<St
             }
             Err(e) => return Err(e),
         };
-        let lines = doc.ranges().len();
+        let lines = doc.text.split_terminator('\n').count();
         let mut selected = BTreeSet::new();
         let mut note = String::new();
         if let Some(search) = &args.search {

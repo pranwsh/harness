@@ -79,15 +79,31 @@ impl Document {
         if text.contains('\0') {
             return Err("binary text (NUL) is not supported".into());
         }
-        let crlf = text.matches("\r\n").count();
-        let lf = text.bytes().filter(|b| *b == b'\n').count();
-        if text.replace("\r\n", "").contains('\r') || (crlf > 0 && crlf != lf) {
-            return Err("mixed or CR-only line endings are not supported; no bytes changed".into());
+        let mut crlf = false;
+        let mut bare_lf = false;
+        let raw = text.as_bytes();
+        for (i, b) in raw.iter().enumerate() {
+            if *b == b'\r' {
+                if raw.get(i + 1) != Some(&b'\n') {
+                    return Err("CR-only line endings are not supported; no bytes changed".into());
+                }
+                crlf = true;
+            }
+            if *b == b'\n' && (i == 0 || raw[i - 1] != b'\r') {
+                bare_lf = true;
+            }
+        }
+        if crlf && bare_lf {
+            return Err("mixed line endings are not supported; no bytes changed".into());
         }
         Ok(Self {
-            text: text.replace("\r\n", "\n"),
+            text: if crlf {
+                text.replace("\r\n", "\n")
+            } else {
+                text
+            },
             encoding,
-            newline: if crlf > 0 { "\r\n" } else { "\n" },
+            newline: if crlf { "\r\n" } else { "\n" },
         })
     }
 
@@ -143,10 +159,16 @@ impl Document {
         anchors: bool,
         width: usize,
     ) -> String {
-        let all = self.text.split_terminator('\n').collect::<Vec<_>>();
+        // Stream through lines once; a small window never allocates a pointer
+        // table or hashes for every line in the file.
+        let mut source = self.text.split_terminator('\n').enumerate().peekable();
         let mut out = String::new();
         for n in lines {
-            if let Some(text) = n.checked_sub(1).and_then(|i| all.get(i)) {
+            while source.peek().is_some_and(|(i, _)| i + 1 < n) {
+                source.next();
+            }
+            if let Some((i, text)) = source.peek().copied().filter(|(i, _)| i + 1 == n) {
+                let _ = i;
                 let clipped: String = text.chars().take(width).collect();
                 let overflow = if clipped.len() < text.len() {
                     " … [line truncated; anchor covers full line]"
@@ -159,6 +181,10 @@ impl Document {
                     format!("{n}: ")
                 };
                 out.push_str(&format!("{prefix}{clipped}{overflow}\n"));
+                if out.len() > 1024 * 1024 {
+                    out.push_str("[overflow: rendered region exceeds 1 MiB; narrow selection]\n");
+                    break;
+                }
             }
         }
         out
@@ -193,7 +219,18 @@ pub(crate) fn bounded(text: String, max_tokens: usize) -> Result<String, String>
     // Avoid returning a partial anchored row as if it were complete.
     let prefix = &text[..ends[lo]];
     let end = prefix.rfind('\n').map_or(0, |n| n + 1);
-    Ok(format!("{}{note}", &prefix[..end]))
+    let mut out = format!("{}{note}", &prefix[..end]);
+    // BPE boundaries can change when the overflow marker is appended. Verify
+    // the actual final response, not only the pre-newline candidate.
+    while tokenizer.encode_ordinary(&out).len() > max_tokens {
+        let prefix = &out[..out.len() - note.len()];
+        let shortened = prefix
+            .trim_end_matches('\n')
+            .rfind('\n')
+            .map_or(0, |n| n + 1);
+        out = format!("{}{note}", &prefix[..shortened]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

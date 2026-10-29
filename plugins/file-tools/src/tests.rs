@@ -185,3 +185,151 @@ async fn tools_registered_with_generated_schema() {
     assert!(out.contains("|hello"));
     assert!(edit_spec().parameters.to_string().contains("insert_before"));
 }
+
+#[test]
+fn strict_arguments_and_encoding_edits() {
+    assert!(
+        serde_json::from_value::<edit::Args>(
+            json!({"edits":[{"path":"x","op":"create","text":"x","typo":true}]})
+        )
+        .is_err()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("x.txt");
+    let e = edit::Editor::default();
+    let s = Arc::new(HashStore::new());
+    for bytes in [
+        b"one\r\ntwo".to_vec(),
+        vec![255, 254, 111, 0, 110, 0, 101, 0],
+    ] {
+        fs::write(&p, &bytes).unwrap();
+        invoke(
+            &e,
+            &s,
+            json!({"edits":[{"path":p,"op":"replace_text","old":"one","new":"ONE"}]}),
+        )
+        .unwrap();
+        let got = fs::read(&p).unwrap();
+        let doc = text::Document::decode(&bytes).unwrap();
+        assert_eq!(got, doc.encode(&doc.text.replace("one", "ONE")));
+    }
+}
+
+#[test]
+fn insert_boundaries_delete_and_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("x.txt");
+    fs::write(&p, "a\nb").unwrap();
+    let e = edit::Editor::default();
+    let s = Arc::new(HashStore::new());
+    invoke(&e,&s,json!({"edits":[{"path":p,"op":"insert_before","anchor":anchor(&p,1),"text":"first"},{"path":p,"op":"insert_after","anchor":anchor(&p,2),"text":"last\n"}]})).unwrap();
+    assert_eq!(fs::read_to_string(&p).unwrap(), "first\na\nb\nlast");
+    let err = invoke(&e,&s,json!({"edits":[{"path":p,"op":"delete","start":anchor(&p,1),"end":anchor(&p,3)},{"path":p,"op":"delete","start":anchor(&p,2),"end":anchor(&p,4)}]})).unwrap_err();
+    assert!(err.contains("overlapping"));
+    invoke(&e, &s, json!({"edits":[{"path":p,"op":"delete_file"}]})).unwrap();
+    assert!(!p.exists());
+}
+
+#[test]
+fn search_modes_globs_batch_and_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.rs");
+    fs::write(&a, "needle\nneedle\n").unwrap();
+    fs::write(&b, "needle\n").unwrap();
+    let s = HashStore::new();
+    let run = |v: Value| read::run(&s, serde_json::from_value(v).unwrap()).unwrap();
+    let out = run(
+        json!({"path":dir.path(),"search":{"regex":"needle","glob":"**/*.txt","output":"count"}}),
+    );
+    assert!(out.contains("a.txt matches=2"));
+    assert!(!out.contains("b.rs"));
+    let out = run(json!({"paths":[a,b],"anchors":false}));
+    assert!(out.contains("1: needle"));
+    assert!(!out.contains("|needle"));
+    let out = run(json!({"path":a,"max_line_width":2}));
+    assert!(out.contains("line truncated"));
+}
+
+#[test]
+#[ignore = "manual performance measurement"]
+fn benchmark_windowed_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("large.txt");
+    fs::write(
+        &p,
+        "let example_value = 123456789; // benchmark line\n".repeat(100000),
+    )
+    .unwrap();
+    let store = HashStore::new();
+    // Warm tokenizer so its one-time construction does not dominate the result.
+    let _ = text::bounded("warm".into(), 4096).unwrap();
+    let start = std::time::Instant::now();
+    for _ in 0..5 {
+        let _ = store.snapshot(&p).unwrap();
+    }
+    eprintln!("legacy snapshot 5 iterations: {:?}", start.elapsed());
+    let start = std::time::Instant::now();
+    for _ in 0..5 {
+        read::run(
+            &store,
+            serde_json::from_value(json!({"path":p,"ranges":[{"start":100,"end":150}]})).unwrap(),
+        )
+        .unwrap();
+    }
+    eprintln!(
+        "new read including bounded rendering 5 iterations: {:?}; bytes={}",
+        start.elapsed(),
+        fs::metadata(&p).unwrap().len()
+    );
+}
+
+#[test]
+fn undo_restores_multi_file_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    let c = dir.path().join("c.txt");
+    fs::write(&a, "source").unwrap();
+    fs::write(&c, "deleted").unwrap();
+    let e = edit::Editor::default();
+    let s = Arc::new(HashStore::new());
+    let out = invoke(
+        &e,
+        &s,
+        json!({"edits":[{"path":a,"op":"move","to":b},{"path":c,"op":"delete_file"}]}),
+    )
+    .unwrap();
+    let id = out
+        .lines()
+        .next()
+        .unwrap()
+        .split("edit_id=")
+        .nth(1)
+        .unwrap();
+    invoke(&e, &s, json!({"undo":id})).unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "source");
+    assert!(!b.exists());
+    assert_eq!(fs::read_to_string(&c).unwrap(), "deleted");
+}
+#[test]
+fn opposite_order_transactions_do_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "x\n").unwrap();
+    fs::write(&b, "x\n").unwrap();
+    let s = Arc::new(HashStore::new());
+    let e = Arc::new(edit::Editor::default());
+    let mut threads = Vec::new();
+    for paths in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+        let s = s.clone();
+        let e = e.clone();
+        threads.push(std::thread::spawn(move || {
+            invoke(&e,&s,json!({"edits":paths.iter().map(|p| json!({"path":p,"op":"replace_text","old":"x","new":"x"})).collect::<Vec<_>>()})).unwrap();
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+}
