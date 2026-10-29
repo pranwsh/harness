@@ -48,34 +48,53 @@ pub(crate) fn tool_err(message: impl Into<String>) -> ToolError {
 pub fn hashline_edit_spec() -> ToolSpec {
     ToolSpec {
         name: "hashline_edit".to_owned(),
-        description: "Edit a file atomically. Prefer line-number ops (no hashes needed): {op:set_n,line,content}|{op:insert_n,after,lines (after 0 prepends)}|{op:delete_n,start,end}|{op:replace_n,start,end,lines}. Hash ops (set/insert/delete/replace + create) take hash/after_hash/start_hash/end_hash from hashline_read. rev is optional (checked when present; omit for rev-less line edits). Pass rev from your last read when the file may be contested — a stale line number silently edits the wrong line, while a stale rev/hash fails loudly. create makes a new file (fails if it exists). All ops validate first, apply bottom-up; rev bumps on success.".to_owned(),
+        description: "Edit a file atomically. Prefer `sub` for changing part of a line: \
+            {op:sub, line|hash, old, new, count=1} replaces occurrences (count must match exactly, so a \
+            mistaken old is refused instead of corrupting the line). Whole-line ops by number: \
+            {op:set_n,line,content}|{op:insert_n,after (0 prepends),lines}|{op:delete_n,start,end}|\
+            {op:replace_n,start,end,lines}. Hash-anchored ops (from hashline_read's `line:hash|content` rows): \
+            set/insert/delete/replace, each of which may also carry the row's line number to disambiguate \
+            a tag shared by identical lines (and to turn a stale tag into an error), plus create for a new \
+            file and revert (must be the only op) to undo \
+            the previous edit. `rev` is an optional optimistic check: pass \
+            your last read (the numbers would be stale), so re-read and retry. All ops validate first, apply \
+            bottom-up, and write atomically; each op must carry only the keys its shape uses. \
+            Set dry_run:true to validate the batch and return the would-be diff instead of writing."
+            .to_owned(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "rev": { "type": "integer", "minimum": 0, "description": "Optional optimistic-concurrency check: must match current REV. Omit for rev-less line edits; pass it when the file may be contested" },
+                "rev": { "type": "integer", "minimum": 0, "description": "Optional optimistic-concurrency check: must match current REV" },
+                "dry_run": { "type": "boolean", "description": "Validate and report the would-be diff without writing (default false)" },
                 "ops": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "set_n", "insert_n", "delete_n", "replace_n", "create"] },
-                            "hash": { "type": "string" },
-                            "content": { "type": "string" },
-                            "after_hash": { "type": "string" },
-                            "lines": { "type": "array", "items": { "type": "string" } },
+                            "op": { "type": "string", "enum": ["set", "insert", "delete", "replace", "sub", "set_n", "insert_n", "delete_n", "replace_n", "create", "revert"] },
+                            "hash": { "type": "string", "description": "4-char tag from hashline_read" },
+                            "content": { "type": "string", "description": "Replacement text for one line (no newline)" },
+                            "after_hash": { "type": "string", "description": "Tag to insert after, or \"HEAD\" to prepend" },
+                            "lines": { "type": "array", "items": { "type": "string" }, "description": "Whole lines to insert, one per element" },
                             "start_hash": { "type": "string" },
                             "end_hash": { "type": "string" },
-                            "line": { "type": "integer", "minimum": 1 },
-                            "after": { "type": "integer", "minimum": 0 },
+                            "start_line": { "type": "integer", "minimum": 1, "description": "Optional line number for start_hash, to disambiguate duplicate tags" },
+                            "end_line": { "type": "integer", "minimum": 1, "description": "Optional line number for end_hash" },
+                            "line": { "type": "integer", "minimum": 1, "description": "1-based line number; with `hash`/`after_hash` it disambiguates a duplicate tag" },
+                            "after": { "type": "integer", "minimum": 0, "description": "Insert after this line; 0 prepends" },
                             "start": { "type": "integer", "minimum": 1 },
-                            "end": { "type": "integer", "minimum": 1 }
+                            "end": { "type": "integer", "minimum": 1 },
+                            "old": { "type": "string", "description": "sub: exact substring to replace" },
+                            "new": { "type": "string", "description": "sub: replacement substring (no newline)" },
+                            "count": { "type": "integer", "minimum": 1, "description": "sub: expected occurrences of old (default 1); a mismatch is an error" }
                         },
                         "required": ["op"]
                     }
                 }
             },
-            "required": ["path", "ops"]
+            "required": ["path", "ops"],
+            "additionalProperties": false
         }),
     }
 }

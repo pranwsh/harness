@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
-use crate::env::{apply_env, detach_tty};
+use crate::env::{apply_env, detach_tty, kill_process_group};
 use crate::output::format_shell_result;
 use harness_contracts::ShellConfig;
 
@@ -165,6 +165,7 @@ pub async fn run_once(cfg: &ShellConfig, req: ExecRequest) -> Result<String, Str
             // Timeout: kill, reap (grace 2s), partial tails survive in rings.
             timed_out = true;
             exit_code = None;
+            kill_process_group(child.id());
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }
@@ -298,6 +299,38 @@ mod tests {
         .unwrap();
         let out = run_once(&cfg, req).await.unwrap();
         assert!(out.contains("timed_out=true"), "got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendants_in_the_command_process_group() {
+        let cfg = ShellConfig::default();
+        let req = resolve_request(
+            &cfg,
+            "bash".to_owned(),
+            vec![
+                "bash".to_owned(),
+                "-c".to_owned(),
+                "sleep 30 & child=$!; echo $child; wait".to_owned(),
+            ],
+            None,
+            Some(300),
+            None,
+        )
+        .unwrap();
+        let output = run_once(&cfg, req).await.unwrap();
+        assert!(output.contains("timed_out=true"), "{output}");
+        let child_pid: i32 = output
+            .lines()
+            .find_map(|line| line.trim().parse().ok())
+            .expect("child pid captured");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // SAFETY: kill(pid, 0) only checks process existence.
+        assert_eq!(
+            unsafe { libc::kill(child_pid, 0) },
+            -1,
+            "background child survived timeout"
+        );
     }
 
     #[tokio::test]

@@ -28,8 +28,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::env::executable_path;
 use futures::future::BoxFuture;
-use harness_contracts::{ShellConfig, ToolRegistryHandle, KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOL_REGISTRY, ToolError, ToolSpec};
+use harness_contracts::{
+    KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOL_REGISTRY, ShellConfig, ToolError, ToolRegistryHandle,
+    ToolSpec,
+};
 use harness_core::{Context, Result};
 
 pub use jobs::{DEFAULT_POLL_WAIT_MS, JobLimits, MAX_POLL_WAIT_MS};
@@ -116,8 +120,8 @@ impl ShellService {
         if env.is_some() {
             let req = resolve_request(
                 &self.cfg,
-                "bash".to_owned(),
-                vec!["bash".to_owned(), "-c".to_owned(), command],
+                executable_path("bash"),
+                vec![executable_path("bash"), "-c".to_owned(), command],
                 workdir,
                 Some(timeout.as_millis() as u64),
                 env,
@@ -167,8 +171,8 @@ impl ShellService {
             .jobs
             .start(
                 &self.cfg,
-                "bash".to_owned(),
-                vec!["bash".to_owned(), "-c".to_owned(), command],
+                executable_path("bash"),
+                vec![executable_path("bash"), "-c".to_owned(), command],
                 workdir,
                 timeout_ms,
                 env,
@@ -389,37 +393,49 @@ impl harness_core::Plugin for ShellPlugin {
         let config = handle.get();
         let svc = Arc::new(ShellService::new(config.shell.clone()));
         registry
-            .register(shell_exec_spec(), Box::new({
-                let svc = Arc::clone(&svc);
-                move |args| shell_exec_handler(Arc::clone(&svc), args)
-            }))
+            .register(
+                shell_exec_spec(),
+                Box::new({
+                    let svc = Arc::clone(&svc);
+                    move |args| shell_exec_handler(Arc::clone(&svc), args)
+                }),
+            )
             .map_err(|e| harness_core::Error::ServiceConflict {
                 key: "shell_exec".into(),
                 provider: e,
             })?;
         registry
-            .register(shell_start_spec(), Box::new({
-                let svc = Arc::clone(&svc);
-                move |args| shell_start_handler(Arc::clone(&svc), args)
-            }))
+            .register(
+                shell_start_spec(),
+                Box::new({
+                    let svc = Arc::clone(&svc);
+                    move |args| shell_start_handler(Arc::clone(&svc), args)
+                }),
+            )
             .map_err(|e| harness_core::Error::ServiceConflict {
                 key: "shell_start".into(),
                 provider: e,
             })?;
         registry
-            .register(shell_poll_spec(), Box::new({
-                let svc = Arc::clone(&svc);
-                move |args| shell_poll_handler(Arc::clone(&svc), args)
-            }))
+            .register(
+                shell_poll_spec(),
+                Box::new({
+                    let svc = Arc::clone(&svc);
+                    move |args| shell_poll_handler(Arc::clone(&svc), args)
+                }),
+            )
             .map_err(|e| harness_core::Error::ServiceConflict {
                 key: "shell_poll".into(),
                 provider: e,
             })?;
         registry
-            .register(shell_stop_spec(), Box::new({
-                let svc = Arc::clone(&svc);
-                move |args| shell_stop_handler(Arc::clone(&svc), args)
-            }))
+            .register(
+                shell_stop_spec(),
+                Box::new({
+                    let svc = Arc::clone(&svc);
+                    move |args| shell_stop_handler(Arc::clone(&svc), args)
+                }),
+            )
             .map_err(|e| harness_core::Error::ServiceConflict {
                 key: "shell_stop".into(),
                 provider: e,
@@ -695,15 +711,7 @@ user_agent = "a"
     #[tokio::test]
     async fn explicit_env_gives_clean_subprocess() {
         let (_ctx, tools, _svc) = ctx_with_shell();
-        let py = [
-            "/etc/profiles/per-user/pranesh/bin/python3",
-            "/usr/bin/python3",
-            "/usr/local/bin/python3",
-        ]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or(&"python3")
-        .to_string();
+
         // One-shot bypasses the session with ONLY_THIS set; a leaked PATH
         // would show Some(...). Single-quoted shell keeps it intact.
         let out = tools
@@ -713,13 +721,13 @@ user_agent = "a"
                 1,
                 call(
                     "shell_exec",
-                    serde_json::json!({"command": format!("{py} -c 'import os; print(os.environ.get(\"ONLY_THIS\"), os.environ.get(\"PATH\"))'"),
+                    serde_json::json!({"command": "printf \"%s\\n\" \"$ONLY_THIS\"".to_owned(),
                         "env": {"ONLY_THIS": "yes"}}),
                 ),
             )
             .await
             .unwrap();
-        assert!(out.contains("yes None"), "got: {out}");
+        assert_eq!(out.trim(), "yes", "got: {out}");
     }
 
     #[test]

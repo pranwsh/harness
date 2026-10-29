@@ -2,9 +2,8 @@
 //!
 //! The shell plugin applies no guardrails. The subprocess inherits the agent
 //! process environment by default; if the call provides explicit `env` vars,
-//! the child gets a clean environment with only those vars. Any filtering
-//! (secret redaction, allowlists) belongs in a future guardrail plugin via
-//! the `tool.approval` waterfall, not here.
+//! the child gets a clean environment with only those vars. Filtering belongs
+//! in a guardrail plugin via `tool.approval`.
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -12,41 +11,50 @@ use std::process::Command;
 /// Apply env to a command about to spawn: inherit all, or clean + explicit.
 pub fn apply_env(cmd: &mut Command, explicit: Option<&HashMap<String, String>>) {
     if let Some(vars) = explicit {
-        // Explicit env = fully clean subprocess.
         cmd.env_clear();
         for (k, v) in vars {
             cmd.env(k, v);
         }
     }
-    // Otherwise inherit everything; no denylist here.
 }
 
+/// Resolve a command through the current PATH before a one-shot clean environment is applied.
+pub fn executable_path(name: &str) -> String {
+    if name.contains('/') {
+        return name.to_owned();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_owned())
+}
 
-/// Detach the child from our controlling terminal (no `/dev/tty`).
-///
-/// `stdin=null` + piped stdout/stderr is NOT enough: `sudo` (and
-/// `su`/`passwd`/`ssh`/pagers) re-opens `/dev/tty` directly, painting
-/// `Password:` over the TUI input box and stealing keystrokes from the
-/// input task. A `setsid` in the child (new session, no ctty) makes that
-/// open fail, so `sudo` exits fast with `no tty present` into captured
-/// stderr instead of corrupting the screen. Unix-only; no-op elsewhere.
+/// Detach the child into its own process group/session (Unix).
 pub fn detach_tty(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
-    {
-        // SAFETY: `setsid` is async-signal-safe; closure does nothing else.
-        unsafe {
-            cmd.pre_exec(|| {
-                // Ignore errors: if already a session leader, parent keeps ctty,
-                // but stdio is still piped/null so no screen corruption.
-                let _ = libc::setsid();
-                Ok(())
-            });
-        }
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
     }
     #[cfg(not(unix))]
-    {
-        let _ = cmd;
+    let _ = cmd;
+}
+
+/// Kill a subprocess and its descendants that remain in its process group.
+/// Falls back to killing just the child on non-Unix platforms.
+pub fn kill_process_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+        // Negative pid addresses the process group created by setsid above.
+        // ESRCH means it already exited; child.wait() still reaps the leader.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 #[cfg(test)]
@@ -54,30 +62,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_env_means_clean() {
+    fn explicit_env_is_clean_and_inherits_only_requested_values() {
         let mut cmd = Command::new("echo");
-        let mut vars = HashMap::new();
-        vars.insert("ONLY_THIS".to_owned(), "1".to_owned());
+        let vars = HashMap::from([("ONLY_THIS".to_owned(), "1".to_owned())]);
         apply_env(&mut cmd, Some(&vars));
-        // env_clear + explicit: PATH must be gone from the child spec.
         let envs: Vec<_> = cmd.get_envs().collect();
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k.to_str() == Some("ONLY_THIS")
-                    && v.map(|v| v == "1").unwrap_or(false)),
-            "explicit var missing: {envs:?}"
-        );
-        assert!(
-            envs.iter().all(|(k, _)| k.to_str() != Some("PATH")),
-            "inherited var leaked: {envs:?}"
-        );
+        assert!(envs.iter().any(
+            |(k, v)| k.to_str() == Some("ONLY_THIS") && v.and_then(|x| x.to_str()) == Some("1")
+        ));
+        assert!(envs.iter().all(|(k, _)| k.to_str() != Some("PATH")));
     }
 
     #[test]
-    fn no_explicit_env_inherits() {
+    fn default_environment_is_inherited() {
         let mut cmd = Command::new("echo");
         apply_env(&mut cmd, None);
-        // No env_clear, no removals: child spec carries no overrides.
         assert_eq!(cmd.get_envs().count(), 0);
     }
 }

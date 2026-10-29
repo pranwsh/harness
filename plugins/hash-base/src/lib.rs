@@ -123,11 +123,10 @@ pub fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         ranges.push((start, nl));
         start = nl + 1;
     }
-    if start < data.len() || data.is_empty() && ranges.is_empty() {
-        // Non-empty tail without trailing newline, or empty file -> 0 lines.
-        if start < data.len() {
-            ranges.push((start, data.len()));
-        }
+    // A tail without a trailing newline is its own line; an empty file has
+    // no lines at all (so this stays false for `data.is_empty()`).
+    if start < data.len() {
+        ranges.push((start, data.len()));
     }
     ranges
 }
@@ -141,6 +140,81 @@ pub fn for_each_line(data: &[u8], mut f: impl FnMut(&[u8])) {
     }
     if start < data.len() {
         f(&data[start..]);
+    }
+}
+
+
+/// Does `data` look like binary, by the same NUL-in-the-leading-8-KiB
+/// heuristic `git` uses?
+///
+/// A tool that splits on `\n` (read or edit) must refuse binary input:
+/// hashing a PNG line-by-line produces nonsense tags, and writing the split
+/// lines back is data loss. Cheap, no decoding, and effectively no false
+/// positives on real source.
+pub fn looks_binary(data: &[u8]) -> bool {
+    data[..data.len().min(8192)].contains(&0)
+}
+
+
+/// Digest of an empty file. `fold_digest` short-circuits to this, and
+/// `snapshot` records it for zero-length files.
+pub const EMPTY_DIGEST: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Fold per-line digests into one file digest.
+///
+/// Content-addressed at the same granularity `REV` speaks in: equal folds
+/// mean the files agree line-for-line (whitespace-normalized). Order- and
+/// count-sensitive, so inserting or swapping a line moves it. Cheap — one
+/// mix per line over digests we already computed while hashing.
+pub fn fold_digest(entries: &[LineEntry], trailing_nl: bool) -> u64 {
+    if entries.is_empty() {
+        // `fold_bytes(b"")` and an empty file must agree exactly, so the
+        // empty case is one constant rather than a second derivation.
+        return EMPTY_DIGEST;
+    }
+    let mut acc = Fold::start();
+    for e in entries {
+        acc.mix(e.full);
+    }
+    // Line hashes are blind to a final newline (both `"a\nb"` and `"a\nb\n"`
+    // are two lines), so fold that bit in explicitly.
+    acc.mix(u64::from(trailing_nl));
+    acc.finish(entries.len())
+}
+/// The single fold that both `fold_digest` (hashing on read) and
+/// [`HashStore::fold_bytes`] (hashing what we are about to write) go
+/// through, so the two can never disagree about whether content changed.
+struct Fold(u64);
+
+impl Fold {
+    fn start() -> Self {
+        Fold(0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn mix(&mut self, full: u64) {
+        // splitmix64-style avalanche over the per-line digest.
+        self.0 ^= full;
+        self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.rotate_left(31);
+    }
+
+    /// Fold in the line count so trailing blank lines cannot alias.
+    fn finish(self, lines: usize) -> u64 {
+        self.0 ^ (lines as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+}
+
+/// fsync a directory so a rename inside it survives power loss. Opening a
+/// directory read-only and syncing it is the portable-enough incantation
+/// (on platforms where this is unsupported it degrades to a no-op).
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match File::open(dir) {
+        Ok(f) => {
+            f.sync_all()?;
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -162,6 +236,10 @@ pub struct FileSnapshot {
     pub canonical: PathBuf,
     pub rev: u64,
     pub entries: Vec<LineEntry>,
+    /// Byte ranges of each line, parallel to `entries`. Hashing already had
+    /// to find every newline; carrying the ranges out means renderers do not
+    /// have to scan the whole file a second time just to slice lines.
+    pub ranges: Vec<(usize, usize)>,
     pub mtime: SystemTime,
     pub len: u64,
 }
@@ -184,18 +262,77 @@ impl FileSnapshot {
 #[derive(Debug, Clone)]
 struct RevState {
     rev: u64,
-    mtime: SystemTime,
-    len: u64,
+    /// Fold of the line digests the current `rev` refers to. A fresh
+    /// observation whose digest differs means the bytes changed under us
+    /// (another process, an external tool), so the rev must advance even
+    /// though our own counter never moved.
+    digest: u64,
+    /// Rev as of the last *read* (line numbers a caller may be holding).
+    /// Edits do not move it: that gap is what lets `hashline_edit` refuse
+    /// line-number ops addressed against a pre-edit read.
+    read_rev: u64,
+    /// Disk mtime/len as of our last observation *or* our own write. The
+    /// external-modification guard compares against this rather than the
+    /// committed values, so a write followed by another write does not trip
+    /// the guard on its own output.
+    seen_mtime: SystemTime,
+    seen_len: u64,
 }
 
 /// Threshold above which line hashing fans out over `thread::scope`.
 pub const PARALLEL_MIN_BYTES: usize = 256 * 1024;
 
+/// Handle held for the duration of an edit transaction.
+/// Best-effort file name for a lockfile: the final path component with
+/// anything awkward for a filename replaced, and bounded in length.
+fn file_stem_lossy(p: &Path) -> String {
+    let raw = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "root".to_owned());
+    raw.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Open (creating if needed) a lockfile in the temp dir.
+fn open_temp_lock(name: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(std::env::temp_dir().join(name))
+}
+/// Handle held for the duration of an edit transaction.
+///
+/// Owns the per-file lockfile; dropping it releases the lock.
+pub struct EditGuard {
+    _file: File,
+}
+
+/// The content a file had before our most recent edit to it.
+struct UndoSlot {
+    bytes: Vec<u8>,
+    /// Rev the file was at *before* that edit.
+    rev: u64,
+}
+
 /// Shared hashing service. Clone via `Arc<HashStore>`.
 pub struct HashStore {
     hasher: Arc<dyn LineHasher>,
     state: Mutex<HashMap<PathBuf, RevState>>,
-    edit_mu: Mutex<()>,
+    /// One-step undo per path: the bytes an edit replaced. Kept in memory only
+    /// (a restart is not an editing session), and overwritten by the next edit
+    /// to the same path, so this is "undo the last thing I did", not history.
+    undo: Mutex<HashMap<PathBuf, UndoSlot>>,
 }
 
 impl std::fmt::Debug for HashStore {
@@ -221,7 +358,7 @@ impl HashStore {
         HashStore {
             hasher: Arc::new(h),
             state: Mutex::new(HashMap::new()),
-            edit_mu: Mutex::new(()),
+            undo: Mutex::new(HashMap::new()),
         }
     }
 
@@ -269,9 +406,36 @@ impl HashStore {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Serialize whole edit transactions in-process. Reads never take this.
-    pub fn lock_edit(&self) -> MutexGuard<'_, ()> {
-        self.edit_mu.lock().unwrap_or_else(|e| e.into_inner())
+    /// Serialize a whole edit transaction for one file.
+    ///
+    /// Returns a guard holding the per-file lockfile; dropping it releases the
+    /// lock. Each call opens its own descriptor, so `flock` excludes other
+    /// *threads* as well as other processes — no separate in-process mutex is
+    /// needed, and edits to different files never contend.
+    pub fn lock_edit(&self, canonical: &Path) -> Result<EditGuard, HashError> {
+        Ok(EditGuard {
+            _file: self.exclusive_file_lock(canonical)?,
+        })
+    }
+
+    /// Remember the bytes an edit is about to replace, so it can be undone.
+    pub fn stash_undo(&self, canonical: &Path, bytes: &[u8], rev: u64) {
+        let mut u = self.undo.lock().unwrap_or_else(|e| e.into_inner());
+        u.insert(
+            canonical.to_path_buf(),
+            UndoSlot {
+                bytes: bytes.to_vec(),
+                rev,
+            },
+        );
+    }
+
+    /// Bytes to restore for a one-step undo, and the rev they belong to.
+    pub fn take_undo(&self, canonical: &Path) -> Option<(Vec<u8>, u64)> {
+        let mut u = self.undo.lock().unwrap_or_else(|e| e.into_inner());
+        // Consume it: one undo per edit, so a second `revert` says so plainly
+        // instead of silently replaying an older state.
+        u.remove(canonical).map(|s| (s.bytes, s.rev))
     }
 
     /// Current in-memory revision, if this process has read the file before.
@@ -279,7 +443,18 @@ impl HashStore {
         self.lock_state().get(canonical).map(|s| s.rev)
     }
 
+    /// Revision as of the last *read*: the numbering a caller holding line
+    /// numbers most likely addressed. `None` means we never read it, so the
+    /// caller cannot be holding numbers from us and there is nothing to
+    /// disqualify.
+    pub fn read_rev(&self, canonical: &Path) -> Option<u64> {
+        self.lock_state().get(canonical).map(|s| s.read_rev)
+    }
+
     /// Validate `req` against stored rev; emits a re-read hint on mismatch.
+    ///
+    /// A path we have never observed is accepted at `REV:0`: nothing has been
+    /// edited through us, and the in-transaction snapshot is authoritative.
     pub fn check_rev(&self, canonical: &Path, req: u64, tool: &str) -> Result<u64, HashError> {
         match self.lock_state().get(canonical) {
             Some(s) if s.rev == req => Ok(req),
@@ -289,6 +464,7 @@ impl HashStore {
                 got: req,
                 tool: tool.to_owned(),
             }),
+            None if req == 0 => Ok(0),
             None => Err(HashError::Stale {
                 path: canonical.display().to_string(),
                 expected: 0,
@@ -298,16 +474,28 @@ impl HashStore {
         }
     }
 
-    /// Bump revision after a successful atomic write.
-    pub fn commit_rev(&self, canonical: &Path, mtime: SystemTime, len: u64) -> u64 {
+    /// Record a successful write: bump the rev and treat the bytes we just
+    /// wrote as our own last observation.
+    pub fn commit_rev(
+        &self,
+        canonical: &Path,
+        digest: u64,
+        mtime: SystemTime,
+        len: u64,
+    ) -> u64 {
         let mut st = self.lock_state();
-        let next = st.get(canonical).map(|s| s.rev + 1).unwrap_or(1);
+        let (next, read_rev) = match st.get(canonical) {
+            Some(s) => (s.rev + 1, s.read_rev),
+            None => (1, 0),
+        };
         st.insert(
             canonical.to_path_buf(),
             RevState {
                 rev: next,
-                mtime,
-                len,
+                digest,
+                read_rev,
+                seen_mtime: mtime,
+                seen_len: len,
             },
         );
         next
@@ -315,6 +503,9 @@ impl HashStore {
 
     /// Best-effort external-modification guard for cross-process writes
     /// (in-memory revs alone cannot see other processes).
+    ///
+    /// Compared against our own last observation, not our last commit, so
+    /// our own output never reads as somebody else's edit.
     pub fn check_external(
         &self,
         canonical: &Path,
@@ -324,9 +515,9 @@ impl HashStore {
     ) -> Result<(), HashError> {
         let st = self.lock_state();
         if let Some(s) = st.get(canonical)
-            && (s.mtime != disk_mtime || s.len != disk_len)
+            && (s.seen_mtime != disk_mtime || s.seen_len != disk_len)
         {
-            // Disk changed under us since our last read/commit.
+            // Disk changed under somebody else since our last observation.
             return Err(HashError::External {
                 path: canonical.display().to_string(),
                 tool: tool.to_owned(),
@@ -335,28 +526,46 @@ impl HashStore {
         Ok(())
     }
 
-    /// Per-file cross-process exclusive lock (blocking) via a temp lockfile.
+    /// Per-file cross-process exclusive lock (blocking) via a lockfile.
+    ///
+    /// The lockfile lives beside the target (`.name.<hash>.lock`) rather than
+    /// in `$TMPDIR`: naming it after a *whitespace-trimmed* hash of the path
+    /// let two paths that differ only in surrounding whitespace collide, and
+    /// temp files accumulated one per path forever with nothing to clean them
+    /// up. A sibling lockfile is also self-explanatory to anyone looking at the
+    /// directory.
+    ///
+    /// Falls back to the temp dir when the target's directory is not writable,
+    /// which is the only case where a sibling lock cannot be created.
     pub fn exclusive_file_lock(&self, canonical: &Path) -> Result<File, HashError> {
-        let mut h = self
-            .hasher
-            .hash_normalized(canonical.as_os_str().as_encoded_bytes());
-        // Mix length to avoid trivial collisions across similar prefixes.
+        // Hash the canonical path bytes verbatim: two distinct paths must
+        // never share a lock.
+        let mut h = xxhash_rust::xxh3::xxh3_64(canonical.as_os_str().as_encoded_bytes());
         h ^= canonical.as_os_str().len() as u64;
-        let name = format!("hashline-{:016x}.lock", h);
-        let lock_path = std::env::temp_dir().join(name);
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
+        let name = format!(".{}.{:08x}.lock", file_stem_lossy(canonical), h & 0xffff_ffff);
+        let f = match canonical.parent().map(|d| d.join(&name)) {
+            Some(p) => match OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&p)
+            {
+                Ok(f) => f,
+                Err(_) => open_temp_lock(&name)?,
+            },
+            None => open_temp_lock(&name)?,
+        };
         f.lock_exclusive()?;
         Ok(f)
     }
 
-    /// Stage `buf` in a sibling temp file and rename over `canonical`, so a
-    /// crash never leaves a half-written file. Shared by `hashline_edit` and
-    /// `file_write` so both tools get the same atomicity story.
+    /// Stage `buf` in a sibling temp file, fsync it, rename it over
+    /// `canonical`, then fsync the parent directory so the rename itself is
+    /// durable. A crash mid-write leaves the original file intact and a
+    /// crash after the rename leaves the new content, never a torn mixture.
+    /// Shared by `hashline_edit` and `file_write` so both tools get the same
+    /// atomicity story.
     ///
     /// `perm` preserves the existing mode for edits (best-effort); created
     /// files take the umask default. `tool` names the caller for error text.
@@ -386,27 +595,40 @@ impl HashStore {
         tmp.flush().map_err(|e| {
             HashError::WriteStage(format!("{tool}: staged write failed: {e}"))
         })?;
+        // Data must be on stable storage *before* the rename publishes it;
+        // otherwise a power loss can leave the new name pointing at nothing.
+        tmp.as_file().sync_all().map_err(|e| {
+            HashError::WriteStage(format!("{tool}: fsync of staged write failed: {e}"))
+        })?;
         tmp.persist(canonical).map_err(|e| {
-            HashError::WriteStage(format!("{tool}: atomic rename failed: {e}"))
+            HashError::WriteStage(format!("{tool}: atomic rename failed: {}", e.error))
+        })?;
+        // Durably record the rename, not just the contents.
+        sync_dir(parent).map_err(|e| {
+            HashError::WriteStage(format!(
+                "{tool}: fsync of {} failed: {e}",
+                parent.display()
+            ))
         })?;
         Ok(())
     }
 
-    /// Record a successful write: re-stat, bump the in-memory rev, report the
-    /// new head (`OK path#REV:n ops=k`). Hashing itself is deferred to the next
-    /// snapshot (untouched lines are byte-identical).
+    /// Record a successful write: bump the in-memory rev and report the new
+    /// head (`OK path#REV:n ops=k`).
+    ///
+    /// Post-write bookkeeping is best-effort: the bytes are already on disk
+    /// under the new name, so a failed `stat` here must not turn a successful
+    /// edit into a reported failure (a retry would then be rejected as
+    /// stale). Fall back to the values we staged.
     pub fn commit_write(
         &self,
         canonical: &Path,
-        _tool: &str,
+        digest: u64,
+        staged_len: u64,
         ops: usize,
     ) -> Result<String, HashError> {
-        let meta = std::fs::metadata(canonical)?;
-        let new_rev = self.commit_rev(
-            canonical,
-            meta.modified().unwrap_or(UNIX_EPOCH),
-            meta.len(),
-        );
+        let (mtime, len) = self.restat(canonical, staged_len);
+        let new_rev = self.commit_rev(canonical, digest, mtime, len);
         Ok(format!(
             "OK {}#REV:{new_rev} ops={ops}",
             canonical.display()
@@ -418,26 +640,30 @@ impl HashStore {
     pub fn commit_write_bytes(
         &self,
         canonical: &Path,
+        digest: u64,
         len: u64,
     ) -> Result<String, HashError> {
-        let meta = std::fs::metadata(canonical)?;
-        let new_rev = self.commit_rev(
-            canonical,
-            meta.modified().unwrap_or(UNIX_EPOCH),
-            meta.len(),
-        );
+        let (mtime, seen_len) = self.restat(canonical, len);
+        let new_rev = self.commit_rev(canonical, digest, mtime, seen_len);
         Ok(format!(
             "OK {}#REV:{new_rev} bytes={len}",
             canonical.display()
         ))
     }
 
-    /// Mmap + hash a file, updating the in-memory rev table (reads never
-    /// bump the counter; first read creates `REV:0`).
-    ///
-    /// Returns the snapshot plus the raw bytes read (owned) so callers can
-    /// render `content` without re-reading. The vec is the mmap copy only
-    /// when the file is non-empty; empty files return an empty vec.
+    /// Re-stat after a write, falling back to what we staged.
+    fn restat(&self, canonical: &Path, staged_len: u64) -> (SystemTime, u64) {
+        match std::fs::metadata(canonical) {
+            Ok(m) => (m.modified().unwrap_or(UNIX_EPOCH), m.len()),
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot stat {} after a successful write ({e}); the rev table may be stale",
+                    canonical.display()
+                );
+                (UNIX_EPOCH, staged_len)
+            }
+        }
+    }
     pub fn snapshot(&self, path: &Path) -> Result<(FileSnapshot, Vec<u8>), HashError> {
         let canonical = self.canonicalize(path);
         // On Linux `File::open` happily opens a directory and the failure only
@@ -459,12 +685,13 @@ impl HashStore {
         let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
 
         if len == 0 {
-            let rev = self.observe(&canonical, mtime, 0);
+            let rev = self.observe(&canonical, EMPTY_DIGEST, mtime, 0, true);
             return Ok((
                 FileSnapshot {
                     canonical,
                     rev,
                     entries: Vec::new(),
+                    ranges: Vec::new(),
                     mtime,
                     len,
                 },
@@ -477,15 +704,20 @@ impl HashStore {
         // as callers need owned content — hashing itself is zero-copy over
         // the mapping).
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let entries = self.hash_all(&mmap);
+        // Split once: the same ranges drive hashing and (via the snapshot)
+        // the caller's slicing, instead of scanning for newlines twice.
+        let ranges = line_ranges(&mmap);
+        let entries = self.hash_all_with_ranges(&mmap, &ranges);
+        let digest = fold_digest(&entries, mmap.ends_with(b"\n") || mmap.ends_with(b"\r"));
         let bytes = mmap[..].to_vec();
         // Shared lock releases on `file` drop here.
-        let rev = self.observe(&canonical, mtime, len);
+        let rev = self.observe(&canonical, digest, mtime, len, true);
         Ok((
             FileSnapshot {
                 canonical,
                 rev,
                 entries,
+                ranges,
                 mtime,
                 len,
             },
@@ -493,50 +725,99 @@ impl HashStore {
         ))
     }
 
-    /// Record an observation; create at 0 or refresh mtime/len keeping rev.
-    fn observe(&self, canonical: &Path, mtime: SystemTime, len: u64) -> u64 {
+    /// Record an observation of the bytes now on disk.
+    ///
+    /// The rev only advances when the *content digest* moves, so a touch or a
+    /// rewrite of identical bytes keeps `REV:n` meaningful as "same content"
+    /// (otherwise `if_rev_match` would report `UNCHANGED` after a real edit and
+    /// a stale line number would sail through). `read` marks a caller-visible
+    /// line-number view, which is what `hashline_edit` checks before letting a
+    /// line-number op through.
+    fn observe(
+        &self,
+        canonical: &Path,
+        digest: u64,
+        mtime: SystemTime,
+        len: u64,
+        read: bool,
+    ) -> u64 {
         let mut st = self.lock_state();
         match st.get_mut(canonical) {
             Some(s) => {
-                s.mtime = mtime;
-                s.len = len;
+                if s.digest != digest {
+                    s.rev += 1;
+                    s.digest = digest;
+                }
+                if read {
+                    s.read_rev = s.rev;
+                }
+                s.seen_mtime = mtime;
+                s.seen_len = len;
                 s.rev
             }
             None => {
-                st.insert(canonical.to_path_buf(), RevState { rev: 0, mtime, len });
+                st.insert(
+                    canonical.to_path_buf(),
+                    RevState {
+                        rev: 0,
+                        digest,
+                        read_rev: 0,
+                        seen_mtime: mtime,
+                        seen_len: len,
+                    },
+                );
                 0
             }
         }
     }
+    /// Digest of `data` as [`snapshot`](Self::snapshot) would compute it.
+    ///
+    /// Lets an editor record what it wrote without hashing the file back off
+    /// disk: the caller has the exact bytes it just produced.
+    pub fn fold_bytes(&self, data: &[u8]) -> u64 {
+        fold_digest(
+            &self.hash_all(data),
+            data.ends_with(b"\n") || data.ends_with(b"\r"),
+        )
+    }
 
     /// Hash every line in `data`, fanning out for large inputs.
     pub fn hash_all(&self, data: &[u8]) -> Vec<LineEntry> {
+        self.hash_all_with_ranges(data, &line_ranges(data))
+    }
+
+    /// Hash every line, reusing line ranges the caller already computed.
+    ///
+    /// `snapshot` splits the file to know where the lines are; handing those
+    /// ranges over keeps a read from scanning the whole file a second time.
+    pub fn hash_all_with_ranges(&self, data: &[u8], ranges: &[(usize, usize)]) -> Vec<LineEntry> {
         if data.len() >= PARALLEL_MIN_BYTES
-            && let Some(entries) = self.hash_all_parallel(data)
+            && let Some(entries) = self.hash_all_parallel(data, ranges)
         {
             return entries;
         }
-        self.hash_all_serial(data)
+        self.hash_all_serial(data, ranges)
     }
 
-    fn hash_all_serial(&self, data: &[u8]) -> Vec<LineEntry> {
-        let mut out = Vec::new();
-        let mut lineno: u32 = 0;
-        for_each_line(data, |line| {
-            lineno += 1;
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+    fn hash_all_serial(&self, data: &[u8], ranges: &[(usize, usize)]) -> Vec<LineEntry> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for (i, (s, e)) in ranges.iter().enumerate() {
+            let line = data[*s..*e].strip_suffix(b"\r").unwrap_or(&data[*s..*e]);
             let full = self.hasher.hash_normalized(line);
             out.push(LineEntry {
-                lineno,
+                lineno: (i + 1) as u32,
                 short: short62(full),
                 full,
             });
-        });
+        }
         out
     }
 
-    fn hash_all_parallel(&self, data: &[u8]) -> Option<Vec<LineEntry>> {
-        let ranges = line_ranges(data);
+    fn hash_all_parallel(
+        &self,
+        data: &[u8],
+        ranges: &[(usize, usize)],
+    ) -> Option<Vec<LineEntry>> {
         if ranges.is_empty() {
             return Some(Vec::new());
         }
@@ -607,6 +888,18 @@ pub enum HashError {
     )]
     Ambiguous {
         hash: String,
+        lines: Vec<u32>,
+        path: String,
+        rev: u64,
+    },
+    /// A hash tag exists in the file but not on the line the caller named:
+    /// the tag comes from a different revision of the file.
+    #[error(
+        "hash '{hash}' is not on line {line} in {path}#REV:{rev} (it is on {lines:?}); re-run hashline_read on \"{path}\" and retry"
+    )]
+    TagLineMismatch {
+        hash: String,
+        line: u32,
         lines: Vec<u32>,
         path: String,
         rev: u64,
@@ -697,6 +990,178 @@ mod tests {
         assert_eq!(line_ranges(b"a"), vec![(0, 1)]);
     }
 
+    fn tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hash-base-{}-{tag}.txt", std::process::id()))
+    }
+
+    #[test]
+    fn fold_digest_tracks_content_not_order_insensitively() {
+        let store = HashStore::new();
+        let a = store.fold_bytes(b"a\nb\n");
+        // Whitespace-only differences hash identically (same line digests).
+        assert_eq!(a, store.fold_bytes(b"a\nb\n"));
+        assert_eq!(a, store.fold_bytes(b"  a  \nb\n"));
+        // Real changes, reordering, and count changes all move it.
+        assert_ne!(a, store.fold_bytes(b"a\nc\n"));
+        assert_ne!(a, store.fold_bytes(b"b\na\n"));
+        assert_ne!(a, store.fold_bytes(b"a\nb\nc\n"));
+        assert_ne!(a, store.fold_bytes(b"a\nb"));
+        // Empty is its own digest and never aliases a temporary.
+        assert_eq!(store.fold_bytes(b""), EMPTY_DIGEST);
+        assert_ne!(store.fold_bytes(b"\n"), EMPTY_DIGEST);
+    }
+
+    /// A read, then an edit, then a read again must keep `REV:n` meaning
+    /// "the content I last looked at" — this is what `if_rev_match` rests on.
+    #[test]
+    fn an_edit_bumps_rev_and_an_external_change_is_observable() {
+        let store = HashStore::new();
+        let p = tmp("rev-bump");
+        std::fs::write(&p, "a\nb\n").unwrap();
+        let (snap, _) = store.snapshot(&p).unwrap();
+        assert_eq!(snap.rev, 0);
+        // Same bytes: same rev.
+        assert_eq!(store.snapshot(&p).unwrap().0.rev, 0);
+        // A whitespace-only touch still agrees (line digests normalize it).
+        std::fs::write(&p, "  a\nb\n").unwrap();
+        assert_eq!(store.snapshot(&p).unwrap().0.rev, 0);
+        // Real content change: the rev moves even though we never wrote it.
+        std::fs::write(&p, "a\nXX\n").unwrap();
+        assert_eq!(store.snapshot(&p).unwrap().0.rev, 1);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn read_rev_lags_edits_so_line_numbers_can_be_disqualified() {
+        let store = HashStore::new();
+        let p = tmp("read-rev");
+        std::fs::write(&p, "a\nb\n").unwrap();
+        store.snapshot(&p).unwrap();
+        let canonical = store.canonicalize(&p);
+        assert_eq!(store.read_rev(&canonical), Some(0));
+        // An edit as far as the store is concerned: commit a new digest.
+        let digest = store.fold_bytes(b"a\nb\nc\n");
+        store.commit_rev(&canonical, digest, UNIX_EPOCH, 6);
+        assert_eq!(store.current_rev(&canonical), Some(1));
+        assert_eq!(store.read_rev(&canonical), Some(0), "edits must not advance read_rev");
+        // A fresh read re-synchronizes them.
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        let (snap, _) = store.snapshot(&p).unwrap();
+        assert_eq!(snap.rev, 1);
+        assert_eq!(store.read_rev(&canonical), Some(1));
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Our own write must not look like somebody else's afterwards, or the
+    /// second edit in a row would trip the external-modification guard.
+    #[test]
+
+    fn a_write_does_not_trip_its_own_external_guard() {
+        let store = HashStore::new();
+        let p = tmp("self-guard");
+        std::fs::write(&p, "a\n").unwrap();
+        let canonical = store.canonicalize(&p);
+        store.snapshot(&p).unwrap();
+
+        let digest = store.fold_bytes(b"b\n");
+        store
+            .atomic_write(&canonical, p.parent().unwrap(), b"b\n", None, "test")
+            .unwrap();
+        store.commit_write(&canonical, digest, 2, 1).unwrap();
+
+        // A second edit: check_external must pass on the file we just wrote.
+        let meta = std::fs::metadata(&canonical).unwrap();
+        store
+            .check_external(
+                &canonical,
+                meta.modified().unwrap_or(UNIX_EPOCH),
+                meta.len(),
+                "test",
+            )
+            .expect("our own write must not look external");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn untouched_path_accepts_rev_zero_only() {
+        let store = HashStore::new();
+        let p = PathBuf::from("/definitely/not/here-hash-base-xyz.txt");
+        let canonical = store.canonicalize(&p);
+        // Nothing observed yet: REV:0 is the honest answer, not a contradiction.
+        assert!(store.check_rev(&canonical, 0, "test").is_ok());
+        assert!(store.check_rev(&canonical, 3, "test").is_err());
+    }
+    /// The per-file lock must exclude other *threads* in this process too,
+    /// not just other processes: two concurrent edits in one harness would
+    /// otherwise both pass validation against the same snapshot.
+    #[test]
+    fn lock_edit_excludes_threads_and_different_files_do_not_contend() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(HashStore::new());
+        // Work in a subdirectory so the sibling lockfile is somewhere we can
+        // assert about, rather than mixed into the system temp dir.
+        let dir = std::env::temp_dir().join(format!("hash-base-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        let canonical = store.canonicalize(&p);
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let inside = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let canonical = canonical.clone();
+            let overlap = Arc::clone(&overlap);
+            let inside = Arc::clone(&inside);
+            handles.push(std::thread::spawn(move || {
+                let _g = store.lock_edit(&canonical).unwrap();
+                if inside.fetch_add(1, Ordering::SeqCst) == 1 {
+                    overlap.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                inside.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(overlap.load(Ordering::SeqCst), 0, "two threads held the same file lock");
+
+        // A different file is not blocked by a held lock.
+        let q = dir.join("b.txt");
+        std::fs::write(&q, "b\n").unwrap();
+        let other = store.canonicalize(&q);
+        let held = store.lock_edit(&canonical).unwrap();
+        let start = std::time::Instant::now();
+        let _second = store.lock_edit(&other).unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a different file's lock blocked on an unrelated edit"
+        );
+        drop(held);
+
+        // The lockfile lives beside the target, not in the temp dir.
+        let siblings: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".lock"))
+            .collect();
+        assert!(
+            siblings.iter().all(|n| n.starts_with('.')),
+            "lockfiles should be hidden siblings of the target: {siblings:?}"
+        );
+        let temp_lockfiles = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".hash-base-lock-") && n.ends_with(".lock"))
+            .count();
+        assert_eq!(temp_lockfiles, 0, "lockfiles should not accumulate in $TMPDIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn parallel_matches_serial() {
         let store = HashStore::new();
@@ -704,9 +1169,9 @@ mod tests {
         for i in 0..5000 {
             data.extend_from_slice(format!("line {i}  \n").as_bytes());
         }
-        // Force parallel path regardless of threshold via direct call.
-        let serial = store.hash_all_serial(&data);
-        let parallel = store.hash_all_parallel(&data).expect("parallel");
+        let ranges = line_ranges(&data);
+        let serial = store.hash_all_serial(&data, &ranges);
+        let parallel = store.hash_all_parallel(&data, &ranges).expect("parallel");
         assert_eq!(serial, parallel);
     }
 }

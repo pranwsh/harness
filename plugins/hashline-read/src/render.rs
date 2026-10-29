@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use harness_contracts::ToolError;
-use harness_hash_base::{HashStore, line_ranges, short_str};
+use harness_hash_base::{HashStore, short_str};
 
 use super::args::ReadArgs;
 
@@ -31,24 +31,83 @@ pub(crate) fn hashline_read_handler(
     }
 }
 
+
+/// Files larger than this are refused rather than hashed whole, because the
+/// snapshot cost is O(file) even for a 50-line window.
+pub(crate) const MAX_READ_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Render a directory as a listing instead of an error.
+///
+/// One tool call answers "what is here", which is what the caller wanted when
+/// they pointed a file reader at a directory.
+fn list_dir(
+    path: &std::path::Path,
+    needle: Option<&str>,
+    ignore_case: bool,
+) -> std::result::Result<String, ToolError> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| crate::tool_err(format!("cannot list {}: {e}", path.display())))?;
+    let mut names: Vec<(bool, String)> = Vec::new();
+    for e in entries.flatten() {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = e.file_name().to_string_lossy().to_string();
+        let keep = match needle {
+            Some(n) if ignore_case => name.to_lowercase().contains(&n.to_lowercase()),
+            Some(n) => name.contains(n),
+            None => true,
+        };
+        if keep {
+            // Trailing separator marks a directory, as `ls -p` does.
+            names.push((is_dir, if is_dir { format!("{name}/") } else { name }));
+        }
+    }
+    names.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out = format!("¶{}/ (directory, {} entries)\n", path.display(), names.len());
+    for (_, name) in names {
+        out.push_str(&name);
+        out.push('\n');
+    }
+    Ok(out)
+}
 /// Render the requested window. Hashing always covers the whole file (see
 /// [`HashStore::snapshot`]); `offset`/`limit`/`grep` only trim the output.
 pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<String, ToolError> {
-    // Directory guard: on Linux `File::open` succeeds for a directory and the
-    // failure only surfaces later as an opaque `ENODEV` from `mmap`. Detect it
-    // up front and say so plainly.
+    // A directory is not an error worth a round-trip to `ls`: list it. The
+    // caller asked what is there, and one tool call answers that.
     if let Ok(meta) = std::fs::metadata(&a.path)
         && meta.is_dir()
     {
+        return list_dir(&a.path, a.grep.as_deref(), a.ignore_case);
+    }
+
+    // Guard before hashing: `snapshot` hashes (and copies) the whole file
+    // regardless of the window, so an accidental read of a multi-GB log would
+    // cost a full scan and a full copy for 50 lines of output.
+    if let Ok(meta) = std::fs::metadata(&a.path)
+        && meta.len() > MAX_READ_BYTES
+    {
         return Err(crate::tool_err(format!(
-            "{} is a directory, not a file; pass a file path (list it with `ls`)",
-            a.path.display()
+            "{} is {} bytes, over the {} byte read limit; \
+             use `offset`/`limit` with `shell` (e.g. `sed -n '1,50p'`) or `grep` instead",
+            a.path.display(),
+            meta.len(),
+            MAX_READ_BYTES
         )));
     }
 
     let (snap, bytes) = store
         .snapshot(&a.path)
         .map_err(|e| crate::tool_err(e.to_string()))?;
+    // Refuse binary: splitting a PNG on `\n` and hashing the pieces yields
+    // tags that address nothing a caller can meaningfully edit, and dumping
+    // the bytes into the transcript is worse than the error.
+    if harness_hash_base::looks_binary(&bytes) {
+        return Err(crate::tool_err(format!(
+            "{} looks like a binary file (NUL byte in the first 8 KiB); \
+             hashline_read only reads text",
+            a.path.display()
+        )));
+    }
     let canonical = snap.canonical.display().to_string();
     let rev = snap.rev;
 
@@ -56,68 +115,102 @@ pub(crate) fn render(store: &HashStore, a: &ReadArgs) -> std::result::Result<Str
     if let Some(want) = a.if_rev_match
         && rev == want
     {
+        // Name what did not change, so the reply is self-contained.
         return Ok(format!(
-            "¶{canonical}#REV:{rev} UNCHANGED (rev {want} matches; body elided)"
+            "¶{canonical}#REV:{rev} lines={} UNCHANGED (rev {want} matches; body elided)",
+            snap.entries.len()
         ));
     }
 
     let total = snap.entries.len();
-    let ranges = line_ranges(&bytes);
+    // Ranges come from the snapshot: hashing already split the file, so
+    // re-scanning here would be a second full pass for the same answer.
     let line_text = |i: usize| -> std::borrow::Cow<'_, str> {
-        let (s, t) = ranges[i];
+        let (s, t) = snap.ranges[i];
         let raw = bytes[s..t].strip_suffix(b"\r").unwrap_or(&bytes[s..t]);
         String::from_utf8_lossy(raw)
     };
 
     // Candidate line indices after the optional substring filter.
-    let selected: Vec<usize> = match &a.grep {
-        Some(needle) => (0..total).filter(|&i| line_text(i).contains(needle.as_str())).collect(),
-        None => (0..total).collect(),
+    let needle = a.grep.as_deref();
+    let matches = |text: &str| match needle {
+        Some(n) if a.ignore_case => text.to_lowercase().contains(&n.to_lowercase()),
+        Some(n) => text.contains(n),
+        None => true,
     };
+    let matched: Vec<usize> = (0..total).filter(|&i| matches(&line_text(i))).collect();
+
+    // With `context`, a match drags its neighbours into the output. Rows keep
+    // the same `line:hash|content` shape, so the extra lines stay editable and
+    // the header's `matches=` still reports only the real hits.
+    let display: Vec<usize> = if needle.is_some() && a.context > 0 && !matched.is_empty() {
+        let mut out: Vec<usize> = Vec::with_capacity(matched.len() * (a.context * 2 + 1));
+        let mut last: Option<usize> = None;
+        for &m in &matched {
+            let lo = m.saturating_sub(a.context);
+            let hi = (m + a.context).min(total.saturating_sub(1));
+            // Never re-emit a line two nearby matches both pull in.
+            let lo = match last {
+                Some(l) if l >= lo => l + 1,
+                _ => lo,
+            };
+            for i in lo..=hi {
+                out.push(i);
+                last = Some(i);
+            }
+        }
+        out
+    } else {
+        matched.clone()
+    };
+    let selected = &display;
     let shown_total = selected.len();
 
-    // Header first so empty files (and empty windows) still report REV.
-    let mut out = String::with_capacity(bytes.len() + total * 8 + 64);
-    out.push('¶');
-    out.push_str(&canonical);
-    out.push_str("#REV:");
-    out.push_str(&rev.to_string());
-
-    if total == 0 {
-        return Ok(out);
-    }
-
+    // Window is an index range into the selected rows; resolve it before
+    // building the string so the buffer can be sized to the window.
     let start = (a.offset - 1) as usize;
-    if start >= shown_total {
+    // Search terms can legitimately match nothing: that is an empty result,
+    // not a bad offset. Only a real line offset out of range is an error.
+    if start >= shown_total && needle.is_none() && total > 0 {
         return Err(crate::tool_err(format!(
-            "offset {} beyond EOF ({shown_total} lines{})",
-            a.offset,
-            if a.grep.is_some() {
-                format!(" matching, of {total} total")
-            } else {
-                String::new()
-            }
+            "offset {} beyond EOF ({total} lines)",
+            a.offset
         )));
     }
+    let start = start.min(shown_total);
     let end = match a.limit {
         Some(l) => start.saturating_add(l as usize),
         None => shown_total,
     }
     .min(shown_total);
+    let shown = if total == 0 { &selected[0..0] } else { &selected[start..end] };
 
-    let windowed = a.offset != 1 || end < shown_total;
-    if windowed {
-        out.push_str(&format!(" lines {}-{end} of {shown_total}", a.offset));
-        if end < shown_total {
-            out.push_str(&format!(" (next offset {})", end + 1));
-        }
+    // Header: `¶path#REV:rev lines=N` plus only the keys that apply, so a
+    // caller can parse it without prose-suffix guessing.
+    let mut out = String::with_capacity(64 + shown.len() * 80);
+    out.push('¶');
+    out.push_str(&canonical);
+    out.push_str("#REV:");
+    out.push_str(&rev.to_string());
+    out.push_str(&format!(" lines={total}"));
+    if needle.is_some() {
+        // Real hits, not the context rows we padded in around them.
+        out.push_str(&format!(" matches={}", matched.len()));
     }
-    if let Some(needle) = &a.grep {
-        out.push_str(&format!(" grep={needle:?} ({shown_total} of {total} lines)"));
+    if a.offset != 1 || end < shown_total {
+        // Real file line numbers, not positions within the filtered list.
+        let span = match (shown.first(), shown.last()) {
+            (Some(f), Some(l)) => format!("{}-{}", snap.entries[*f].lineno, snap.entries[*l].lineno),
+            _ => "none".to_owned(),
+        };
+        out.push_str(&format!(" window={span}"));
+        if end < shown_total {
+            out.push_str(&format!(" next={}", end + 1));
+        }
     }
     out.push('\n');
 
-    for &i in &selected[start..end] {
+    for &i in shown {
         let e = &snap.entries[i];
         out.push_str(&e.lineno.to_string());
         if a.hashes {
@@ -146,6 +239,8 @@ mod tests {
             hashes: true,
             if_rev_match: None,
             grep: None,
+            ignore_case: false,
+            context: 0,
         }
     }
 
@@ -157,6 +252,8 @@ mod tests {
             hashes: false,
             if_rev_match: None,
             grep: None,
+            ignore_case: false,
+            context: 0,
         }
     }
 
@@ -171,8 +268,9 @@ mod tests {
         let header = lines.next().unwrap();
         assert!(header.starts_with('¶'), "header: {header}");
         assert!(header.contains("#REV:0"), "header: {header}");
-        // Unpaginated header carries no window suffix.
-        assert!(!header.contains("lines"), "header: {header}");
+        // Unpaginated header reports the size but carries no window key.
+        assert!(header.contains("lines=2"), "header: {header}");
+        assert!(!header.contains("window="), "header: {header}");
         let l1 = lines.next().unwrap();
         let l2 = lines.next().unwrap();
         assert!(l1.starts_with("1:"), "l1: {l1}");
@@ -217,8 +315,9 @@ mod tests {
         let out = render(&store, &test_args(&path, 2, Some(2))).unwrap();
         let mut lines = out.lines();
         let header = lines.next().unwrap();
-        assert!(header.contains("lines 2-3 of 5"), "header: {header}");
-        assert!(header.contains("next offset 4"), "header: {header}");
+        assert!(header.contains("lines=5"), "header: {header}");
+        assert!(header.contains("window=2-3"), "header: {header}");
+        assert!(header.contains("next=4"), "header: {header}");
         let body: Vec<&str> = lines.collect();
         assert_eq!(body.len(), 2, "body: {body:?}");
         assert!(body[0].starts_with("2:"), "row: {}", body[0]);
@@ -235,8 +334,9 @@ mod tests {
         let store = HashStore::new();
         let out = render(&store, &test_args(&path, 2, Some(100))).unwrap();
         let header = out.lines().next().unwrap();
-        assert!(header.contains("lines 2-2 of 2"), "header: {header}");
-        assert!(!header.contains("next offset"), "header: {header}");
+        assert!(header.contains("lines=2"), "header: {header}");
+        assert!(header.contains("window=2-2"), "header: {header}");
+        assert!(!header.contains("next="), "header: {header}");
         std::fs::remove_file(&path).ok();
     }
 
@@ -251,12 +351,37 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Pointing a file reader at a directory answers the question instead of
+    /// making the caller spend a round-trip on `ls`.
     #[test]
-    fn directory_is_a_clean_error() {
+    fn directory_renders_a_listing() {
+        let dir = std::env::temp_dir().join(format!("hashline-read-{}-dir", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         let store = HashStore::new();
-        let dir = std::env::temp_dir();
-        let err = render(&store, &test_args(&dir, 1, None)).unwrap_err();
-        assert!(err.message.contains("is a directory"), "got: {}", err.message);
+        let out = render(&store, &test_args(&dir, 1, None)).unwrap();
+        assert!(out.contains("directory"), "out: {out}");
+        assert!(out.contains("b.txt"), "out: {out}");
+        assert!(out.contains("sub/"), "directories marked: {out}");
+        // Listed in a stable order, with the file before the directory.
+        let listing: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(listing, vec!["b.txt", "sub/"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_files_are_refused_before_hashing() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-big.txt", std::process::id()));
+        // Sparse-ish: just enough to trip the limit without writing 32 MiB.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+        drop(f);
+        let store = HashStore::new();
+        let err = render(&store, &test_args(&path, 1, None)).unwrap_err();
+        assert!(err.message.contains("over the"), "got: {}", err.message);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -269,10 +394,45 @@ mod tests {
         args.grep = Some("a".to_owned());
         let out = render(&store, &args).unwrap();
         let header = out.lines().next().unwrap();
-        assert!(header.contains("grep="), "header: {header}");
-        assert!(header.contains("3 of 3 lines"), "header: {header}");
+        assert!(header.contains("lines=3"), "header: {header}");
+        assert!(header.contains("matches=3"), "header: {header}");
         let body: Vec<&str> = out.lines().skip(1).collect();
         assert_eq!(body.len(), 3, "body: {body:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// In grep mode the header's window must report real file line numbers,
+    /// not positions within the filtered list — a caller edits by the former.
+    #[test]
+    fn grep_window_reports_real_line_numbers() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-grep-ln.txt", std::process::id()));
+        std::fs::write(&path, "no\nhit one\nno\nhit two\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, Some(1));
+        args.grep = Some("hit".to_owned());
+        let out = render(&store, &args).unwrap();
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("matches=2"), "header: {header}");
+        // First match shown, and the window names its real line (2), not 1.
+        assert!(header.contains("window=2-2"), "header: {header}");
+        assert!(out.contains("|hit one"), "out: {out}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn grep_can_ignore_case() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-grep-i.txt", std::process::id()));
+        std::fs::write(&path, "Alpha\nbeta\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, None);
+        args.grep = Some("alpha".to_owned());
+        // Case-sensitive by default: no match.
+        assert_eq!(render(&store, &args).unwrap().lines().count(), 1);
+        args.ignore_case = true;
+        let out = render(&store, &args).unwrap();
+        assert!(out.contains("Alpha"), "out: {out}");
         std::fs::remove_file(&path).ok();
     }
 
@@ -289,6 +449,66 @@ mod tests {
         let out = render(&store, &args).unwrap();
         assert!(out.contains("UNCHANGED"), "out: {out}");
         assert_eq!(out.lines().count(), 1, "out: {out}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `if_rev_match` is a promise that the body did not change. An out-of-band
+    /// write must break that promise by advancing the rev, not by silently
+    /// eliding a body that no longer matches what the caller last saw.
+    #[test]
+    fn if_rev_match_does_not_elide_after_an_external_write() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-rev-ext.txt", std::process::id()));
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let store = HashStore::new();
+        let _ = render(&store, &test_args(&path, 1, None)).unwrap();
+
+        // Somebody else rewrites the file.
+        std::fs::write(&path, "a\nZZZ\n").unwrap();
+
+        let mut args = test_args(&path, 1, None);
+        args.if_rev_match = Some(0);
+        let out = render(&store, &args).unwrap();
+        assert!(!out.contains("UNCHANGED"), "stale rev must not elide: {out}");
+        assert!(out.contains("ZZZ"), "the new body must be rendered: {out}");
+        assert!(out.contains("ZZZ"), "the new body must be rendered: {out}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A binary file has no lines a caller can edit meaningfully, and the
+    /// bytes should not land in the transcript. Say so instead.
+    #[test]
+    fn binary_files_are_refused() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-bin.txt", std::process::id()));
+        let original: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        std::fs::write(&path, original).unwrap();
+        let store = HashStore::new();
+        let err = render(&store, &test_args(&path, 1, None)).unwrap_err();
+        assert!(err.message.contains("binary"), "got: {}", err.message);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "bytes stay intact");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Context rows make a grep hit readable in place; `matches=` still
+    /// counts only the real hits, not the padding.
+    #[test]
+    fn grep_context_includes_neighbours() {
+        let path =
+            std::env::temp_dir().join(format!("hashline-read-{}-ctx.txt", std::process::id()));
+        std::fs::write(&path, "one\ntwo\nHIT\nfour\nfive\n").unwrap();
+        let store = HashStore::new();
+        let mut args = test_args(&path, 1, None);
+        args.grep = Some("HIT".to_owned());
+        args.context = 1;
+        let out = render(&store, &args).unwrap();
+        let header = out.lines().next().unwrap();
+        assert!(header.contains("matches=1"), "header: {header}");
+        let body: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(body.len(), 3, "body: {body:?}");
+        assert!(body[0].contains("|two"), "body: {body:?}");
+        assert!(body[1].contains("|HIT"), "body: {body:?}");
+        assert!(body[2].contains("|four"), "body: {body:?}");
         std::fs::remove_file(&path).ok();
     }
 }
