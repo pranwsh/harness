@@ -4,41 +4,76 @@ mod read;
 mod syntax;
 mod text;
 
-use std::sync::Arc;
-use harness_contracts::{ToolError, ToolRegistryHandle, ToolSpec, KEY_HASH_STORE, KEY_TOOL_REGISTRY};
+use harness_contracts::{
+    KEY_HASH_STORE, KEY_TOOL_REGISTRY, ToolError, ToolRegistryHandle, ToolSpec,
+};
 use harness_core::{Context, Result};
 use harness_hash_base::HashStore;
+use std::sync::Arc;
 
 pub struct FileToolsPlugin;
 
 impl harness_core::Plugin for FileToolsPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
-        harness_core::PluginMeta::new("file-tools").injects(KEY_TOOL_REGISTRY).injects(KEY_HASH_STORE)
+        harness_core::PluginMeta::new("file-tools")
+            .injects(KEY_TOOL_REGISTRY)
+            .injects(KEY_HASH_STORE)
     }
     fn build(&self, ctx: Context) -> Result<()> {
         let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
         let store: Arc<HashStore> = ctx.inject_key(KEY_HASH_STORE)?;
-        registry.register(read_spec(), Box::new(|arguments| Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let args = serde_json::from_str(&arguments).map_err(|e| error("read", format!("invalid arguments: {e}")))?;
-                read::run(args).map_err(|e| error("read", e))
-            }).await.map_err(|e| error("read", format!("task failed: {e}")))?
-        }))).map_err(|e| harness_core::Error::ServiceConflict { key: "read".into(), provider: e })?;
+        let read_store = store.clone();
+        registry
+            .register(
+                read_spec(),
+                Box::new(move |arguments| {
+                    let store = read_store.clone();
+                    Box::pin(async move {
+                        tokio::task::spawn_blocking(move || {
+                            let args = serde_json::from_str(&arguments)
+                                .map_err(|e| error("read", format!("invalid arguments: {e}")))?;
+                            read::run(&store, args).map_err(|e| error("read", e))
+                        })
+                        .await
+                        .map_err(|e| error("read", format!("task failed: {e}")))?
+                    })
+                }),
+            )
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "read".into(),
+                provider: e,
+            })?;
         let editor = Arc::new(edit::Editor::default());
-        registry.register(edit_spec(), Box::new(move |arguments| {
-            let store = store.clone();
-            let editor = editor.clone();
-            Box::pin(async move {
-                tokio::task::spawn_blocking(move || {
-                    let args = serde_json::from_str(&arguments).map_err(|e| error("edit", format!("invalid arguments: {e}")))?;
-                    editor.run(&store, args).map_err(|e| error("edit", e))
-                }).await.map_err(|e| error("edit", format!("task failed: {e}")))?
-            })
-        })).map_err(|e| harness_core::Error::ServiceConflict { key: "edit".into(), provider: e })?;
+        registry
+            .register(
+                edit_spec(),
+                Box::new(move |arguments| {
+                    let store = store.clone();
+                    let editor = editor.clone();
+                    Box::pin(async move {
+                        tokio::task::spawn_blocking(move || {
+                            let args = serde_json::from_str(&arguments)
+                                .map_err(|e| error("edit", format!("invalid arguments: {e}")))?;
+                            editor.run(&store, args).map_err(|e| error("edit", e))
+                        })
+                        .await
+                        .map_err(|e| error("edit", format!("task failed: {e}")))?
+                    })
+                }),
+            )
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "edit".into(),
+                provider: e,
+            })?;
         Ok(())
     }
 }
-fn error(tool: &str, message: String) -> ToolError { ToolError { tool: tool.into(), message } }
+fn error(tool: &str, message: String) -> ToolError {
+    ToolError {
+        tool: tool.into(),
+        message,
+    }
+}
 
 pub fn read_spec() -> ToolSpec {
     ToolSpec {
