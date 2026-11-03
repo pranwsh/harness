@@ -230,6 +230,64 @@ struct ExecArgs {
     env: Option<HashMap<String, String>>,
 }
 
+/// Explicit, foreground-only privileged request; arguments are never shell-expanded.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SudoArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+fn shell_sudo_handler(
+    svc: Arc<ShellService>,
+    args: String,
+) -> BoxFuture<'static, Result<String, ToolError>> {
+    Box::pin(async move {
+        const TOOL: &str = "shell_sudo_exec";
+        let a: SudoArgs = serde_json::from_str(&args)
+            .map_err(|e| tool_err(TOOL, format!("invalid arguments: {e}")))?;
+        if a.program.is_empty()
+            || a.program.starts_with('-')
+            || a.program.contains('\0')
+            || a.args.len() > 256
+            || a.args.iter().any(|x| x.contains('\0'))
+            || a.program.len() + a.args.iter().map(String::len).sum::<usize>() > 65536
+        {
+            return Err(tool_err(TOOL, "invalid program or arguments"));
+        }
+        // An absolute, administrator-controlled sudo path avoids PATH substitution.
+        let sudo = "/usr/bin/sudo".to_owned();
+        let mut argv = vec![sudo.clone(), "-n".to_owned(), "--".to_owned(), a.program];
+        argv.extend(a.args);
+        let req = resolve_request(&svc.cfg, sudo, argv, a.workdir, a.timeout_ms, None)
+            .map_err(|e| tool_err(TOOL, e))?;
+        exec::run_once(&svc.cfg, req)
+            .await
+            .map_err(|e| tool_err(TOOL, e))
+    })
+}
+
+pub fn shell_sudo_spec() -> ToolSpec {
+    ToolSpec {
+        name: "shell_sudo_exec".to_owned(),
+        description: "Run an explicit argv with sudo -n in the foreground, subject to session approval and OS authorization. No shell expansion or password prompt.".to_owned(),
+        parameters: serde_json::json!({
+            "type":"object", "additionalProperties":false,
+            "properties": {
+                "program":{"type":"string"},
+                "args":{"type":"array", "items":{"type":"string"}},
+                "workdir":{"type":"string"},
+                "timeout_ms":{"type":"integer", "minimum":1}
+            }, "required":["program"]
+        }),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct PollArgs {
     job_id: String,
@@ -392,6 +450,18 @@ impl harness_core::Plugin for ShellPlugin {
         let handle: Arc<harness_contracts::ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
         let config = handle.get();
         let svc = Arc::new(ShellService::new(config.shell.clone()));
+        registry
+            .register(
+                shell_sudo_spec(),
+                Box::new({
+                    let svc = Arc::clone(&svc);
+                    move |args| shell_sudo_handler(Arc::clone(&svc), args)
+                }),
+            )
+            .map_err(|e| harness_core::Error::ServiceConflict {
+                key: "shell_sudo_exec".into(),
+                provider: e,
+            })?;
         registry
             .register(
                 shell_exec_spec(),
