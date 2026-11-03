@@ -8,7 +8,7 @@
 
 /// The slash commands. The popup shows them on a bare `/` and
 /// prefix-filters them as the user types.
-pub const ALL_COMMANDS: [&str; 3] = ["/model", "/sessions", "/branch"];
+pub const ALL_COMMANDS: [&str; 4] = ["/model", "/sessions", "/branch", "/sudo"];
 
 /// Popup title, with the surrounding spaces the border title expects.
 pub const COMMANDS_TITLE: &str = " commands ";
@@ -55,7 +55,8 @@ mod tests {
             vec![
                 "/model".to_owned(),
                 "/sessions".to_owned(),
-                "/branch".to_owned()
+                "/branch".to_owned(),
+                "/sudo".to_owned()
             ]
         );
     }
@@ -64,11 +65,11 @@ mod tests {
     fn prefix_filters() {
         assert_eq!(filter_commands("/m"), vec!["/model".to_owned()]);
         assert_eq!(filter_commands("/model"), vec!["/model".to_owned()]);
-        assert_eq!(filter_commands("/s"), vec!["/sessions".to_owned()]);
         assert_eq!(
-            filter_commands("/sessions"),
-            vec!["/sessions".to_owned()]
+            filter_commands("/s"),
+            vec!["/sessions".to_owned(), "/sudo".to_owned()]
         );
+        assert_eq!(filter_commands("/sessions"), vec!["/sessions".to_owned()]);
         assert_eq!(filter_commands("/b"), vec!["/branch".to_owned()]);
         assert_eq!(filter_commands("/c"), Vec::<String>::new());
         assert_eq!(filter_commands("/bogus"), Vec::<String>::new());
