@@ -17,7 +17,6 @@ pub struct SudoPopup {
 #[derive(Clone)]
 enum State {
     Mode,
-    Enable,
     Request(u64),
 }
 impl SudoPopup {
@@ -107,29 +106,11 @@ impl SudoPopup {
                         self.popup.close();
                         *state = None;
                     }
-                    State::Enable => {
-                        if chosen == "Yes" {
-                            self.policy.0.set_mode(session, SudoMode::AllowForSession);
-                            app.update(AppMsg::Notice("sudo: allowed for this session (not a sandbox; OS authorization still applies)".into()));
-                        }
-                        self.popup.close();
-                        *state = None;
-                    }
-                    State::Mode if chosen == "AllowForSession" => {
-                        self.popup.open(
-                            " allow for this session? OS authorization still applies ",
-                            vec!["No".into(), "Yes".into()],
-                            0,
-                            None,
-                            vec![],
-                        );
-                        *state = Some(State::Enable);
-                    }
                     State::Mode => {
-                        let mode = if chosen == "Ask" {
-                            SudoMode::Ask
-                        } else {
-                            SudoMode::Block
+                        let mode = match chosen.as_str() {
+                            "Ask" => SudoMode::Ask,
+                            "AllowForSession" => SudoMode::AllowForSession,
+                            _ => SudoMode::Block,
                         };
                         self.policy.0.set_mode(session, mode);
                         app.update(AppMsg::Notice(format!(
