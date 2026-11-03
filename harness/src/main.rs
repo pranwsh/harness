@@ -69,17 +69,7 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "tools", harness_tools::ToolsPlugin);
     load!(ctx, "skills", harness_skills::SkillsPlugin);
     load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
-    load!(
-        ctx,
-        "hashline-read",
-        harness_hashline_read::HashlineReadPlugin
-    );
-    load!(
-        ctx,
-        "hashline-edit",
-        harness_hashline_edit::HashlineEditPlugin
-    );
-    load!(ctx, "file-write", harness_file_write::FileWritePlugin);
+    load!(ctx, "file-tools", harness_file_tools::FileToolsPlugin);
     {
         // Shell injects `config.app` + `tools.executor` via DI and parks
         // until both are ready; no ctor wiring needed.
