@@ -292,8 +292,8 @@ pub struct ToolExecuted {
 
 /// `CH_TOOL_APPROVAL` waterfall payload: pre-execution gate for tool calls.
 ///
-/// A future guardrail plugin registers a waterfall handler on
-/// `CH_TOOL_APPROVAL`, inspects/rewrites `call`, and sets `denied = Some(reason)`
+/// A guardrail plugin registers a waterfall handler on
+/// `CH_TOOL_APPROVAL`, inspects `call`, and sets `denied = Some(reason)`
 /// to veto. With no handlers the call runs unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolApproval {
@@ -301,7 +301,7 @@ pub struct ToolApproval {
     pub session_id: SessionId,
     pub turn: u64,
     pub call: ToolCall,
-    /// `Some(reason)` vetoes execution; `None` allows (possibly rewritten) `call`.
+    /// `Some(reason)` vetoes execution; `None` allows the unchanged call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<String>,
 }

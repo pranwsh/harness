@@ -67,6 +67,7 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "agent", harness_agent::AgentPlugin);
     load!(ctx, "session", harness_session::SessionPlugin);
     load!(ctx, "tools", harness_tools::ToolsPlugin);
+    load!(ctx, "sudo-policy", harness_sudo_policy::SudoPolicyPlugin);
     load!(ctx, "skills", harness_skills::SkillsPlugin);
     load!(ctx, "hash-base", harness_hash_base::HashBasePlugin);
     load!(ctx, "file-tools", harness_file_tools::FileToolsPlugin);
@@ -96,6 +97,7 @@ async fn run() -> Result<ExitCode> {
     load!(ctx, "tui-input", harness_tui_input::InputPlugin);
     load!(ctx, "tui-markdown", harness_tui_markdown::MarkdownPlugin);
     load!(ctx, "tui-popup", harness_tui_popup::TuiPopupPlugin);
+    load!(ctx, "tui-sudo", harness_tui_sudo::TuiSudoPlugin);
     load!(ctx, "tui-model", harness_tui_model::TuiModelPlugin);
     load!(ctx, "tui-commands", harness_tui_commands::TuiCommandsPlugin);
     load!(ctx, "tui-sessions", harness_tui_sessions::TuiSessionsPlugin);

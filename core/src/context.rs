@@ -202,6 +202,16 @@ impl Context {
         key: impl Into<Key>,
         event: E,
     ) -> Result<E> {
+        self.waterfall_checked_key(key, event, |_, _| true).await
+    }
+
+    /// Run each handler with a transition validator. Invalid transitions fail closed.
+    pub async fn waterfall_checked_key<E: Event + Clone>(
+        &self,
+        key: impl Into<Key>,
+        event: E,
+        validate: impl Fn(&E, &E) -> bool,
+    ) -> Result<E> {
         let key = key.into();
         let listeners: Vec<Arc<ListenerEntry>> = {
             let reg = self.inner.read_events();
@@ -229,7 +239,20 @@ impl Context {
         let mut current: BoxedEvent = Arc::new(event);
         for entry in &listeners {
             if let ListenerKind::Waterfall(f) = &entry.kind {
-                current = f(current).await;
+                let previous = current.clone();
+                let next = f(current).await;
+                let before: Arc<dyn Any + Send + Sync> = previous;
+                let after: Arc<dyn Any + Send + Sync> = next.clone();
+                let before = before
+                    .downcast::<E>()
+                    .map_err(|_| Error::PayloadTypeMismatch { key: key.clone() })?;
+                let after = after
+                    .downcast::<E>()
+                    .map_err(|_| Error::PayloadTypeMismatch { key: key.clone() })?;
+                if !validate(&before, &after) {
+                    return Err(Error::InvalidWaterfallTransition { key });
+                }
+                current = next;
             }
         }
 

@@ -143,7 +143,15 @@ mod tests {
         bridge.sync(&app);
         assert!(bridge.is_open());
         let snap = bridge.snapshot().expect("open");
-        assert_eq!(snap.items, vec!["/model".to_owned(), "/sessions".to_owned()]);
+        assert_eq!(
+            snap.items,
+            vec![
+                "/model".to_owned(),
+                "/sessions".to_owned(),
+                "/branch".to_owned(),
+                "/sudo".to_owned()
+            ]
+        );
         assert_eq!(snap.selected, 0);
         assert_eq!(snap.current, None);
     }
@@ -164,7 +172,12 @@ mod tests {
         bridge.sync(&app);
         assert_eq!(
             bridge.snapshot().expect("open").items,
-            vec!["/model".to_owned(), "/sessions".to_owned()]
+            vec![
+                "/model".to_owned(),
+                "/sessions".to_owned(),
+                "/branch".to_owned(),
+                "/sudo".to_owned()
+            ]
         );
     }
 
@@ -199,13 +212,13 @@ mod tests {
         let mut app = App::new();
         type_text(&mut app, "/");
         bridge.sync(&app);
-        // Two rows: moving steps through them and wraps around.
-        assert!(bridge.handle_key(KeyEvent::Down, &mut app));
-        assert_eq!(bridge.snapshot().expect("open").selected, 1);
-        assert!(bridge.handle_key(KeyEvent::Down, &mut app));
-        assert_eq!(bridge.snapshot().expect("open").selected, 0);
+        // Four rows: moving steps through them and wraps around.
+        for expected in [1, 2, 3, 0] {
+            assert!(bridge.handle_key(KeyEvent::Down, &mut app));
+            assert_eq!(bridge.snapshot().expect("open").selected, expected);
+        }
         assert!(bridge.handle_key(KeyEvent::Up, &mut app));
-        assert_eq!(bridge.snapshot().expect("open").selected, 1);
+        assert_eq!(bridge.snapshot().expect("open").selected, 3);
         // Cursor never left the entry bar.
         assert_eq!(app.input(), "/");
     }

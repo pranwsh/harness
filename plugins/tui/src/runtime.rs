@@ -14,15 +14,16 @@ use tokio::sync::mpsc;
 
 use harness_agent_loop::{AgentLoop, TurnEvent};
 use harness_contracts::{SessionStoreHandle, SessionTreeHandle};
+use harness_tui_branch::BranchPopup;
 use harness_tui_commands::CommandPopup;
 use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
-use harness_tui_branch::BranchPopup;
 use harness_tui_sessions::SessionPopup;
 use harness_tui_state::{
     app::{App, AppMsg, KeyEvent},
     render::RendererHandle,
 };
+use harness_tui_sudo::SudoPopup;
 
 use crate::view::{self, LayoutCache};
 
@@ -55,6 +56,7 @@ pub async fn run(
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
     branch_popup: Arc<BranchPopup>,
+    sudo_popup: Arc<SudoPopup>,
 ) {
     let terminal = ratatui::init();
     enable_terminal_features();
@@ -70,6 +72,7 @@ pub async fn run(
         command_popup,
         session_popup,
         branch_popup,
+        sudo_popup,
     )
     .run(terminal)
     .await;
@@ -123,9 +126,16 @@ struct EventLoop {
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
     branch_popup: Arc<BranchPopup>,
+    sudo_popup: Arc<SudoPopup>,
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
     layout_cache: LayoutCache,
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        self.sudo_popup.reset(&self.session_id);
+    }
 }
 
 impl EventLoop {
@@ -142,6 +152,7 @@ impl EventLoop {
         command_popup: Arc<CommandPopup>,
         session_popup: Arc<SessionPopup>,
         branch_popup: Arc<BranchPopup>,
+        sudo_popup: Arc<SudoPopup>,
     ) -> Self {
         // Bound generous enough to absorb bursts of stream events; the
         // input task bails out if the loop ever stops draining.
@@ -161,6 +172,7 @@ impl EventLoop {
             command_popup,
             session_popup,
             branch_popup,
+            sudo_popup,
             tx,
             rx,
             layout_cache: LayoutCache::new(),
@@ -175,9 +187,12 @@ impl EventLoop {
             // Each provider owns its surface; draw at most one, model
             // first, then sessions, then branch, so the modal selectors
             // win over autocomplete.
+            let width = terminal.size().map(|s| s.width as usize).unwrap_or(0);
+            self.sudo_popup.sync(&self.session_id, width);
             let snapshot = self
-                .model_popup
+                .sudo_popup
                 .snapshot()
+                .or_else(|| self.model_popup.snapshot())
                 .or_else(|| self.session_popup.snapshot())
                 .or_else(|| self.branch_popup.snapshot())
                 .or_else(|| self.command_popup.snapshot());
@@ -219,6 +234,18 @@ impl EventLoop {
             //   slash candidate, so they cannot self-close).
             // - Else: normal edit; post-reduce syncs the eligible provider.
             if let AppMsg::Key(key) = &msg {
+                if self.sudo_popup.active() {
+                    if self
+                        .sudo_popup
+                        .handle(&self.session_id, *key, &mut self.app)
+                    {
+                        continue;
+                    }
+                } else if *key == KeyEvent::Enter && self.app.input().trim() == "/sudo" {
+                    self.sudo_popup.open(&self.session_id, &mut self.app);
+                    self.command_popup.close();
+                    continue;
+                }
                 if self.model_popup.is_active() {
                     if self.model_popup.handle_key(*key, &mut self.app) {
                         if self.app.should_quit() {
@@ -265,16 +292,12 @@ impl EventLoop {
                         self.command_popup.close();
                         continue;
                     }
-                    if *key == KeyEvent::Enter
-                        && self.session_popup.wants_input(self.app.input())
-                    {
+                    if *key == KeyEvent::Enter && self.session_popup.wants_input(self.app.input()) {
                         self.session_popup.open(&mut self.app);
                         self.command_popup.close();
                         continue;
                     }
-                    if *key == KeyEvent::Enter
-                        && self.branch_popup.wants_input(self.app.input())
-                    {
+                    if *key == KeyEvent::Enter && self.branch_popup.wants_input(self.app.input()) {
                         self.branch_popup.open(&mut self.app);
                         self.command_popup.close();
                         continue;
@@ -379,6 +402,8 @@ impl EventLoop {
     /// decoupled store handle (lazily hydrated from disk by the session
     /// plugin); rendering the entries is pure `App` state.
     fn switch_session(&mut self, session_id: String) {
+        self.sudo_popup.reset(&self.session_id);
+        self.sudo_popup.reset(&session_id);
         let history = self.sessions.history(&session_id);
         let entries = history.len();
         self.app.set_transcript(&history);
@@ -436,17 +461,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use harness_tui_branch::BranchPopup;
     use harness_contracts::{
         AgentRegistryApi, AgentRegistryHandle, AgentState, BoxFuture, Entry, Message,
         ModelCatalogApi, ModelCatalogHandle, ModelSelectorApi, ModelSelectorHandle,
         ModelStreamerApi, ModelStreamerHandle, PromptAssemblerApi, PromptAssemblerHandle,
-        SessionCatalogApi, SessionCatalogHandle, SessionStoreApi, SessionSummary,
-        SessionTreeApi, SessionTreeHandle, StreamEvent, ToolExecutorApi, ToolExecutorHandle,
-        ToolSpec,
+        SessionCatalogApi, SessionCatalogHandle, SessionStoreApi, SessionSummary, SessionTreeApi,
+        SessionTreeHandle, StreamEvent, ToolExecutorApi, ToolExecutorHandle, ToolSpec,
     };
     use harness_core::Context;
     use harness_session::SessionLog;
+    use harness_tui_branch::BranchPopup;
     use harness_tui_state::app::ItemKind;
     use harness_tui_state::render::{ASSISTANT_BASE, PlainRenderer};
 
@@ -594,7 +618,11 @@ mod tests {
             Entry::from_message(&Message::user("live two")),
         );
         let turn = log.begin_turn("past-1");
-        log.append("past-1", turn, Entry::from_message(&Message::user("old question")));
+        log.append(
+            "past-1",
+            turn,
+            Entry::from_message(&Message::user("old question")),
+        );
         log.append(
             "past-1",
             turn,
@@ -625,7 +653,9 @@ mod tests {
             Arc::new(RendererHandle(Arc::new(PlainRenderer::new(ASSISTANT_BASE)))),
             Arc::new(Input),
             Arc::new(ModelPopup::new(
-                Arc::new(ModelCatalogHandle(catalog.clone() as Arc<dyn ModelCatalogApi>)),
+                Arc::new(ModelCatalogHandle(
+                    catalog.clone() as Arc<dyn ModelCatalogApi>
+                )),
                 None,
             )),
             Arc::new(CommandPopup::new()),
@@ -633,6 +663,15 @@ mod tests {
                 catalog as Arc<dyn SessionCatalogApi>,
             )))),
             Arc::new(BranchPopup::new(tree)),
+            {
+                let ctx = Context::root();
+                ctx.load(harness_sudo_policy::SudoPolicyPlugin).unwrap();
+                Arc::new(SudoPopup::new(
+                    ctx.inject_key(harness_contracts::KEY_SUDO_POLICY).unwrap(),
+                    ctx.inject_key(harness_contracts::KEY_SUDO_APPROVAL)
+                        .unwrap(),
+                ))
+            },
         );
         (log, Fixture { events })
     }
@@ -651,7 +690,9 @@ mod tests {
         assert_eq!(items[1].text, "old answer");
         assert_eq!(items[2].kind, ItemKind::Notice);
         assert!(
-            items[2].text.starts_with("resumed session past-1 (2 entries)"),
+            items[2]
+                .text
+                .starts_with("resumed session past-1 (2 entries)"),
             "got: {}",
             items[2].text
         );
@@ -667,7 +708,11 @@ mod tests {
         assert_eq!(fx.events.session_id, "never-seen");
         let items = fx.events.app.items();
         assert_eq!(items.len(), 1);
-        assert!(items[0].text.contains("(0 entries)"), "got: {}", items[0].text);
+        assert!(
+            items[0].text.contains("(0 entries)"),
+            "got: {}",
+            items[0].text
+        );
     }
 
     #[tokio::test]
@@ -678,8 +723,16 @@ mod tests {
         // single row, exact-Enter to stage the resume.
         let mut scratch = App::new();
         fx.events.session_popup.open(&mut scratch);
-        assert!(fx.events.session_popup.handle_key(KeyEvent::Enter, &mut scratch));
-        assert!(fx.events.session_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        assert!(
+            fx.events
+                .session_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
+        assert!(
+            fx.events
+                .session_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
 
         fx.events.app.turn_started();
         fx.events.drain_switch_request();
@@ -709,9 +762,21 @@ mod tests {
         // move up to t1, complete it, then exact-Enter to stage it.
         let mut scratch = App::new();
         fx.events.branch_popup.open(&mut scratch);
-        assert!(fx.events.branch_popup.handle_key(KeyEvent::Up, &mut scratch));
-        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
-        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        assert!(
+            fx.events
+                .branch_popup
+                .handle_key(KeyEvent::Up, &mut scratch)
+        );
+        assert!(
+            fx.events
+                .branch_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
+        assert!(
+            fx.events
+                .branch_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
         fx.events.drain_revert_request();
 
         let items = fx.events.app.items();
@@ -719,7 +784,11 @@ mod tests {
         assert_eq!(items[0].kind, ItemKind::User);
         assert_eq!(items[0].text, "live one");
         assert_eq!(items[1].kind, ItemKind::Notice);
-        assert!(items[1].text.contains("rewound to t1"), "got: {}", items[1].text);
+        assert!(
+            items[1].text.contains("rewound to t1"),
+            "got: {}",
+            items[1].text
+        );
         // Head moved: a new turn parents onto t1.
         assert_eq!(fx.events.tree.head("live-1"), 1);
     }
@@ -730,8 +799,16 @@ mod tests {
 
         let mut scratch = App::new();
         fx.events.branch_popup.open(&mut scratch);
-        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
-        assert!(fx.events.branch_popup.handle_key(KeyEvent::Enter, &mut scratch));
+        assert!(
+            fx.events
+                .branch_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
+        assert!(
+            fx.events
+                .branch_popup
+                .handle_key(KeyEvent::Enter, &mut scratch)
+        );
 
         fx.events.app.turn_started();
         fx.events.drain_revert_request();
@@ -759,7 +836,11 @@ mod tests {
         fx.events.branch_popup.open(&mut scratch);
         let snap = fx.events.branch_popup.snapshot().expect("open");
         assert_eq!(snap.items.len(), 1);
-        assert!(snap.items[0].contains("old question"), "got: {:?}", snap.items);
+        assert!(
+            snap.items[0].contains("old question"),
+            "got: {:?}",
+            snap.items
+        );
     }
 
     #[tokio::test]

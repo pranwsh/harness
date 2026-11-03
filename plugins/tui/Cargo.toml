@@ -13,11 +13,13 @@ harness-tui-sessions = { path = "../tui-sessions" }
 harness-tui-branch = { path = "../tui-branch" }
 harness-tui-state = { path = "../tui-state" }
 harness-tui-input = { path = "../tui-input" }
+harness-tui-sudo = { path = "../tui-sudo" }
 harness-tui-popup = { path = "../tui-popup" }
 crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+harness-sudo-policy = { path = "../sudo-policy" }
 harness-tui-markdown = { path = "../tui-markdown" }
 harness-session = { path = "../session" }
