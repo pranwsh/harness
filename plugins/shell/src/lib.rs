@@ -243,6 +243,12 @@ struct SudoArgs {
     timeout_ms: Option<u64>,
 }
 
+fn sudo_path() -> Option<&'static str> {
+    ["/run/wrappers/bin/sudo", "/usr/bin/sudo"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+}
+
 fn shell_sudo_handler(
     svc: Arc<ShellService>,
     args: String,
@@ -260,8 +266,17 @@ fn shell_sudo_handler(
         {
             return Err(tool_err(TOOL, "invalid program or arguments"));
         }
-        // An absolute, administrator-controlled sudo path avoids PATH substitution.
-        let sudo = "/usr/bin/sudo".to_owned();
+        // NixOS exposes setuid programs through /run/wrappers/bin. Do not
+        // canonicalize that wrapper: its path must remain intact for sudo.
+        // Never search the caller-controlled PATH for a privileged executable.
+        let sudo = sudo_path()
+            .ok_or_else(|| {
+                tool_err(
+                    TOOL,
+                    "sudo not found at /run/wrappers/bin/sudo or /usr/bin/sudo",
+                )
+            })?
+            .to_owned();
         let mut argv = vec![sudo.clone(), "-n".to_owned(), "--".to_owned(), a.program];
         argv.extend(a.args);
         let req = resolve_request(&svc.cfg, sudo, argv, a.workdir, a.timeout_ms, None)
