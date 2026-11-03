@@ -4,6 +4,8 @@ use crate::key::Key;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("waterfall rejected invalid transition on `{key}`")]
+    InvalidWaterfallTransition { key: Key },
     #[error("service `{0}` is not registered")]
     MissingService(Key),
     #[error("plugin `{0}` is already loaded")]

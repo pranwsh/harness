@@ -4,10 +4,9 @@ use std::{
 };
 
 use harness_contracts::{
-    BoxFuture, CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOLS,
-    KEY_TOOL_EXECUTOR, KEY_TOOL_REGISTRY, ToolApproval, ToolCall, ToolError, ToolExecuted,
-    ToolExecutorApi, ToolExecutorHandle, ToolRegistered, ToolRegistryApi, ToolRegistryHandle,
-    ToolSpec,
+    BoxFuture, CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOL_EXECUTOR,
+    KEY_TOOL_REGISTRY, KEY_TOOLS, ToolApproval, ToolCall, ToolError, ToolExecuted, ToolExecutorApi,
+    ToolExecutorHandle, ToolRegistered, ToolRegistryApi, ToolRegistryHandle, ToolSpec,
 };
 use harness_core::{Context, Result};
 
@@ -17,7 +16,7 @@ pub type ToolHandler = Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>
 /// Registry and executor of tools.
 ///
 /// `execute` runs the `tool.approval` waterfall first so a future guardrail
-/// plugin can rewrite or veto the call, then runs the handler, emits
+/// plugin can veto the call, then runs the handler, emits
 /// `tool.executed` (Ok or Err in-band), and returns the result to the caller.
 /// Async handler futures are joined so the emission — including the session
 /// plugin's sync listener — completes before `execute` returns: the loop
@@ -71,11 +70,21 @@ impl Tools {
         call: ToolCall,
     ) -> Result<String, ToolError> {
         // Pre-execution hook for a future guardrail plugin. Waterfall handlers
-        // may rewrite `call` or set `denied`; no handlers = allow as-is.
+        // may set `denied`; no handlers = allow as-is. Calls and context are immutable.
         // Fail-closed on waterfall infra errors so a broken gate can't be
         // bypassed silently.
         let approval = ToolApproval::allow(agent_id, session_id, turn, call.clone());
-        let approved = match self.ctx.waterfall_key(CH_TOOL_APPROVAL, approval).await {
+        let approved = match self
+            .ctx
+            .waterfall_checked_key(CH_TOOL_APPROVAL, approval, |before, after| {
+                before.call == after.call
+                    && before.agent_id == after.agent_id
+                    && before.session_id == after.session_id
+                    && before.turn == after.turn
+                    && (before.denied.is_none() || before.denied == after.denied)
+            })
+            .await
+        {
             Ok(a) => a,
             Err(e) => {
                 let err = ToolError {
@@ -339,7 +348,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_waterfall_can_rewrite_call() {
+    async fn approval_denial_cannot_be_cleared() {
+        let ctx = Context::root();
+        ctx.load(ToolsPlugin).unwrap();
+        let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+        tools.register(echo_spec(), echo_handler).unwrap();
+        ctx.on_waterfall_key::<ToolApproval, _, _>(CH_TOOL_APPROVAL, |a| async move {
+            let mut a = (*a).clone();
+            a.denied = Some("no".into());
+            a
+        })
+        .unwrap();
+        ctx.on_waterfall_key::<ToolApproval, _, _>(CH_TOOL_APPROVAL, |a| async move {
+            let mut a = (*a).clone();
+            a.denied = None;
+            a
+        })
+        .unwrap();
+        let call = ToolCall {
+            id: "x".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            tools
+                .execute("a", "s", 1, call)
+                .await
+                .unwrap_err()
+                .message
+                .contains("invalid transition")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_waterfall_cannot_rewrite_call() {
         let ctx = Context::root();
         ctx.load(ToolsPlugin).unwrap();
         let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
@@ -356,7 +398,7 @@ mod tests {
             name: "echo".into(),
             arguments: r#"{"text":"original"}"#.into(),
         };
-        let out = tools.execute("a", "s", 1, call).await.unwrap();
-        assert_eq!(out, "rewritten");
+        let err = tools.execute("a", "s", 1, call).await.unwrap_err();
+        assert!(err.message.contains("invalid transition"));
     }
 }
