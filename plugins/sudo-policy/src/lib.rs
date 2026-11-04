@@ -81,7 +81,7 @@ impl SudoApprovalApi for ApprovalQueue {
 impl ApprovalQueue {
     async fn ask(&self, session_id: &str, details: String) -> bool {
         // Refuse to display incomplete details or terminal control sequences.
-        if details.len() > 300 || details.chars().any(char::is_control) {
+        if details.len() > 65536 || details.chars().any(char::is_control) {
             return false;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();

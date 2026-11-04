@@ -7,3 +7,8 @@ harness-contracts = { path = "../../contracts" }
 harness-core = { path = "../../core" }
 harness-tui-popup = { path = "../tui-popup" }
 harness-tui-state = { path = "../tui-state" }
+
+[dev-dependencies]
+harness-sudo-policy = { path = "../sudo-policy" }
+harness-tools = { path = "../tools" }
+tokio.workspace = true

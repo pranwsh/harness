@@ -187,8 +187,17 @@ impl EventLoop {
             // Each provider owns its surface; draw at most one, model
             // first, then sessions, then branch, so the modal selectors
             // win over autocomplete.
-            let width = terminal.size().map(|s| s.width as usize).unwrap_or(0);
-            self.sudo_popup.sync(&self.session_id, width);
+            let (width, height) = terminal
+                .size()
+                .map(|s| (s.width as usize, s.height as usize))
+                .unwrap_or((0, 0));
+            let input_height = self
+                .app
+                .input_rows()
+                .min(harness_tui_state::app::INPUT_VISIBLE_ROWS)
+                + 2;
+            self.sudo_popup
+                .sync(&self.session_id, width, height.saturating_sub(input_height));
             let snapshot = self
                 .sudo_popup
                 .snapshot()

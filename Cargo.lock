@@ -1137,8 +1137,11 @@ version = "0.1.0"
 dependencies = [
  "harness-contracts",
  "harness-core",
+ "harness-sudo-policy",
+ "harness-tools",
  "harness-tui-popup",
  "harness-tui-state",
+ "tokio",
 ]
 
 [[package]]
