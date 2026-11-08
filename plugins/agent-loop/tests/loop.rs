@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use harness_agent_loop::{AgentLoop, TurnEvent};
 use harness_contracts::{
     AgentRegistryHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API, KEY_CONFIG, KEY_MODEL_STREAMER,
-    KEY_PROMPT, KEY_SESSION_STORE, KEY_TOOLS, Message, ModelStreamerApi, ModelStreamerHandle,
-    Role, SessionStoreHandle, StreamEvent, ToolCall, ToolError, ToolSpec,
+    KEY_PROMPT, KEY_SESSION_STORE, KEY_TOOLS, Message, ModelStreamerApi, ModelStreamerHandle, Role,
+    SessionStoreHandle, StreamEvent, ToolCall, ToolError, ToolSpec,
 };
 use harness_core::Context;
 use harness_tools::Tools;
@@ -239,10 +239,7 @@ async fn prompt_text_is_pulled_fresh_each_turn() {
     let _ = drain(loop_svc.run("a1", "s-prompt", "hi")).await;
 
     // Live-update the prompt text by re-providing the service key.
-    ctx.provide_key(
-        KEY_PROMPT_TEXT,
-        Arc::new("prompt-v2-live".to_owned()),
-    );
+    ctx.provide_key(KEY_PROMPT_TEXT, Arc::new("prompt-v2-live".to_owned()));
 
     let _ = drain(loop_svc.run("a1", "s-prompt", "again")).await;
 
@@ -259,7 +256,10 @@ async fn prompt_text_is_pulled_fresh_each_turn() {
 async fn max_iterations_is_pulled_fresh_each_turn() {
     // Looping model: always requests a tool so the cap decides the outcome.
     let fake = FakeModel::new(vec![
-        Message::assistant_with_calls("again", vec![fake_tool_call("t1")]);
+        Message::assistant_with_calls(
+            "again",
+            vec![fake_tool_call("t1")]
+        );
         16
     ]);
 
@@ -330,8 +330,7 @@ async fn missing_session_listener_fails_closed() {
     ctx.provide_key(
         KEY_MODEL_STREAMER,
         Arc::new(ModelStreamerHandle(
-            FakeModel::new(vec![Message::assistant("unreachable")])
-                as Arc<dyn ModelStreamerApi>,
+            FakeModel::new(vec![Message::assistant("unreachable")]) as Arc<dyn ModelStreamerApi>,
         )),
     );
     // Agent-loop parks while sessions.store is missing; the pending outcome
@@ -416,5 +415,65 @@ async fn tool_errors_are_fed_back_and_logged() {
         KEY_CONFIG,
         KEY_PROMPT,
         Entry::from_message(&Message::user("x")),
+    );
+}
+
+#[tokio::test]
+async fn run_options_deny_unlisted_tools_and_record_result() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls("", vec![fake_tool_call("restricted")]),
+            Message::assistant("finished"),
+        ],
+        8,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run_with_options(
+        "restricted-agent",
+        "restricted-session",
+        "hello",
+        RunOptions {
+            allowed_tools: Some(vec![]),
+            instructions: Some("Child instructions".into()),
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(events.iter().any(|event| matches!(event, TurnEvent::ToolResult(_, Err(e)) if e.message.contains("run tool policy"))));
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("restricted-session");
+    assert!(
+        history
+            .iter()
+            .any(|entry| entry.role == Role::Tool && entry.content.contains("run tool policy"))
+    );
+}
+
+#[tokio::test]
+async fn run_iteration_limit_cannot_exceed_global_limit() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![Message::assistant_with_calls(
+            "",
+            vec![fake_tool_call("one")],
+        )],
+        1,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run_with_options(
+        "a",
+        "s",
+        "hello",
+        RunOptions {
+            max_iterations: Some(100),
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Failed(e) if e.contains("max iterations (1)")))
     );
 }

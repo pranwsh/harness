@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use harness_contracts::{
     AgentRegistryHandle, AgentState, CH_SESSION_APPEND_REQUESTED, CH_SESSION_TURN_CLOSE_REQUESTED,
-    CH_SESSION_TURN_OPEN_REQUESTED, CH_TURN_COMPLETED, CH_TURN_FAILED, CH_TURN_ITERATION,
-    CH_TURN_STARTED, ConfigHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API, KEY_CONFIG,
-    KEY_MODEL_SELECTOR_API, KEY_MODEL_STREAMER, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT,
+    CH_SESSION_TURN_OPEN_REQUESTED, CH_TOOL_EXECUTED, CH_TURN_COMPLETED, CH_TURN_FAILED,
+    CH_TURN_ITERATION, CH_TURN_STARTED, ConfigHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API,
+    KEY_CONFIG, KEY_MODEL_SELECTOR_API, KEY_MODEL_STREAMER, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT,
     KEY_SESSION_STORE, KEY_TOOL_EXECUTOR, Message, ModelSelectorHandle, ModelStreamerHandle,
     PromptAssemblerHandle, SessionAppendRequested, SessionId, SessionStoreHandle,
-    SessionTurnCloseRequested, SessionTurnOpenRequested, StreamEvent, ToolCall, ToolExecutorHandle,
-    TurnCompleted, TurnFailed, TurnIteration, TurnStarted,
+    SessionTurnCloseRequested, SessionTurnOpenRequested, StreamEvent, ToolCall, ToolError,
+    ToolExecuted, ToolExecutorHandle, TurnCompleted, TurnFailed, TurnIteration, TurnStarted,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
@@ -26,6 +26,18 @@ pub enum TurnEvent {
     ToolResult(ToolCall, Result<String, harness_contracts::ToolError>),
     Completed(u32),
     Failed(String),
+}
+
+/// Optional per-run restrictions. `None` preserves the existing live defaults.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Additional instructions, appended to the shared system prompt.
+    pub instructions: Option<String>,
+    pub model: Option<String>,
+    /// A per-run ceiling, never higher than the global limit.
+    pub max_iterations: Option<u32>,
+    /// None allows all tools; Some(empty) denies all tools.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// The orchestrator. One `run` spawns a turn task and returns a stream the
@@ -93,6 +105,16 @@ impl AgentLoop {
         session_id: &str,
         input: impl Into<String>,
     ) -> mpsc::Receiver<TurnEvent> {
+        self.run_with_options(agent_id, session_id, input, RunOptions::default())
+    }
+
+    pub fn run_with_options(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        input: impl Into<String>,
+        options: RunOptions,
+    ) -> mpsc::Receiver<TurnEvent> {
         let (tx, rx) = mpsc::channel(64);
         let task = TurnTask {
             ctx: self.ctx.clone(),
@@ -105,6 +127,7 @@ impl AgentLoop {
             agent_id: agent_id.to_owned(),
             session_id: session_id.to_owned(),
             input: input.into(),
+            options,
             tx,
             turn_no: 0,
         };
@@ -126,6 +149,7 @@ struct TurnTask {
     agent_id: String,
     session_id: SessionId,
     input: String,
+    options: RunOptions,
     tx: mpsc::Sender<TurnEvent>,
     turn_no: u64,
 }
@@ -135,20 +159,30 @@ impl TurnTask {
     /// `prompt.text` applies to the next model call. Empty when the
     /// provider is absent (the assembler then omits the system message).
     fn system_prompt(&self) -> String {
-        self.ctx
+        let mut prompt = self
+            .ctx
             .try_inject_key::<String>(KEY_PROMPT_TEXT)
             .map(|s| (*s).clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(extra) = &self.options.instructions {
+            prompt.push_str("\n\n");
+            prompt.push_str(extra);
+        }
+        prompt
     }
 
     /// Fresh loop bound for this turn. Pulled live from the single
     /// `config.app` source of truth so live updates apply without rebuilding
     /// the loop. Falls back to the contract default.
     fn max_iterations(&self) -> u32 {
-        self.ctx
+        let global = self
+            .ctx
             .try_inject_key::<ConfigHandle>(KEY_CONFIG)
             .map(|h| h.max_iterations())
-            .unwrap_or(harness_contracts::default_max_iterations())
+            .unwrap_or(harness_contracts::default_max_iterations());
+        self.options
+            .max_iterations
+            .map_or(global, |limit| limit.min(global))
     }
 
     /// Canonical session write: emits `session.append_requested` and
@@ -157,7 +191,10 @@ impl TurnTask {
     fn request_append(&self, entry: Entry) -> std::result::Result<(), String> {
         let key: harness_core::Key = CH_SESSION_APPEND_REQUESTED.into();
         if self.ctx.listeners_of(&key).is_empty() {
-            return Err("session persistence unavailable: no listener on session.append_requested".to_owned());
+            return Err(
+                "session persistence unavailable: no listener on session.append_requested"
+                    .to_owned(),
+            );
         }
         self.ctx
             .emit_key(
@@ -250,9 +287,7 @@ impl TurnTask {
         self.agents.get_or_create(&self.agent_id);
         self.agents.set_state(&self.agent_id, AgentState::Busy);
         self.turn_no = self.request_open_turn().await?;
-        self.request_append(Entry::from_message(&Message::user(
-            self.input.clone(),
-        )))?;
+        self.request_append(Entry::from_message(&Message::user(self.input.clone())))?;
         let _ = self.tx.send(TurnEvent::Started).await;
         let _ = self.ctx.emit_key(
             CH_TURN_STARTED,
@@ -268,9 +303,7 @@ impl TurnTask {
             iterations += 1;
             let max_iterations = self.max_iterations();
             if iterations > max_iterations {
-                return Err(format!(
-                    "turn exceeded max iterations ({max_iterations})"
-                ));
+                return Err(format!("turn exceeded max iterations ({max_iterations})"));
             }
             let _ = self.tx.send(TurnEvent::Iteration(iterations)).await;
             let _ = self.ctx.emit_key(
@@ -297,9 +330,23 @@ impl TurnTask {
 
             // 2. Pick model, stream it. Text slices go out immediately;
             // the full message is stored once it completes.
-            let model = self.selector.select(&self.agent_id);
-            let mut stream =
-                Arc::clone(&self.model.0).stream(&model, &messages, &self.tools.specs());
+            let model = self
+                .options
+                .model
+                .clone()
+                .unwrap_or_else(|| self.selector.select(&self.agent_id));
+            let specs: Vec<_> = self
+                .tools
+                .specs()
+                .into_iter()
+                .filter(|spec| {
+                    self.options
+                        .allowed_tools
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(&spec.name))
+                })
+                .collect();
+            let mut stream = Arc::clone(&self.model.0).stream(&model, &messages, &specs);
             let reply = loop {
                 match stream.recv().await {
                     Some(StreamEvent::Content(delta)) => {
@@ -325,10 +372,37 @@ impl TurnTask {
             }
             for call in reply.tool_calls.clone() {
                 let _ = self.tx.send(TurnEvent::ToolStarted(call.clone())).await;
-                let result = self
-                    .tools
-                    .execute(&self.agent_id, &self.session_id, self.turn_no, call.clone())
-                    .await;
+                let result = if self
+                    .options
+                    .allowed_tools
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&call.name))
+                {
+                    let err = ToolError {
+                        tool: call.name.clone(),
+                        message: "denied by run tool policy".into(),
+                    };
+                    // Preserve the normal tool-result persistence path even for a denied call.
+                    if let Ok(futures) = self.ctx.emit_key(
+                        CH_TOOL_EXECUTED,
+                        ToolExecuted {
+                            agent_id: self.agent_id.clone(),
+                            session_id: self.session_id.clone(),
+                            turn: self.turn_no,
+                            call: call.clone(),
+                            result: Err(err.clone()),
+                        },
+                    ) {
+                        for future in futures {
+                            future.await;
+                        }
+                    }
+                    Err(err)
+                } else {
+                    self.tools
+                        .execute(&self.agent_id, &self.session_id, self.turn_no, call.clone())
+                        .await
+                };
                 let _ = self.tx.send(TurnEvent::ToolResult(call, result)).await;
             }
         }
@@ -354,6 +428,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
             .emits::<SessionAppendRequested>(CH_SESSION_APPEND_REQUESTED)
             .emits::<TurnStarted>(CH_TURN_STARTED)
             .emits::<TurnIteration>(CH_TURN_ITERATION)
+            .emits::<ToolExecuted>(CH_TOOL_EXECUTED)
             .emits::<TurnCompleted>(CH_TURN_COMPLETED)
             .emits::<TurnFailed>(CH_TURN_FAILED)
     }
@@ -372,7 +447,15 @@ impl harness_core::Plugin for AgentLoopPlugin {
         let model: Arc<ModelStreamerHandle> = ctx.inject_key(KEY_MODEL_STREAMER)?;
         let _: Arc<ConfigHandle> = ctx.inject_key(KEY_CONFIG)?;
 
-        let agent_loop = AgentLoop::new(ctx.clone(), agents, sessions, tools, prompt, selector, model);
+        let agent_loop = AgentLoop::new(
+            ctx.clone(),
+            agents,
+            sessions,
+            tools,
+            prompt,
+            selector,
+            model,
+        );
         ctx.provide_key(KEY_AGENT_LOOP, Arc::new(agent_loop));
         Ok(())
     }
