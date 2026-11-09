@@ -721,6 +721,33 @@ user_agent = "a"
     }
 
     #[tokio::test]
+    async fn concurrent_child_shells_are_independent() {
+        let svc = ShellService::new(ShellConfig::default());
+        let timeout = Duration::from_secs(5);
+        svc.session_for("root")
+            .run("export SHARED_START=original", None, timeout, 65536)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(svc.fork("root", "a"), svc.fork("root", "b"));
+        a.unwrap();
+        b.unwrap();
+        let a = svc.session_for("a");
+        let b = svc.session_for("b");
+        let (a_result, b_result) = tokio::join!(
+            a.run(
+                "export SHARED_START=first; printf %s \"$SHARED_START\"",
+                None,
+                timeout,
+                65536
+            ),
+            b.run("printf %s \"$SHARED_START\"", None, timeout, 65536)
+        );
+        assert_eq!(a_result.unwrap().stdout, b"first");
+        assert_eq!(b_result.unwrap().stdout, b"original");
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn background_job_inherits_its_session_export_and_directory() {
         let (_ctx, tools, svc) = ctx_with_shell();
         tools
