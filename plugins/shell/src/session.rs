@@ -555,6 +555,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_preserves_non_utf8_variables_without_serialization() {
+        let parent = BashSession::new();
+        let timeout = Duration::from_secs(2);
+        parent
+            .run(
+                r#"opaque=$'\xff\xfe'; readonly immutable='fixed'"#,
+                None,
+                timeout,
+                65536,
+            )
+            .await
+            .unwrap();
+        let child = parent.fork(timeout).await.unwrap();
+        let out = child
+            .run(r#"printf '%s' "$opaque""#, None, timeout, 65536)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![255, 254]);
+        // A readonly assignment is fatal in a noninteractive Bash subshell.
+        assert!(
+            child
+                .run("immutable=changed", None, timeout, 65536)
+                .await
+                .is_err()
+        );
+        child.shutdown().await;
+        parent.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn child_exit_is_prompt_and_never_restarts_fresh() {
         let parent = BashSession::new();
         let child = parent.fork(Duration::from_secs(2)).await.unwrap();

@@ -815,7 +815,18 @@ async fn spawn_returns_handle_and_wait_returns_result_without_duplicate_delivery
             let is_child = messages
                 .iter()
                 .any(|m| m.content.starts_with("Task: background task"));
-            let reply = if is_child {
+            let reply = if is_child
+                && !messages
+                    .iter()
+                    .any(|m| m.call_id.as_deref() == Some("child-probe"))
+            {
+                Message::assistant_with_calls("", vec![ToolCall { id: "child-probe".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s' \"$SPAWN_PRIVATE\"; SPAWN_PRIVATE=changed"}).to_string() }])
+            } else if is_child {
+                let probe = messages
+                    .iter()
+                    .find(|m| m.call_id.as_deref() == Some("child-probe"))
+                    .unwrap();
+                assert_eq!(probe.content, "unexported-parent");
                 Message::assistant("background finding")
             } else if !messages
                 .iter()
@@ -881,6 +892,22 @@ async fn spawn_returns_handle_and_wait_returns_result_without_duplicate_delivery
         Arc::new(ModelStreamerHandle(Arc::new(SpawnModel))),
     );
     ctx.load(harness_agent_loop::AgentLoopPlugin).unwrap();
+    ctx.load(harness_shell::ShellPlugin).unwrap();
+    let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+    tools
+        .execute(
+            "parent",
+            "spawn-parent",
+            1,
+            ToolCall {
+                id: "init".into(),
+                name: "shell_exec".into(),
+                arguments: serde_json::json!({"command":"SPAWN_PRIVATE=unexported-parent"})
+                    .to_string(),
+            },
+        )
+        .await
+        .unwrap();
     let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
     let events = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -904,4 +931,112 @@ async fn spawn_returns_handle_and_wait_returns_result_without_duplicate_delivery
             .iter()
             .any(|m| m.content.starts_with("Background agent report"))
     );
+    let parent_shell = tools
+        .execute(
+            "parent",
+            "spawn-parent",
+            1,
+            ToolCall {
+                id: "verify".into(),
+                name: "shell_exec".into(),
+                arguments: serde_json::json!({"command":"printf '%s' \"$SPAWN_PRIVATE\""})
+                    .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent_shell, "unexported-parent");
+    let shells: Arc<harness_shell::ShellService> = ctx
+        .inject_key(harness_contracts::KEY_SHELL_SERVICE)
+        .unwrap();
+    shells.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_completion_is_delivered_once_on_next_parent_turn() {
+    struct Model;
+    impl ModelStreamerApi for Model {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            messages: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let child = messages
+                .iter()
+                .any(|m| m.content.starts_with("Task: queued task"));
+            let reply = if child {
+                Message::assistant("queued result")
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("spawn"))
+            {
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "spawn".into(),
+                        name: "spawn_agent".into(),
+                        arguments: r#"{"task":"queued task"}"#.into(),
+                    }],
+                )
+            } else {
+                Message::assistant("parent response")
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                if child {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let _ = tx.send(StreamEvent::Done(reply)).await;
+            });
+            rx
+        }
+    }
+    let ctx = Context::root();
+    ctx.load(
+        harness_config::ConfigPlugin::from_toml(
+            "[llm]\nbase_url='u'\nmodel='fake'\napi_key='k'\nuser_agent='a'\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ctx.load(harness_model::ModelPlugin).unwrap();
+    ctx.load(harness_agent::AgentPlugin).unwrap();
+    ctx.load(harness_session::SessionPlugin).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
+    ctx.load(harness_system_prompt::SystemPromptPlugin::default())
+        .unwrap();
+    ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
+        .unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(Model))),
+    );
+    ctx.load(harness_agent_loop::AgentLoopPlugin).unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    drain(svc.run("parent", "queued-parent", "go")).await;
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    assert!(
+        !sessions
+            .history("queued-parent")
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Finishing a child does not mutate an idle parent's history or wake it.
+    assert!(
+        !sessions
+            .history("queued-parent")
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+    drain(svc.run("parent", "queued-parent", "continue")).await;
+    drain(svc.run("parent", "queued-parent", "again")).await;
+    let history = sessions.history("queued-parent");
+    let reports: Vec<_> = history
+        .iter()
+        .filter(|m| m.content.starts_with("Background agent report"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].content.contains("queued result"));
 }

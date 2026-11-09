@@ -142,6 +142,27 @@ impl AgentLoop {
         self.start_run(agent_id, session_id, input, options)
     }
 
+    /// Request cancellation of every background run, then wait until the
+    /// manager has drained terminal events and released child resources.
+    /// Frontends embedding the harness should call this before runtime exit.
+    pub async fn shutdown_background(&self) {
+        loop {
+            let pending = {
+                let mut runs = self.background.lock().unwrap_or_else(|e| e.into_inner());
+                for run in runs.values_mut() {
+                    if let Some(cancel) = run.cancel.take() {
+                        let _ = cancel.send(());
+                    }
+                }
+                runs.values().any(|run| run.result.is_none())
+            };
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     fn start_run(
         &self,
         agent_id: &str,
@@ -632,7 +653,7 @@ async fn finish_child(
         agent_id,
         session_id,
         task,
-        shell: _shell_guard,
+        mut shell,
         ..
     } = child;
     let outcome = loop {
@@ -658,6 +679,11 @@ async fn finish_child(
         Err(err) => ("failed", err),
     };
 
+    if let Some(guard) = shell.take() {
+        guard.shell.0.release(&guard.session_id).await;
+        // Drop is intentionally idempotent; a cancelled release future still
+        // schedules cleanup, while successful release has removed the session.
+    }
     serde_json::json!({"status":status,"task":task,"summary":report,
         "parent_agent_id":caller.agent_id,"parent_session_id":caller.session_id,
         "parent_turn":caller.turn,"agent_id":agent_id,"session_id":session_id})
@@ -757,6 +783,8 @@ async fn background_control(
                 if let Some(sender) = run.cancel.take() {
                     let _ = sender.send(());
                 }
+                drop(runs);
+                cancel_background_tree(&loop_.background, id);
                 return Ok(
                     serde_json::json!({"run_id":id,"status":"cancellation_requested"}).to_string(),
                 );
@@ -934,5 +962,52 @@ impl harness_core::Plugin for AgentLoopPlugin {
         }
         ctx.provide_key(KEY_AGENT_LOOP, agent_loop);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelling_background_tree_does_not_cancel_siblings() {
+        let (a, mut ar) = tokio::sync::oneshot::channel();
+        let (b, mut br) = tokio::sync::oneshot::channel();
+        let (c, mut cr) = tokio::sync::oneshot::channel();
+        let runs = Arc::new(Mutex::new(HashMap::from([
+            (
+                "child".into(),
+                BackgroundRun {
+                    owner: "parent".into(),
+                    result: None,
+                    delivered: false,
+                    cancel: Some(a),
+                },
+            ),
+            (
+                "grandchild".into(),
+                BackgroundRun {
+                    owner: "child".into(),
+                    result: None,
+                    delivered: false,
+                    cancel: Some(b),
+                },
+            ),
+            (
+                "sibling".into(),
+                BackgroundRun {
+                    owner: "other".into(),
+                    result: None,
+                    delivered: false,
+                    cancel: Some(c),
+                },
+            ),
+        ])));
+        cancel_background_tree(&runs, "parent");
+        assert_eq!(ar.try_recv(), Ok(()));
+        assert_eq!(br.try_recv(), Ok(()));
+        assert!(matches!(
+            cr.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 }

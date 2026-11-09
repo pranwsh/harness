@@ -63,3 +63,13 @@
 - [ ] Harden all fork-setup races, reaping and PID-reuse handling; test arbitrary shell options and cancellation at every handshake stage.
 - [ ] Durable run catalog, interrupted-run recovery and independent background agent spawn/wait remain outstanding.
 - [ ] Resolve workspace test failures: latest run still fails 10 TUI view layout tests. Targeted agent-loop, shell and tool tests and harness compilation pass.
+
+## Minimal spawn iteration (completed)
+- [x] `spawn_agent` returns a handle after launch-time live shell fork, without waiting for the child answer.
+- [x] Manager owns event draining, result collection, cancellation and shell release.
+- [x] `agent_wait` and `agent_cancel` enforce parent-session ownership; waits suppress subsequent automatic delivery.
+- [x] Completed results enter persistent parent context only before the next model request; no UI notifications or automatic wakeup.
+- [x] Children survive normal parent turn completion; explicit cancellation propagates to background descendants. Normal application exit drains cancelled background children.
+- [x] Real-shell spawn/wait test verifies unexported parent state is copied and child mutations do not alter the parent. Non-UTF-8 and readonly inheritance covered at shell layer.
+- [x] Document native Bash semantics, shared filesystem and same-user trust boundary in SUBAGENTS.md.
+- Validation: 90 targeted tests plus shell doctest pass; harness compiles. This iteration does not implement restart recovery, exhaustive race hardening or resolve existing workspace layout failures.
