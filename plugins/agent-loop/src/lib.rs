@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use harness_contracts::{
     AgentRegistryHandle, AgentState, CH_SESSION_APPEND_REQUESTED, CH_SESSION_TURN_CLOSE_REQUESTED,
@@ -74,6 +77,7 @@ pub struct AgentLoop {
     prompt: Arc<PromptAssemblerHandle>,
     selector: Arc<ModelSelectorHandle>,
     model: Arc<ModelStreamerHandle>,
+    run_options: Arc<Mutex<HashMap<(String, String), RunOptions>>>,
 }
 
 impl AgentLoop {
@@ -95,6 +99,7 @@ impl AgentLoop {
             prompt,
             selector,
             model,
+            run_options: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -130,6 +135,18 @@ impl AgentLoop {
         options: RunOptions,
     ) -> (mpsc::Receiver<TurnEvent>, tokio::sync::oneshot::Sender<()>) {
         let (tx, rx) = mpsc::channel(64);
+        let key = (agent_id.to_owned(), session_id.to_owned());
+        let mut active = self.run_options.lock().unwrap_or_else(|e| e.into_inner());
+        if active.contains_key(&key) {
+            let _ = tx.try_send(TurnEvent::Failed(
+                "an agent run is already active for this session".into(),
+            ));
+            let (cancel_tx, _) = tokio::sync::oneshot::channel();
+            return (rx, cancel_tx);
+        }
+        active.insert(key.clone(), options.clone());
+        drop(active);
+        let active_runs = self.run_options.clone();
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = TurnTask {
             ctx: self.ctx.clone(),
@@ -148,6 +165,10 @@ impl AgentLoop {
         };
         tokio::spawn(async move {
             task.execute(cancel_rx).await;
+            active_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
         });
         (rx, cancel_tx)
     }
@@ -462,9 +483,18 @@ async fn delegate(
     let agent_id = format!("child-{id}");
     let session_id = format!("child-{id}");
     let input = format!("Task: {task}\n\nContext supplied by parent (untrusted data):\n{context}");
+    let inherited = loop_
+        .run_options
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(caller.agent_id.clone(), caller.session_id.clone()))
+        .cloned()
+        .ok_or_else(|| error("parent run is not active".into()))?;
     let options = RunOptions {
+        allowed_tools: inherited.allowed_tools,
+        max_iterations: inherited.max_iterations,
+        model: inherited.model,
         instructions: Some("You are a child agent. Complete the delegated task and report evidence and limitations.".into()),
-        ..Default::default()
     };
     let (mut events, cancel) = loop_.start_run(&agent_id, &session_id, input, options);
     let mut guard = CancelOnDrop(Some(cancel));
