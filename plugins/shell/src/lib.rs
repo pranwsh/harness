@@ -55,9 +55,10 @@ fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
 /// Runtime service behind the four shell tools. Clone via `Arc`.
 pub struct ShellService {
     cfg: ShellConfig,
-    jobs: JobManager,
+    jobs: Arc<JobManager>,
     session: Arc<BashSession>,
     sessions: Arc<Mutex<HashMap<String, Arc<BashSession>>>>,
+    job_owners: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ShellService {
@@ -65,9 +66,10 @@ impl ShellService {
         let limits = JobLimits::from_config(&cfg);
         ShellService {
             cfg,
-            jobs: JobManager::new(limits),
+            jobs: Arc::new(JobManager::new(limits)),
             session: Arc::new(BashSession::new()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            job_owners: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -278,6 +280,17 @@ impl ShellScopeApi for ShellService {
         })
     }
     fn release(&self, session: &str) -> harness_contracts::BoxFuture<()> {
+        let jobs = self.jobs.clone();
+        let mut owners = self.job_owners.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<_> = owners
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == session)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            owners.remove(id);
+        }
+        drop(owners);
         let child = self
             .sessions
             .lock()
@@ -286,6 +299,9 @@ impl ShellScopeApi for ShellService {
         Box::pin(async move {
             if let Some(child) = child {
                 child.shutdown().await;
+            }
+            for id in ids {
+                let _ = jobs.stop(&id).await;
             }
         })
     }
@@ -428,11 +444,6 @@ fn shell_start_handler(
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a = parse_exec_args("shell_start", &args)?;
-        if a.env.is_some() && a.workdir.is_some() {
-            return svc
-                .start("shell_start", a.command, a.workdir, a.timeout_ms, a.env)
-                .await;
-        }
         let session = svc.session_for(&invocation.session_id);
         let snapshot = session
             .run(
@@ -462,24 +473,45 @@ fn shell_start_handler(
                 .ok_or_else(|| tool_err("shell_start", "invalid shell environment"))?;
             inherited.insert(key.to_owned(), value.to_owned());
         }
-        svc.start(
-            "shell_start",
-            a.command,
-            a.workdir.or(Some(cwd)),
-            a.timeout_ms,
-            a.env.or(Some(inherited)),
-        )
-        .await
+        let started = svc
+            .start(
+                "shell_start",
+                a.command,
+                a.workdir.or(Some(cwd)),
+                a.timeout_ms,
+                a.env.or(Some(inherited)),
+            )
+            .await?;
+        if let Some(id) = started.split_whitespace().nth(1) {
+            svc.job_owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_owned(), invocation.session_id);
+        }
+        Ok(started)
     })
 }
 
 fn shell_poll_handler(
     svc: Arc<ShellService>,
+    invocation: ToolInvocation,
     args: String,
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a: PollArgs = serde_json::from_str(&args)
             .map_err(|e| tool_err("shell_poll", format!("invalid arguments: {e}")))?;
+        if svc
+            .job_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&a.job_id)
+            != Some(&invocation.session_id)
+        {
+            return Err(tool_err(
+                "shell_poll",
+                "job is not owned by this session or does not exist",
+            ));
+        }
         svc.poll("shell_poll", &a.job_id, a.tail_bytes, a.wait_ms)
             .await
     })
@@ -487,11 +519,24 @@ fn shell_poll_handler(
 
 fn shell_stop_handler(
     svc: Arc<ShellService>,
+    invocation: ToolInvocation,
     args: String,
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a: StopArgs = serde_json::from_str(&args)
             .map_err(|e| tool_err("shell_stop", format!("invalid arguments: {e}")))?;
+        if svc
+            .job_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&a.job_id)
+            != Some(&invocation.session_id)
+        {
+            return Err(tool_err(
+                "shell_stop",
+                "job is not owned by this session or does not exist",
+            ));
+        }
         svc.stop("shell_stop", &a.job_id).await
     })
 }
@@ -629,11 +674,11 @@ impl harness_core::Plugin for ShellPlugin {
                 provider: e,
             })?;
         registry
-            .register(
+            .register_contextual(
                 shell_poll_spec(),
                 Box::new({
                     let svc = Arc::clone(&svc);
-                    move |args| shell_poll_handler(Arc::clone(&svc), args)
+                    move |invocation, args| shell_poll_handler(Arc::clone(&svc), invocation, args)
                 }),
             )
             .map_err(|e| harness_core::Error::ServiceConflict {
@@ -641,11 +686,11 @@ impl harness_core::Plugin for ShellPlugin {
                 provider: e,
             })?;
         registry
-            .register(
+            .register_contextual(
                 shell_stop_spec(),
                 Box::new({
                     let svc = Arc::clone(&svc);
-                    move |args| shell_stop_handler(Arc::clone(&svc), args)
+                    move |invocation, args| shell_stop_handler(Arc::clone(&svc), invocation, args)
                 }),
             )
             .map_err(|e| harness_core::Error::ServiceConflict {
