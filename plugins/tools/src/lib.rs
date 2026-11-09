@@ -6,12 +6,14 @@ use std::{
 use harness_contracts::{
     BoxFuture, CH_TOOL_APPROVAL, CH_TOOL_EXECUTED, CH_TOOL_REGISTERED, KEY_TOOL_EXECUTOR,
     KEY_TOOL_REGISTRY, KEY_TOOLS, ToolApproval, ToolCall, ToolError, ToolExecuted, ToolExecutorApi,
-    ToolExecutorHandle, ToolRegistered, ToolRegistryApi, ToolRegistryHandle, ToolSpec,
+    ToolExecutorHandle, ToolInvocation, ToolRegistered, ToolRegistryApi, ToolRegistryHandle,
+    ToolSpec,
 };
 use harness_core::{Context, Result};
 
 /// A tool implementation: raw arguments JSON in, string result out.
-pub type ToolHandler = Arc<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
+pub type ToolHandler =
+    Arc<dyn Fn(ToolInvocation, String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>;
 
 /// Registry and executor of tools.
 ///
@@ -48,7 +50,10 @@ impl Tools {
                     provider: "tools".to_owned(),
                 });
             }
-            tools.insert(spec.name.clone(), (spec.clone(), Arc::new(handler)));
+            tools.insert(
+                spec.name.clone(),
+                (spec.clone(), Arc::new(move |_, args| handler(args))),
+            );
         }
         let _ = self
             .ctx
@@ -111,7 +116,16 @@ impl Tools {
             return Err(err);
         }
         let effective = approved.call;
-        let result = self.run(&effective).await;
+        let result = self
+            .run(
+                ToolInvocation {
+                    agent_id: agent_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    turn,
+                },
+                &effective,
+            )
+            .await;
 
         self.emit_executed(agent_id, session_id, turn, effective, result.clone())
             .await;
@@ -143,7 +157,7 @@ impl Tools {
         }
     }
 
-    async fn run(&self, call: &ToolCall) -> Result<String, ToolError> {
+    async fn run(&self, invocation: ToolInvocation, call: &ToolCall) -> Result<String, ToolError> {
         let handler = {
             let tools = self.lock();
             tools
@@ -154,7 +168,7 @@ impl Tools {
                     message: "unknown tool".to_owned(),
                 })
         }?;
-        handler(call.arguments.clone()).await
+        handler(invocation, call.arguments.clone()).await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (ToolSpec, ToolHandler)>> {
@@ -210,6 +224,26 @@ impl ToolRegistryApi for Tools {
         // Adapt the boxed handler to the concrete `register` generic.
         self.register(spec, move |args| handler(args))
             .map_err(|e| e.to_string())
+    }
+
+    fn register_contextual(
+        &self,
+        spec: ToolSpec,
+        handler: Box<
+            dyn Fn(ToolInvocation, String) -> BoxFuture<Result<String, ToolError>> + Send + Sync,
+        >,
+    ) -> Result<(), String> {
+        {
+            let mut tools = self.lock();
+            if tools.contains_key(&spec.name) {
+                return Err(format!("tool already registered: {}", spec.name));
+            }
+            tools.insert(spec.name.clone(), (spec.clone(), Arc::from(handler)));
+        }
+        let _ = self
+            .ctx
+            .emit_key(CH_TOOL_REGISTERED, ToolRegistered { name: spec.name });
+        Ok(())
     }
 }
 

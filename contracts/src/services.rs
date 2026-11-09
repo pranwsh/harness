@@ -191,6 +191,25 @@ pub trait ToolRegistryApi: Send + Sync + 'static {
         spec: ToolSpec,
         handler: Box<dyn Fn(String) -> BoxFuture<Result<String, ToolError>> + Send + Sync>,
     ) -> Result<(), String>;
+
+    /// Register a handler that receives the calling turn identity.
+    /// Providers that do not support contextual handlers fail closed.
+    fn register_contextual(
+        &self,
+        _spec: ToolSpec,
+        _handler: Box<
+            dyn Fn(ToolInvocation, String) -> BoxFuture<Result<String, ToolError>> + Send + Sync,
+        >,
+    ) -> Result<(), String> {
+        Err("contextual tool handlers are not supported".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocation {
+    pub agent_id: String,
+    pub session_id: String,
+    pub turn: u64,
 }
 
 #[derive(Clone)]
