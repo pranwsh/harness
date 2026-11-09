@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use harness_agent_loop::{AgentLoop, TurnEvent};
 use harness_contracts::{
     AgentRegistryHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API, KEY_CONFIG, KEY_MODEL_STREAMER,
-    KEY_PROMPT, KEY_SESSION_STORE, KEY_TOOLS, Message, ModelStreamerApi, ModelStreamerHandle,
-    Role, SessionStoreHandle, StreamEvent, ToolCall, ToolError, ToolSpec,
+    KEY_PROMPT, KEY_SESSION_STORE, KEY_TOOLS, Message, ModelStreamerApi, ModelStreamerHandle, Role,
+    SessionStoreHandle, StreamEvent, ToolCall, ToolError, ToolSpec,
 };
 use harness_core::Context;
 use harness_tools::Tools;
@@ -239,10 +239,7 @@ async fn prompt_text_is_pulled_fresh_each_turn() {
     let _ = drain(loop_svc.run("a1", "s-prompt", "hi")).await;
 
     // Live-update the prompt text by re-providing the service key.
-    ctx.provide_key(
-        KEY_PROMPT_TEXT,
-        Arc::new("prompt-v2-live".to_owned()),
-    );
+    ctx.provide_key(KEY_PROMPT_TEXT, Arc::new("prompt-v2-live".to_owned()));
 
     let _ = drain(loop_svc.run("a1", "s-prompt", "again")).await;
 
@@ -259,7 +256,10 @@ async fn prompt_text_is_pulled_fresh_each_turn() {
 async fn max_iterations_is_pulled_fresh_each_turn() {
     // Looping model: always requests a tool so the cap decides the outcome.
     let fake = FakeModel::new(vec![
-        Message::assistant_with_calls("again", vec![fake_tool_call("t1")]);
+        Message::assistant_with_calls(
+            "again",
+            vec![fake_tool_call("t1")]
+        );
         16
     ]);
 
@@ -330,8 +330,7 @@ async fn missing_session_listener_fails_closed() {
     ctx.provide_key(
         KEY_MODEL_STREAMER,
         Arc::new(ModelStreamerHandle(
-            FakeModel::new(vec![Message::assistant("unreachable")])
-                as Arc<dyn ModelStreamerApi>,
+            FakeModel::new(vec![Message::assistant("unreachable")]) as Arc<dyn ModelStreamerApi>,
         )),
     );
     // Agent-loop parks while sessions.store is missing; the pending outcome
@@ -417,4 +416,627 @@ async fn tool_errors_are_fed_back_and_logged() {
         KEY_PROMPT,
         Entry::from_message(&Message::user("x")),
     );
+}
+
+#[tokio::test]
+async fn run_options_deny_unlisted_tools_and_record_result() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls("", vec![fake_tool_call("restricted")]),
+            Message::assistant("finished"),
+        ],
+        8,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run_with_options(
+        "restricted-agent",
+        "restricted-session",
+        "hello",
+        RunOptions {
+            allowed_tools: Some(vec![]),
+            instructions: Some("Child instructions".into()),
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(events.iter().any(|event| matches!(event, TurnEvent::ToolResult(_, Err(e)) if e.message.contains("run tool policy"))));
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("restricted-session");
+    assert!(
+        history
+            .iter()
+            .any(|entry| entry.role == Role::Tool && entry.content.contains("run tool policy"))
+    );
+}
+
+#[tokio::test]
+async fn run_iteration_limit_cannot_exceed_global_limit() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![Message::assistant_with_calls(
+            "",
+            vec![fake_tool_call("one")],
+        )],
+        1,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run_with_options(
+        "a",
+        "s",
+        "hello",
+        RunOptions {
+            max_iterations: Some(100),
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Failed(e) if e.contains("max iterations (1)")))
+    );
+}
+
+#[tokio::test]
+async fn delegation_creates_separate_child_session_and_preserves_parent_tool_pair() {
+    let delegate = ToolCall {
+        id: "delegate-1".into(),
+        name: "delegate_task".into(),
+        arguments: r#"{"task":"inspect the repo","context":"only this context"}"#.into(),
+    };
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls("", vec![delegate]),
+            Message::assistant("child finding"),
+            Message::assistant("parent answer"),
+        ],
+        8,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run("parent", "parent-session", "private parent request")).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Completed(_)))
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let parent = sessions.history("parent-session");
+    let result = parent
+        .iter()
+        .find(|entry| entry.call_id.as_deref() == Some("delegate-1"))
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(report["status"], "completed");
+    assert_eq!(report["summary"], "child finding");
+    assert_eq!(report["parent_session_id"], "parent-session");
+    assert!(
+        parent
+            .iter()
+            .any(|entry| entry.tool_calls.iter().any(|call| call.id == "delegate-1"))
+    );
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert!(
+        child
+            .iter()
+            .any(|entry| entry.content.contains("only this context"))
+    );
+    assert!(
+        !child
+            .iter()
+            .any(|entry| entry.content.contains("private parent request"))
+    );
+    assert!(!parent.iter().any(|entry| entry.content == "child finding"));
+}
+
+#[tokio::test]
+async fn child_can_use_registered_tools() {
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "outer".into(),
+                    name: "delegate_task".into(),
+                    arguments: r#"{"task":"inspect"}"#.into(),
+                }],
+            ),
+            Message::assistant_with_calls("", vec![fake_tool_call("child-tool")]),
+            Message::assistant("child completed"),
+            Message::assistant("parent completed"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "parent-session", "hello")).await;
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::ToolResult(_, Ok(report)) => Some(report),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert!(
+        child
+            .iter()
+            .any(|entry| entry.call_id.as_deref() == Some("child-tool")
+                && entry.content.contains("echo:"))
+    );
+}
+
+#[tokio::test]
+async fn parallel_delegation_returns_separate_sessions_in_task_order() {
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "batch".into(),
+                    name: "delegate_tasks".into(),
+                    arguments: r#"{"tasks":[{"task":"first"},{"task":"second"}]}"#.into(),
+                }],
+            ),
+            Message::assistant("answer one"),
+            Message::assistant("answer two"),
+            Message::assistant("parent done"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "parent-session", "hello")).await;
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult(call, Ok(result)) if call.id == "batch" => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["task"], "first");
+    assert_eq!(results[1]["task"], "second");
+    assert_ne!(results[0]["session_id"], results[1]["session_id"]);
+    assert!(results.iter().all(|result| result["status"] == "completed"));
+}
+
+#[tokio::test]
+async fn child_inherits_parent_tool_allowlist() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "outer".into(),
+                    name: "delegate_task".into(),
+                    arguments: r#"{"task":"inspect"}"#.into(),
+                }],
+            ),
+            Message::assistant_with_calls("", vec![fake_tool_call("denied")]),
+            Message::assistant("child done"),
+            Message::assistant("parent done"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run_with_options(
+        "parent",
+        "parent-session",
+        "hello",
+        RunOptions {
+            allowed_tools: Some(vec!["delegate_task".into()]),
+            ..Default::default()
+        },
+    ))
+    .await;
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult(_, Ok(report)) => Some(report),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    assert!(
+        sessions
+            .history(report["session_id"].as_str().unwrap())
+            .iter()
+            .any(|entry| entry.call_id.as_deref() == Some("denied")
+                && entry.content.contains("denied by run tool policy"))
+    );
+}
+
+#[tokio::test]
+async fn cancellation_closes_turn_and_reports_failure() {
+    struct PendingModel;
+    impl ModelStreamerApi for PendingModel {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            _: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                let _held = tx;
+                std::future::pending::<()>().await;
+            });
+            rx
+        }
+    }
+    let ctx = setup(vec![], 8);
+    // AgentLoop captured its streamer at construction, so rebuild the plugin.
+    ctx.unload("agent-loop").unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(PendingModel))),
+    );
+    // Existing tool registrations survive unload; construct the loop directly.
+    let svc = AgentLoop::new(
+        ctx.clone(),
+        ctx.inject_key(harness_contracts::KEY_AGENTS_API).unwrap(),
+        ctx.inject_key(harness_contracts::KEY_SESSION_STORE)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_TOOL_EXECUTOR)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_PROMPT_ASSEMBLER)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_MODEL_SELECTOR_API)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_MODEL_STREAMER)
+            .unwrap(),
+    );
+    let (mut events, cancel) =
+        svc.run_cancellable("cancel-agent", "cancel-session", "test", Default::default());
+    while !matches!(events.recv().await, Some(TurnEvent::Started)) {}
+    cancel.send(()).unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), drain(events))
+        .await
+        .unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, TurnEvent::Failed(message) if message.contains("cancelled"))
+        )
+    );
+}
+
+#[tokio::test]
+async fn delegated_child_inherits_real_shell_state_without_mutating_parent() {
+    let ctx = setup(vec![
+        Message::assistant_with_calls("", vec![ToolCall { id: "set".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"cd /tmp; export PARENT_SHELL_TEST=original"}).to_string() }]),
+        Message::assistant_with_calls("", vec![ToolCall { id: "child".into(), name: "delegate_task".into(), arguments: serde_json::json!({"task":"check shell"}).to_string() }]),
+        Message::assistant_with_calls("", vec![ToolCall { id: "child-shell".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s:%s' \"$PWD\" \"$PARENT_SHELL_TEST\"; cd /; export PARENT_SHELL_TEST=changed"}).to_string() }]),
+        Message::assistant("child finished"),
+        Message::assistant_with_calls("", vec![ToolCall { id: "parent-shell".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s:%s' \"$PWD\" \"$PARENT_SHELL_TEST\""}).to_string() }]),
+        Message::assistant("done"),
+    ], 8);
+    ctx.load(harness_shell::ShellPlugin).unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "shell-parent", "start")).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Completed(_))),
+        "{events:?}"
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let parent = sessions.history("shell-parent");
+    let child_report = parent
+        .iter()
+        .find(|e| e.call_id.as_deref() == Some("child"))
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&child_report.content).unwrap();
+    assert_eq!(report["status"], "completed", "{report}");
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert_eq!(
+        child
+            .iter()
+            .find(|e| e.call_id.as_deref() == Some("child-shell"))
+            .unwrap()
+            .content,
+        "/tmp:original"
+    );
+    assert_eq!(
+        parent
+            .iter()
+            .find(|e| e.call_id.as_deref() == Some("parent-shell"))
+            .unwrap()
+            .content,
+        "/tmp:original"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_records_results_for_all_unanswered_calls() {
+    let ctx = setup(
+        vec![Message::assistant_with_calls(
+            "",
+            vec![
+                ToolCall {
+                    id: "blocking".into(),
+                    name: "blocking_tool".into(),
+                    arguments: "{}".into(),
+                },
+                fake_tool_call("not-started"),
+            ],
+        )],
+        8,
+    );
+    let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+    tools
+        .register(
+            ToolSpec {
+                name: "blocking_tool".into(),
+                description: "blocks".into(),
+                parameters: json!({"type":"object"}),
+            },
+            |_| Box::pin(std::future::pending()),
+        )
+        .unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let (mut events, cancel) = svc.run_cancellable("a", "cancel-tools", "test", Default::default());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(events.recv().await, Some(TurnEvent::ToolStarted(_))) {}
+    })
+    .await
+    .unwrap();
+    cancel.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), drain(events))
+        .await
+        .unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("cancel-tools");
+    for id in ["blocking", "not-started"] {
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.call_id.as_deref() == Some(id))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn spawn_returns_handle_and_wait_returns_result_without_duplicate_delivery() {
+    struct SpawnModel;
+    impl ModelStreamerApi for SpawnModel {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            messages: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let is_child = messages
+                .iter()
+                .any(|m| m.content.starts_with("Task: background task"));
+            let reply = if is_child
+                && !messages
+                    .iter()
+                    .any(|m| m.call_id.as_deref() == Some("child-probe"))
+            {
+                Message::assistant_with_calls("", vec![ToolCall { id: "child-probe".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s' \"$SPAWN_PRIVATE\"; SPAWN_PRIVATE=changed"}).to_string() }])
+            } else if is_child {
+                let probe = messages
+                    .iter()
+                    .find(|m| m.call_id.as_deref() == Some("child-probe"))
+                    .unwrap();
+                assert_eq!(probe.content, "unexported-parent");
+                Message::assistant("background finding")
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("spawn"))
+            {
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "spawn".into(),
+                        name: "spawn_agent".into(),
+                        arguments: r#"{"task":"background task"}"#.into(),
+                    }],
+                )
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("wait"))
+            {
+                let handle = messages
+                    .iter()
+                    .find(|m| m.call_id.as_deref() == Some("spawn"))
+                    .unwrap();
+                let handle: serde_json::Value = serde_json::from_str(&handle.content).unwrap();
+                assert_eq!(handle["status"], "running");
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "wait".into(),
+                        name: "agent_wait".into(),
+                        arguments: serde_json::json!({"run_id":handle["run_id"]}).to_string(),
+                    }],
+                )
+            } else {
+                Message::assistant("parent done")
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                if is_child {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let _ = tx.send(StreamEvent::Done(reply)).await;
+            });
+            rx
+        }
+    }
+    let ctx = Context::root();
+    ctx.load(
+        harness_config::ConfigPlugin::from_toml(
+            "[llm]\nbase_url='u'\nmodel='fake'\napi_key='k'\nuser_agent='a'\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ctx.load(harness_model::ModelPlugin).unwrap();
+    ctx.load(harness_agent::AgentPlugin).unwrap();
+    ctx.load(harness_session::SessionPlugin).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
+    ctx.load(harness_system_prompt::SystemPromptPlugin::default())
+        .unwrap();
+    ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
+        .unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(SpawnModel))),
+    );
+    ctx.load(harness_agent_loop::AgentLoopPlugin).unwrap();
+    ctx.load(harness_shell::ShellPlugin).unwrap();
+    let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+    tools
+        .execute(
+            "parent",
+            "spawn-parent",
+            1,
+            ToolCall {
+                id: "init".into(),
+                name: "shell_exec".into(),
+                arguments: serde_json::json!({"command":"SPAWN_PRIVATE=unexported-parent"})
+                    .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        drain(svc.run("parent", "spawn-parent", "go")),
+    )
+    .await
+    .unwrap();
+    assert!(
+        events.iter().any(|e| matches!(e, TurnEvent::Completed(_))),
+        "{events:?}"
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("spawn-parent");
+    let waited = history
+        .iter()
+        .find(|m| m.call_id.as_deref() == Some("wait"))
+        .unwrap();
+    assert!(waited.content.contains("background finding"));
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+    let parent_shell = tools
+        .execute(
+            "parent",
+            "spawn-parent",
+            1,
+            ToolCall {
+                id: "verify".into(),
+                name: "shell_exec".into(),
+                arguments: serde_json::json!({"command":"printf '%s' \"$SPAWN_PRIVATE\""})
+                    .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent_shell, "unexported-parent");
+    let shells: Arc<harness_shell::ShellService> = ctx
+        .inject_key(harness_contracts::KEY_SHELL_SERVICE)
+        .unwrap();
+    shells.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_completion_is_delivered_once_on_next_parent_turn() {
+    struct Model;
+    impl ModelStreamerApi for Model {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            messages: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let child = messages
+                .iter()
+                .any(|m| m.content.starts_with("Task: queued task"));
+            let reply = if child {
+                Message::assistant("queued result")
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("spawn"))
+            {
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "spawn".into(),
+                        name: "spawn_agent".into(),
+                        arguments: r#"{"task":"queued task"}"#.into(),
+                    }],
+                )
+            } else {
+                Message::assistant("parent response")
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                if child {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let _ = tx.send(StreamEvent::Done(reply)).await;
+            });
+            rx
+        }
+    }
+    let ctx = Context::root();
+    ctx.load(
+        harness_config::ConfigPlugin::from_toml(
+            "[llm]\nbase_url='u'\nmodel='fake'\napi_key='k'\nuser_agent='a'\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ctx.load(harness_model::ModelPlugin).unwrap();
+    ctx.load(harness_agent::AgentPlugin).unwrap();
+    ctx.load(harness_session::SessionPlugin).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
+    ctx.load(harness_system_prompt::SystemPromptPlugin::default())
+        .unwrap();
+    ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
+        .unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(Model))),
+    );
+    ctx.load(harness_agent_loop::AgentLoopPlugin).unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    drain(svc.run("parent", "queued-parent", "go")).await;
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    assert!(
+        !sessions
+            .history("queued-parent")
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Finishing a child does not mutate an idle parent's history or wake it.
+    assert!(
+        !sessions
+            .history("queued-parent")
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+    drain(svc.run("parent", "queued-parent", "continue")).await;
+    drain(svc.run("parent", "queued-parent", "again")).await;
+    let history = sessions.history("queued-parent");
+    let reports: Vec<_> = history
+        .iter()
+        .filter(|m| m.content.starts_with("Background agent report"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].content.contains("queued result"));
 }

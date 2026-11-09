@@ -112,6 +112,8 @@ async fn run() -> Result<ExitCode> {
 
     tui.run().await;
     let _ = done_rx.recv().await;
+    let agents: Arc<harness_agent_loop::AgentLoop> = ctx.inject_key(harness_contracts::KEY_AGENT_LOOP)?;
+    agents.shutdown_background().await;
 
     Ok(ExitCode::SUCCESS)
 }
