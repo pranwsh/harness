@@ -45,6 +45,25 @@ pub struct SessionOutput {
     pub err_omitted: u64,
 }
 
+/// Own temporary fork resources until the handshake commits. Also used on
+/// cancellation: a child which opens its channel after cleanup exits on open.
+struct ForkSetup {
+    directory: std::path::PathBuf,
+    committed: bool,
+}
+impl Drop for ForkSetup {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(pid) = std::fs::read_to_string(self.directory.join("pid")) {
+                if let Ok(pid) = pid.trim().parse::<u32>() {
+                    kill_process_group(Some(pid));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
 enum ShellProcess {
     Root(Child),
     Fork {
@@ -95,12 +114,14 @@ struct SessionState {
 
 pub struct BashSession {
     state: Mutex<Option<SessionState>>,
+    forked: bool,
 }
 
 impl BashSession {
     pub fn new() -> Self {
         BashSession {
             state: Mutex::new(None),
+            forked: false,
         }
     }
 
@@ -138,13 +159,17 @@ impl BashSession {
 
     /// Fork Bash itself, without exec or serialization of its variables.
     pub async fn fork(&self, timeout: Duration) -> Result<Self, String> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         let directory = std::env::temp_dir().join(format!(
             "harness-fork-{}-{}",
             std::process::id(),
             NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        let mut setup = ForkSetup {
+            directory: directory.clone(),
+            committed: false,
+        };
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
         let input = directory.join("in");
@@ -156,23 +181,28 @@ impl BashSession {
                 return Err(std::io::Error::last_os_error().to_string());
             }
         }
-        let open = |path: &Path| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|e| e.to_string())
-        };
-        let writer = open(&input)?;
-        let reader = open(&output)?;
+        // Nonblocking descriptors integrated with Tokio's reactor. Unlike
+        // tokio::fs, cancellation cannot strand a blocking read worker.
+        let writer = tokio::net::unix::pipe::OpenOptions::new()
+            .read_write(true)
+            .open_sender(&input)
+            .map_err(|e| e.to_string())?;
+        let reader = tokio::net::unix::pipe::OpenOptions::new()
+            .open_receiver(&output)
+            .map_err(|e| e.to_string())?;
+        // Hold output open only through the handshake. Thereafter EOF means
+        // the child actually exited, not that it has not opened the FIFO yet.
+        let keeper = tokio::net::unix::pipe::OpenOptions::new()
+            .open_sender(&output)
+            .map_err(|e| e.to_string())?;
         // Job control gives the fork an independent process group. Restore the
         // parent's monitor setting before returning to its command protocol.
         let script = format!(
             r#"case $- in *m*) __harness_monitor=1;; *) __harness_monitor=0; set -m;; esac
-( if [[ $__harness_monitor == 0 ]]; then set +m; fi; unset __harness_monitor; builtin printf '%s\n' "$BASHPID"; while IFS= builtin read -r __harness_line; do builtin eval "$__harness_line"; done ) <{} >{} 2>/dev/null &
+( if [[ $__harness_monitor == 0 ]]; then set +m; fi; unset __harness_monitor; builtin printf '%s\n' "$BASHPID" >{}; builtin printf '%s\n' "$BASHPID"; while IFS= builtin read -r __harness_line; do builtin eval "$__harness_line"; done ) <{} >{} 2>/dev/null &
 if [[ $__harness_monitor == 0 ]]; then set +m; fi
 unset __harness_monitor"#,
+            sh_quote(&directory.join("pid").to_string_lossy()),
             sh_quote(&input.to_string_lossy()),
             sh_quote(&output.to_string_lossy())
         );
@@ -182,17 +212,20 @@ unset __harness_monitor"#,
             return Err("could not fork parent shell".into());
         }
         let mut stdout: BufReader<Box<dyn AsyncRead + Send + Unpin>> =
-            BufReader::new(Box::new(tokio::fs::File::from_std(reader)));
+            BufReader::new(Box::new(reader));
         let mut pid = String::new();
         tokio::time::timeout(timeout, stdout.read_line(&mut pid))
             .await
             .map_err(|_| "child shell handshake timed out".to_owned())?
             .map_err(|e| e.to_string())?;
         let pid = pid.trim().parse::<u32>().map_err(|e| e.to_string())?;
+        drop(keeper);
+        setup.committed = true;
         Ok(Self {
+            forked: true,
             state: Mutex::new(Some(SessionState {
                 child: ShellProcess::Fork { pid, directory },
-                stdin: Box::new(tokio::fs::File::from_std(writer)),
+                stdin: Box::new(writer),
                 stdout,
                 seq: 0,
                 in_flight: false,
@@ -217,6 +250,10 @@ unset __harness_monitor"#,
         }
         for _ in 0..2 {
             if !Self::alive(&mut guard) {
+                if self.forked {
+                    Self::kill_slot(&mut guard);
+                    return Err("inherited child shell terminated; create a new child rather than silently losing inherited state".into());
+                }
                 *guard = Some(Self::spawn().map_err(|e| format!("cannot start bash: {e}"))?);
             }
             let state = guard.as_mut().expect("session spawned");
@@ -515,6 +552,42 @@ mod tests {
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(sh_quote("o'clock"), "'o'\\''clock'");
+    }
+
+    #[tokio::test]
+    async fn child_exit_is_prompt_and_never_restarts_fresh() {
+        let parent = BashSession::new();
+        let child = parent.fork(Duration::from_secs(2)).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            child.run("exit 7", None, Duration::from_secs(1), 65536),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(
+            child
+                .run("echo must-not-run", None, Duration::from_secs(1), 65536)
+                .await
+                .is_err()
+        );
+        parent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_setup_cancellation_removes_private_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "harness-setup-test-{}",
+            NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        {
+            let _guard = ForkSetup {
+                directory: directory.clone(),
+                committed: false,
+            };
+        }
+        assert!(!directory.exists());
     }
 
     #[tokio::test]
