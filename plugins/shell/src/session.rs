@@ -50,6 +50,7 @@ struct SessionState {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     seq: u64,
+    in_flight: bool,
 }
 
 pub struct BashSession {
@@ -89,6 +90,7 @@ impl BashSession {
             stdin,
             stdout: BufReader::new(stdout),
             seq: 0,
+            in_flight: false,
         })
     }
 
@@ -102,6 +104,11 @@ impl BashSession {
         cap: usize,
     ) -> Result<SessionOutput, String> {
         let mut guard = self.state.lock().await;
+        // A dropped run future can leave unread output and a live command in
+        // the protocol stream. Never reuse that shell on the next call.
+        if guard.as_ref().is_some_and(|state| state.in_flight) {
+            Self::kill_slot(&mut guard);
+        }
         for _ in 0..2 {
             if !Self::alive(&mut guard) {
                 *guard = Some(Self::spawn().map_err(|e| format!("cannot start bash: {e}"))?);
@@ -116,8 +123,12 @@ impl BashSession {
             );
             let tmp = std::env::temp_dir().join(format!("harness-sh-{nonce}.err"));
             let payload = build_payload(script, workdir, &tmp, &nonce);
+            state.in_flight = true;
             match Self::attempt(state, &payload, &nonce, &tmp, timeout, cap).await {
-                Attempt::Done(out) => return Ok(out),
+                Attempt::Done(out) => {
+                    state.in_flight = false;
+                    return Ok(out);
+                }
                 Attempt::TimedOut(out) => {
                     Self::kill_slot(&mut guard);
                     return Ok(out);
@@ -386,6 +397,29 @@ mod tests {
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(sh_quote("o'clock"), "'o'\\''clock'");
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_does_not_corrupt_next_protocol_response() {
+        let session = std::sync::Arc::new(BashSession::new());
+        let worker = session.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .run("sleep 5; echo stale", None, Duration::from_secs(10), 65536)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.run("echo fresh", None, Duration::from_secs(1), 65536),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out.stdout, b"fresh\n");
+        session.shutdown().await;
     }
 
     #[tokio::test]
