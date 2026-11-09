@@ -451,6 +451,11 @@ fn shell_start_handler(
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a = parse_exec_args("shell_start", &args)?;
+        if a.env.is_some() && a.workdir.is_some() {
+            return svc
+                .start("shell_start", a.command, a.workdir, a.timeout_ms, a.env)
+                .await;
+        }
         let session = svc.session_for(&invocation.session_id);
         let snapshot = session
             .run(

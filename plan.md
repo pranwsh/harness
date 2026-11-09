@@ -37,7 +37,9 @@
 ## Child shell state
 - [x] Give each conversation session its own persistent `shell_exec` Bash process and initialize child shells from the parent's current directory, exported variables, and functions.
 - [x] Test inheritance and independent subsequent state changes.
-- [ ] Add end-to-end parent/child delegation coverage with the real shell plugin, concurrent siblings, and cancellation during snapshot.
+- [ ] Add concurrent sibling and snapshot-cancellation coverage. End-to-end parent/child delegation with the real shell plugin is covered.
 - [ ] Decide how to preserve additional Bash state (unexported variables, aliases, shell options, traps, and non-UTF-8 values). Current snapshot is not a complete clone of Bash state.
-- [ ] Align background `shell_start` and privileged execution with the scoped shell environment; they remain independent one-shot processes using the harness process environment, and jobs are shared.
+- [ ] Decide whether privileged execution should inherit scoped working directory and environment. Background `shell_start` now inherits session cwd and exported environment by default; jobs remain shared and explicit env overrides inheritance.
 - Files and filesystem changes remain shared; this is shell-state isolation, not a sandbox. Child shell state is released after the delegation finishes, so resuming a historical child session starts a fresh shell.
+
+- Snapshot serialization cannot faithfully clone all Bash process state; non-UTF-8, large snapshots, cancellation during capture, and restarted shells need additional handling.
