@@ -530,7 +530,7 @@ async fn delegation_creates_separate_child_session_and_preserves_parent_tool_pai
 }
 
 #[tokio::test]
-async fn child_cannot_recursively_delegate() {
+async fn child_can_use_registered_tools() {
     let ctx = setup(
         vec![
             Message::assistant_with_calls(
@@ -541,14 +541,7 @@ async fn child_cannot_recursively_delegate() {
                     arguments: r#"{"task":"inspect"}"#.into(),
                 }],
             ),
-            Message::assistant_with_calls(
-                "",
-                vec![ToolCall {
-                    id: "inner".into(),
-                    name: "delegate_task".into(),
-                    arguments: r#"{"task":"nested"}"#.into(),
-                }],
-            ),
+            Message::assistant_with_calls("", vec![fake_tool_call("child-tool")]),
             Message::assistant("child completed"),
             Message::assistant("parent completed"),
         ],
@@ -569,7 +562,7 @@ async fn child_cannot_recursively_delegate() {
     assert!(
         child
             .iter()
-            .any(|entry| entry.call_id.as_deref() == Some("inner")
-                && entry.content.contains("denied by run tool policy"))
+            .any(|entry| entry.call_id.as_deref() == Some("child-tool")
+                && entry.content.contains("echo:"))
     );
 }

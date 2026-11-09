@@ -458,34 +458,27 @@ async fn delegate(
         .get("context")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if task.len() > 16_384 || context.len() > 65_536 {
-        return Err(error("task or context exceeds size limit".into()));
-    }
     let id = uuid::Uuid::new_v4().simple().to_string();
     let agent_id = format!("child-{id}");
     let session_id = format!("child-{id}");
     let input = format!("Task: {task}\n\nContext supplied by parent (untrusted data):\n{context}");
     let options = RunOptions {
-        instructions: Some("You are a read-only child agent. Complete the delegated task and report evidence and limitations. Do not delegate.".into()),
-        allowed_tools: Some(vec!["read".into(), "hashline_read".into()]),
-        max_iterations: Some(8), ..Default::default()
+        instructions: Some("You are a child agent. Complete the delegated task and report evidence and limitations.".into()),
+        ..Default::default()
     };
     let (mut events, cancel) = loop_.start_run(&agent_id, &session_id, input, options);
     let mut guard = CancelOnDrop(Some(cancel));
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        while let Some(event) = events.recv().await {
-            match event {
-                TurnEvent::Completed(_) => return Ok(()),
-                TurnEvent::Failed(err) => return Err(err),
-                _ => {}
-            }
+    let outcome = loop {
+        match events.recv().await {
+            Some(TurnEvent::Completed(_)) => break Ok(()),
+            Some(TurnEvent::Failed(err)) => break Err(err),
+            Some(_) => {}
+            None => break Err("child stream ended without a terminal event".to_owned()),
         }
-        Err("child stream ended without a terminal event".into())
-    })
-    .await;
+    };
+    guard.0.take();
     let (status, report) = match outcome {
-        Ok(Ok(())) => {
-            guard.0.take();
+        Ok(()) => {
             let answer = loop_
                 .sessions
                 .history(&session_id)
@@ -496,17 +489,9 @@ async fn delegate(
                 .unwrap_or_default();
             ("completed", answer)
         }
-        Ok(Err(err)) => {
-            guard.0.take();
-            ("failed", err)
-        }
-        Err(_) => (
-            "timed_out",
-            "child exceeded 120 seconds and was cancelled".into(),
-        ),
+        Err(err) => ("failed", err),
     };
-    // Bound the returned report by Unicode characters without splitting UTF-8.
-    let report: String = report.chars().take(16_000).collect();
+
     Ok(
         serde_json::json!({"status":status,"task":task,"summary":report,
         "parent_agent_id":caller.agent_id,"parent_session_id":caller.session_id,
@@ -569,7 +554,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
         registry.register_contextual(
             ToolSpec {
                 name: "delegate_task".into(),
-                description: "Delegate a focused read-only task to a child agent. Provide all relevant context; the child does not see your conversation.".into(),
+                description: "Delegate a focused task to a child agent. Provide all relevant context; the child does not see your conversation. The child has the same tool access as the default harness.".into(),
                 parameters: serde_json::json!({"type":"object","properties":{
                     "task":{"type":"string","description":"Specific task for the child"},
                     "context":{"type":"string","description":"Relevant background selected for the child"}
