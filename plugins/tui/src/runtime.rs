@@ -130,10 +130,14 @@ struct EventLoop {
     tx: mpsc::Sender<AppMsg>,
     rx: mpsc::Receiver<AppMsg>,
     layout_cache: LayoutCache,
+    cancel_turn: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for EventLoop {
     fn drop(&mut self) {
+        if let Some(cancel) = self.cancel_turn.take() {
+            let _ = cancel.send(());
+        }
         self.sudo_popup.reset(&self.session_id);
     }
 }
@@ -176,6 +180,7 @@ impl EventLoop {
             tx,
             rx,
             layout_cache: LayoutCache::new(),
+            cancel_turn: None,
         }
     }
 
@@ -242,7 +247,19 @@ impl EventLoop {
             //   `/model ` / `/sessions ` / `/branch ` lines still match a
             //   slash candidate, so they cannot self-close).
             // - Else: normal edit; post-reduce syncs the eligible provider.
+            if matches!(msg, AppMsg::TurnFinished) {
+                self.cancel_turn.take();
+            }
             if let AppMsg::Key(key) = &msg {
+                if *key == KeyEvent::Interrupt && self.app.is_busy() {
+                    if let Some(cancel) = self.cancel_turn.take() {
+                        let _ = cancel.send(());
+                        self.app.update(AppMsg::Notice(
+                            "cancelling active turn and delegated children".into(),
+                        ));
+                    }
+                    continue;
+                }
                 if self.sudo_popup.active() {
                     if self
                         .sudo_popup
@@ -443,8 +460,10 @@ impl EventLoop {
         let agent_id = self.agent_id.clone();
         let session_id = self.session_id.clone();
         let tx = self.tx.clone();
+        let (mut rx, cancel) =
+            agent_loop.run_cancellable(&agent_id, &session_id, input, Default::default());
+        self.cancel_turn = Some(cancel);
         tokio::spawn(async move {
-            let mut rx = agent_loop.run(&agent_id, &session_id, input);
             while let Some(event) = rx.recv().await {
                 let msg = match event {
                     // Lifecycle bookkeeping the chat pane doesn't render.
