@@ -446,12 +446,48 @@ fn shell_exec_handler(
 
 fn shell_start_handler(
     svc: Arc<ShellService>,
+    invocation: ToolInvocation,
     args: String,
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a = parse_exec_args("shell_start", &args)?;
-        svc.start("shell_start", a.command, a.workdir, a.timeout_ms, a.env)
+        let session = svc.session_for(&invocation.session_id);
+        let snapshot = session
+            .run(
+                r#"printf '%s\0' "$PWD"; env -0"#,
+                None,
+                Duration::from_millis(svc.cfg.max_timeout_ms.max(1)),
+                4 * 1024 * 1024,
+            )
             .await
+            .map_err(|e| tool_err("shell_start", e))?;
+        if snapshot.timed_out || snapshot.exit_code != Some(0) || snapshot.out_omitted != 0 {
+            return Err(tool_err(
+                "shell_start",
+                "could not capture complete shell environment",
+            ));
+        }
+        let mut parts = snapshot.stdout.split(|b| *b == 0);
+        let cwd = std::str::from_utf8(parts.next().unwrap_or_default())
+            .map_err(|_| tool_err("shell_start", "shell working directory is not UTF-8"))?
+            .to_owned();
+        let mut inherited = HashMap::new();
+        for entry in parts.filter(|part| !part.is_empty()) {
+            let text = std::str::from_utf8(entry)
+                .map_err(|_| tool_err("shell_start", "shell environment is not UTF-8"))?;
+            let (key, value) = text
+                .split_once('=')
+                .ok_or_else(|| tool_err("shell_start", "invalid shell environment"))?;
+            inherited.insert(key.to_owned(), value.to_owned());
+        }
+        svc.start(
+            "shell_start",
+            a.command,
+            a.workdir.or(Some(cwd)),
+            a.timeout_ms,
+            a.env.or(Some(inherited)),
+        )
+        .await
     })
 }
 
@@ -599,11 +635,11 @@ impl harness_core::Plugin for ShellPlugin {
                 provider: e,
             })?;
         registry
-            .register(
+            .register_contextual(
                 shell_start_spec(),
                 Box::new({
                     let svc = Arc::clone(&svc);
-                    move |args| shell_start_handler(Arc::clone(&svc), args)
+                    move |invocation, args| shell_start_handler(Arc::clone(&svc), invocation, args)
                 }),
             )
             .map_err(|e| harness_core::Error::ServiceConflict {
@@ -677,6 +713,50 @@ user_agent = "a"
             name: name.into(),
             arguments: args.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn background_job_inherits_its_session_export_and_directory() {
+        let (_ctx, tools, svc) = ctx_with_shell();
+        tools
+            .execute(
+                "a",
+                "scoped",
+                1,
+                call(
+                    "shell_exec",
+                    serde_json::json!({"command":"cd /tmp; export TEST_SCOPED_JOB=inherited"}),
+                ),
+            )
+            .await
+            .unwrap();
+        let started = tools
+            .execute(
+                "a",
+                "scoped",
+                1,
+                call(
+                    "shell_start",
+                    serde_json::json!({"command":"printf '%s:%s' \"$PWD\" \"$TEST_SCOPED_JOB\""}),
+                ),
+            )
+            .await
+            .unwrap();
+        let id = started.split_whitespace().nth(1).unwrap();
+        let result = tools
+            .execute(
+                "a",
+                "scoped",
+                1,
+                call(
+                    "shell_poll",
+                    serde_json::json!({"job_id":id,"wait_ms":2000}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("/tmp:inherited"), "{result}");
+        svc.shutdown().await;
     }
 
     #[tokio::test]
