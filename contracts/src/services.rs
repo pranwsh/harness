@@ -389,3 +389,11 @@ pub trait SudoApprovalApi: Send + Sync + 'static {
     fn cancel_session(&self, session_id: &str);
 }
 pub struct SudoApprovalHandle(pub Arc<dyn SudoApprovalApi>);
+
+/// Optional provider for child shell initialization and cleanup.
+pub trait ShellScopeApi: Send + Sync + 'static {
+    fn fork(&self, parent_session: &str, child_session: &str) -> BoxFuture<Result<(), String>>;
+    fn release(&self, session: &str) -> BoxFuture<()>;
+}
+#[derive(Clone)]
+pub struct ShellScopeHandle(pub Arc<dyn ShellScopeApi>);

@@ -8,11 +8,12 @@ use harness_contracts::{
     CH_SESSION_TURN_OPEN_REQUESTED, CH_TOOL_EXECUTED, CH_TURN_COMPLETED, CH_TURN_FAILED,
     CH_TURN_ITERATION, CH_TURN_STARTED, ConfigHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API,
     KEY_CONFIG, KEY_MODEL_SELECTOR_API, KEY_MODEL_STREAMER, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT,
-    KEY_SESSION_STORE, KEY_TOOL_EXECUTOR, KEY_TOOL_REGISTRY, Message, ModelSelectorHandle,
-    ModelStreamerHandle, PromptAssemblerHandle, Role, SessionAppendRequested, SessionId,
-    SessionStoreHandle, SessionTurnCloseRequested, SessionTurnOpenRequested, StreamEvent, ToolCall,
-    ToolError, ToolExecuted, ToolExecutorHandle, ToolInvocation, ToolRegistryHandle, ToolSpec,
-    TurnCompleted, TurnFailed, TurnIteration, TurnStarted,
+    KEY_SESSION_STORE, KEY_SHELL_SCOPE, KEY_TOOL_EXECUTOR, KEY_TOOL_REGISTRY, Message,
+    ModelSelectorHandle, ModelStreamerHandle, PromptAssemblerHandle, Role, SessionAppendRequested,
+    SessionId, SessionStoreHandle, SessionTurnCloseRequested, SessionTurnOpenRequested,
+    ShellScopeHandle, StreamEvent, ToolCall, ToolError, ToolExecuted, ToolExecutorHandle,
+    ToolInvocation, ToolRegistryHandle, ToolSpec, TurnCompleted, TurnFailed, TurnIteration,
+    TurnStarted,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
@@ -471,6 +472,17 @@ impl Drop for CancelOnDrop {
     }
 }
 
+struct ShellReleaseGuard {
+    shell: Arc<ShellScopeHandle>,
+    session_id: String,
+}
+impl Drop for ShellReleaseGuard {
+    fn drop(&mut self) {
+        let future = self.shell.0.release(&self.session_id);
+        tokio::spawn(future);
+    }
+}
+
 async fn delegate(
     loop_: Arc<AgentLoop>,
     caller: ToolInvocation,
@@ -494,6 +506,22 @@ async fn delegate(
     let id = uuid::Uuid::new_v4().simple().to_string();
     let agent_id = format!("child-{id}");
     let session_id = format!("child-{id}");
+    let _shell_guard = if let Some(shell) = loop_
+        .ctx
+        .try_inject_key::<ShellScopeHandle>(KEY_SHELL_SCOPE)
+    {
+        shell
+            .0
+            .fork(&caller.session_id, &session_id)
+            .await
+            .map_err(|err| error(format!("failed to inherit parent shell: {err}")))?;
+        Some(ShellReleaseGuard {
+            shell,
+            session_id: session_id.clone(),
+        })
+    } else {
+        None
+    };
     let input = format!("Task: {task}\n\nContext supplied by parent (untrusted data):\n{context}");
     let inherited = loop_
         .run_options

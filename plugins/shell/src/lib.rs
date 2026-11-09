@@ -25,14 +25,14 @@ mod output;
 mod session;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::env::executable_path;
 use futures::future::BoxFuture;
 use harness_contracts::{
-    KEY_CONFIG, KEY_SHELL_SERVICE, KEY_TOOL_REGISTRY, ShellConfig, ToolError, ToolRegistryHandle,
-    ToolSpec,
+    KEY_CONFIG, KEY_SHELL_SCOPE, KEY_SHELL_SERVICE, KEY_TOOL_REGISTRY, ShellConfig, ShellScopeApi,
+    ShellScopeHandle, ToolError, ToolInvocation, ToolRegistryHandle, ToolSpec,
 };
 use harness_core::{Context, Result};
 
@@ -56,7 +56,8 @@ fn tool_err(tool: &str, message: impl Into<String>) -> ToolError {
 pub struct ShellService {
     cfg: ShellConfig,
     jobs: JobManager,
-    session: BashSession,
+    session: Arc<BashSession>,
+    sessions: Arc<Mutex<HashMap<String, Arc<BashSession>>>>,
 }
 
 impl ShellService {
@@ -65,7 +66,8 @@ impl ShellService {
         ShellService {
             cfg,
             jobs: JobManager::new(limits),
-            session: BashSession::new(),
+            session: Arc::new(BashSession::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -81,6 +83,16 @@ impl ShellService {
     /// (harness exit / tests).
     pub async fn shutdown(&self) {
         self.session.shutdown().await;
+        let sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
+        for session in sessions {
+            session.shutdown().await;
+        }
         self.jobs.shutdown().await;
     }
 
@@ -114,6 +126,26 @@ impl ShellService {
         timeout_ms: Option<u64>,
         env: Option<HashMap<String, String>>,
     ) -> std::result::Result<String, ToolError> {
+        self.exec_scoped(
+            self.session.clone(),
+            tool,
+            command,
+            workdir,
+            timeout_ms,
+            env,
+        )
+        .await
+    }
+
+    async fn exec_scoped(
+        &self,
+        session: Arc<BashSession>,
+        tool: &'static str,
+        command: String,
+        workdir: Option<String>,
+        timeout_ms: Option<u64>,
+        env: Option<HashMap<String, String>>,
+    ) -> std::result::Result<String, ToolError> {
         self.check_common(tool, &command, &env)?;
         let want = timeout_ms.unwrap_or(self.cfg.default_timeout_ms);
         let timeout = Duration::from_millis(want.clamp(1, self.cfg.max_timeout_ms.max(1)));
@@ -135,8 +167,7 @@ impl ShellService {
             None => None,
             Some(w) => Some(resolve_workdir(Some(w.as_str())).map_err(|e| tool_err(tool, e))?),
         };
-        let out = self
-            .session
+        let out = session
             .run(
                 &command,
                 dir.as_deref(),
@@ -212,6 +243,74 @@ impl ShellService {
             return Err(tool_err(tool, "job_id must not be empty"));
         }
         self.jobs.stop(job_id).await.map_err(|e| tool_err(tool, e))
+    }
+}
+
+impl ShellService {
+    fn session_for(&self, id: &str) -> Arc<BashSession> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(BashSession::new()))
+            .clone()
+    }
+}
+
+impl ShellScopeApi for ShellService {
+    fn fork(
+        &self,
+        parent_session: &str,
+        child_session: &str,
+    ) -> harness_contracts::BoxFuture<Result<(), String>> {
+        let parent = self.session_for(parent_session);
+        let sessions = self.sessions.clone();
+        let child_id = child_session.to_owned();
+        let timeout = Duration::from_millis(self.cfg.max_timeout_ms.max(1));
+        Box::pin(async move {
+            // Serialization occurs inside the parent BashSession mutex, giving a
+            // consistent point-in-time snapshot relative to shell_exec calls.
+            let snapshot = parent
+                .run(
+                    r#"printf 'cd -- %q\n' "$PWD"; export -p; declare -f"#,
+                    None,
+                    timeout,
+                    4 * 1024 * 1024,
+                )
+                .await?;
+            if snapshot.timed_out || snapshot.exit_code != Some(0) || snapshot.out_omitted != 0 {
+                return Err("could not capture complete parent shell state".into());
+            }
+            let script = String::from_utf8(snapshot.stdout)
+                .map_err(|_| "shell snapshot was not UTF-8".to_owned())?;
+            let child = Arc::new(BashSession::new());
+            let initialized = child.run(&script, None, timeout, 4 * 1024 * 1024).await?;
+            if initialized.timed_out || initialized.exit_code != Some(0) {
+                child.shutdown().await;
+                return Err(format!(
+                    "could not initialize child shell: {}",
+                    String::from_utf8_lossy(&initialized.stderr)
+                ));
+            }
+            let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if map.contains_key(&child_id) {
+                return Err("child shell already exists".into());
+            }
+            map.insert(child_id, child);
+            Ok(())
+        })
+    }
+    fn release(&self, session: &str) -> harness_contracts::BoxFuture<()> {
+        let child = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+        Box::pin(async move {
+            if let Some(child) = child {
+                child.shutdown().await;
+            }
+        })
     }
 }
 
@@ -327,12 +426,21 @@ fn parse_exec_args(tool: &'static str, args: &str) -> std::result::Result<ExecAr
 
 fn shell_exec_handler(
     svc: Arc<ShellService>,
+    invocation: ToolInvocation,
     args: String,
 ) -> BoxFuture<'static, Result<String, ToolError>> {
     Box::pin(async move {
         let a = parse_exec_args("shell_exec", &args)?;
-        svc.exec_sync("shell_exec", a.command, a.workdir, a.timeout_ms, a.env)
-            .await
+        let session = svc.session_for(&invocation.session_id);
+        svc.exec_scoped(
+            session,
+            "shell_exec",
+            a.command,
+            a.workdir,
+            a.timeout_ms,
+            a.env,
+        )
+        .await
     })
 }
 
@@ -456,6 +564,7 @@ impl harness_core::Plugin for ShellPlugin {
     fn meta(&self) -> harness_core::PluginMeta {
         harness_core::PluginMeta::new("shell")
             .provides(KEY_SHELL_SERVICE)
+            .provides(KEY_SHELL_SCOPE)
             .injects(KEY_TOOL_REGISTRY)
             .injects(KEY_CONFIG)
     }
@@ -478,11 +587,11 @@ impl harness_core::Plugin for ShellPlugin {
                 provider: e,
             })?;
         registry
-            .register(
+            .register_contextual(
                 shell_exec_spec(),
                 Box::new({
                     let svc = Arc::clone(&svc);
-                    move |args| shell_exec_handler(Arc::clone(&svc), args)
+                    move |invocation, args| shell_exec_handler(Arc::clone(&svc), invocation, args)
                 }),
             )
             .map_err(|e| harness_core::Error::ServiceConflict {
@@ -528,6 +637,10 @@ impl harness_core::Plugin for ShellPlugin {
         // Keep the service alive for the plugin lifetime; dropping it aborts
         // background jobs via JobManager::drop. Stored under `KEY_SHELL_SERVICE`
         // owned by this plugin so unload cleans it up.
+        ctx.provide_key(
+            KEY_SHELL_SCOPE,
+            Arc::new(ShellScopeHandle(svc.clone() as Arc<dyn ShellScopeApi>)),
+        );
         ctx.provide_key(KEY_SHELL_SERVICE, svc);
         Ok(())
     }
@@ -564,6 +677,39 @@ user_agent = "a"
             name: name.into(),
             arguments: args.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_parent_state_and_isolates_later_changes() {
+        let svc = ShellService::new(ShellConfig::default());
+        let parent = svc.session_for("parent");
+        let timeout = Duration::from_secs(5);
+        parent.run("cd /tmp; export CHILD_TEST_VAR='parent value'; child_test_fn() { echo inherited; }", None, timeout, 65536).await.unwrap();
+        svc.fork("parent", "child").await.unwrap();
+        let child = svc.session_for("child");
+        let out = child.run(r#"printf '%s|%s|' "$PWD" "$CHILD_TEST_VAR"; child_test_fn; cd /; export CHILD_TEST_VAR=child"#, None, timeout, 65536).await.unwrap();
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "/tmp|parent value|inherited\n"
+        );
+        let out = parent
+            .run(
+                r#"printf '%s|%s' "$PWD" "$CHILD_TEST_VAR""#,
+                None,
+                timeout,
+                65536,
+            )
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/tmp|parent value");
+        svc.release("child").await;
+        svc.shutdown().await;
     }
 
     #[tokio::test]
