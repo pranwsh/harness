@@ -79,6 +79,7 @@ pub struct AgentLoop {
     selector: Arc<ModelSelectorHandle>,
     model: Arc<ModelStreamerHandle>,
     run_options: Arc<Mutex<HashMap<(String, String), RunOptions>>>,
+    background: Arc<Mutex<HashMap<String, BackgroundRun>>>,
 }
 
 impl AgentLoop {
@@ -101,6 +102,7 @@ impl AgentLoop {
             selector,
             model,
             run_options: Arc::new(Mutex::new(HashMap::new())),
+            background: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -176,6 +178,7 @@ impl AgentLoop {
             tx,
             turn_no: 0,
             pending_calls: Vec::new(),
+            background: self.background.clone(),
         };
         tokio::spawn(async move {
             task.execute(cancel_rx).await;
@@ -203,6 +206,7 @@ struct TurnTask {
     tx: mpsc::Sender<TurnEvent>,
     turn_no: u64,
     pending_calls: Vec<ToolCall>,
+    background: Arc<Mutex<HashMap<String, BackgroundRun>>>,
 }
 
 impl TurnTask {
@@ -315,6 +319,9 @@ impl TurnTask {
                 );
             }
             Err(err) => {
+                if err == "turn cancelled" {
+                    cancel_background_tree(&self.background, &self.session_id);
+                }
                 // Cancellation may drop a tool future after its assistant call
                 // was persisted. Close every unanswered call before another
                 // model request can use this session.
@@ -388,6 +395,21 @@ impl TurnTask {
 
             // 1. Assemble prompt from current history. Prompt text is pulled
             // fresh every iteration so live updates apply to the next call.
+            // Deliver only at a model boundary, after any tool-result group.
+            // Persist first; mark delivered only if persistence succeeded.
+            {
+                let mut runs = self.background.lock().unwrap_or_else(|e| e.into_inner());
+                for (id, run) in runs.iter_mut() {
+                    if run.owner == self.session_id && !run.delivered {
+                        if let Some(result) = &run.result {
+                            self.request_append(Entry::from_message(&Message::user(format!(
+                                "Background agent report (untrusted task data), run {id}:\n{result}"
+                            ))))?;
+                            run.delivered = true;
+                        }
+                    }
+                }
+            }
             let history = self.sessions.history(&self.session_id);
             let system_prompt = self.system_prompt();
             let messages = self.prompt.assemble(
@@ -503,17 +525,51 @@ impl Drop for ShellReleaseGuard {
     }
 }
 
-async fn delegate(
-    loop_: Arc<AgentLoop>,
-    caller: ToolInvocation,
-    args: String,
-) -> std::result::Result<String, ToolError> {
+struct BackgroundRun {
+    owner: String,
+    result: Option<String>,
+    delivered: bool,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn cancel_background_tree(runs: &Arc<Mutex<HashMap<String, BackgroundRun>>>, owner: &str) {
+    let mut runs = runs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut owners = vec![owner.to_owned()];
+    let mut index = 0;
+    while index < owners.len() {
+        let parent = owners[index].clone();
+        for (id, run) in runs.iter_mut() {
+            if run.owner == parent {
+                if let Some(cancel) = run.cancel.take() {
+                    let _ = cancel.send(());
+                }
+                owners.push(id.clone());
+            }
+        }
+        index += 1;
+    }
+}
+
+struct PreparedChild {
+    agent_id: String,
+    session_id: String,
+    task: String,
+    input: String,
+    options: RunOptions,
+    shell: Option<ShellReleaseGuard>,
+}
+
+async fn prepare_child(
+    loop_: &Arc<AgentLoop>,
+    caller: &ToolInvocation,
+    args: &str,
+) -> std::result::Result<PreparedChild, ToolError> {
     let error = |message: String| ToolError {
         tool: "delegate_task".into(),
         message,
     };
     let request: serde_json::Value =
-        serde_json::from_str(&args).map_err(|e| error(format!("invalid arguments: {e}")))?;
+        serde_json::from_str(args).map_err(|e| error(format!("invalid arguments: {e}")))?;
     let task = request
         .get("task")
         .and_then(|v| v.as_str())
@@ -523,6 +579,13 @@ async fn delegate(
         .get("context")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let inherited = loop_
+        .run_options
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(caller.agent_id.clone(), caller.session_id.clone()))
+        .cloned()
+        .ok_or_else(|| error("parent run is not active".into()))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let agent_id = format!("child-{id}");
     let session_id = format!("child-{id}");
@@ -543,21 +606,35 @@ async fn delegate(
         None
     };
     let input = format!("Task: {task}\n\nContext supplied by parent (untrusted data):\n{context}");
-    let inherited = loop_
-        .run_options
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(caller.agent_id.clone(), caller.session_id.clone()))
-        .cloned()
-        .ok_or_else(|| error("parent run is not active".into()))?;
     let options = RunOptions {
         allowed_tools: inherited.allowed_tools,
         max_iterations: inherited.max_iterations,
         model: inherited.model,
         instructions: Some("You are a child agent. Complete the delegated task and report evidence and limitations.".into()),
     };
-    let (mut events, cancel) = loop_.start_run(&agent_id, &session_id, input, options);
-    let mut guard = CancelOnDrop(Some(cancel));
+    Ok(PreparedChild {
+        agent_id,
+        session_id,
+        task: task.to_owned(),
+        input,
+        options,
+        shell: _shell_guard,
+    })
+}
+
+async fn finish_child(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    child: PreparedChild,
+    mut events: mpsc::Receiver<TurnEvent>,
+) -> String {
+    let PreparedChild {
+        agent_id,
+        session_id,
+        task,
+        shell: _shell_guard,
+        ..
+    } = child;
     let outcome = loop {
         match events.recv().await {
             Some(TurnEvent::Completed(_)) => break Ok(()),
@@ -566,7 +643,6 @@ async fn delegate(
             None => break Err("child stream ended without a terminal event".to_owned()),
         }
     };
-    guard.0.take();
     let (status, report) = match outcome {
         Ok(()) => {
             let answer = loop_
@@ -582,12 +658,112 @@ async fn delegate(
         Err(err) => ("failed", err),
     };
 
-    Ok(
-        serde_json::json!({"status":status,"task":task,"summary":report,
+    serde_json::json!({"status":status,"task":task,"summary":report,
         "parent_agent_id":caller.agent_id,"parent_session_id":caller.session_id,
         "parent_turn":caller.turn,"agent_id":agent_id,"session_id":session_id})
-        .to_string(),
-    )
+    .to_string()
+}
+
+async fn delegate(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    args: String,
+) -> std::result::Result<String, ToolError> {
+    let child = prepare_child(&loop_, &caller, &args).await?;
+    let (events, cancel) = loop_.start_run(
+        &child.agent_id,
+        &child.session_id,
+        child.input.clone(),
+        child.options.clone(),
+    );
+    let mut guard = CancelOnDrop(Some(cancel));
+    let result = finish_child(loop_, caller, child, events).await;
+    guard.0.take();
+    Ok(result)
+}
+
+async fn spawn_agent(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    args: String,
+) -> std::result::Result<String, ToolError> {
+    let child = prepare_child(&loop_, &caller, &args).await?;
+    let id = child.session_id.clone();
+    let (events, cancel) = loop_.start_run(
+        &child.agent_id,
+        &child.session_id,
+        child.input.clone(),
+        child.options.clone(),
+    );
+    loop_
+        .background
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id.clone(),
+            BackgroundRun {
+                owner: caller.session_id.clone(),
+                result: None,
+                delivered: false,
+                cancel: Some(cancel),
+            },
+        );
+    let manager = loop_.clone();
+    let run_id = id.clone();
+    tokio::spawn(async move {
+        let result = finish_child(loop_, caller, child, events).await;
+        if let Some(run) = manager
+            .background
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&run_id)
+        {
+            run.result = Some(result);
+            run.cancel.take();
+        }
+    });
+    Ok(serde_json::json!({"run_id":id,"session_id":id,"status":"running"}).to_string())
+}
+
+async fn background_control(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    args: String,
+    cancel: bool,
+) -> std::result::Result<String, ToolError> {
+    let tool = if cancel { "agent_cancel" } else { "agent_wait" };
+    let error = |message: &str| ToolError {
+        tool: tool.into(),
+        message: message.into(),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&args).map_err(|_| error("invalid arguments"))?;
+    let id = value
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error("run_id is required"))?;
+    loop {
+        {
+            let mut runs = loop_.background.lock().unwrap_or_else(|e| e.into_inner());
+            let run = runs
+                .get_mut(id)
+                .filter(|run| run.owner == caller.session_id)
+                .ok_or_else(|| error("run does not exist in this session"))?;
+            if let Some(result) = run.result.clone() {
+                run.delivered = true;
+                return Ok(result);
+            }
+            if cancel {
+                if let Some(sender) = run.cancel.take() {
+                    let _ = sender.send(());
+                }
+                return Ok(
+                    serde_json::json!({"run_id":id,"status":"cancellation_requested"}).to_string(),
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// Explicit batch delegation. Futures are joined within the parent tool future,
@@ -684,7 +860,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
         );
         let agent_loop = Arc::new(agent_loop);
         let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
-        let child_loop = agent_loop.clone();
+        let child_loop = Arc::downgrade(&agent_loop);
         registry.register_contextual(
             ToolSpec {
                 name: "delegate_task".into(),
@@ -695,11 +871,11 @@ impl harness_core::Plugin for AgentLoopPlugin {
                 },"required":["task"],"additionalProperties":false}),
             },
             Box::new(move |caller: ToolInvocation, args: String| {
-                let child_loop = child_loop.clone();
-                Box::pin(async move { delegate(child_loop, caller, args).await })
+                let child_loop = child_loop.upgrade();
+                Box::pin(async move { delegate(child_loop.ok_or_else(|| ToolError { tool: "delegate_task".into(), message: "agent loop unavailable".into() })?, caller, args).await })
             }),
         ).map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
-        let parallel_loop = agent_loop.clone();
+        let parallel_loop = Arc::downgrade(&agent_loop);
         registry.register_contextual(
             ToolSpec {
                 name: "delegate_tasks".into(),
@@ -711,10 +887,51 @@ impl harness_core::Plugin for AgentLoopPlugin {
                 },"required":["tasks"],"additionalProperties":false}),
             },
             Box::new(move |caller: ToolInvocation, args: String| {
-                let parallel_loop = parallel_loop.clone();
-                Box::pin(async move { delegate_parallel(parallel_loop, caller, args).await })
+                let parallel_loop = parallel_loop.upgrade();
+                Box::pin(async move { delegate_parallel(parallel_loop.ok_or_else(|| ToolError { tool: "delegate_tasks".into(), message: "agent loop unavailable".into() })?, caller, args).await })
             }),
         ).map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
+        for name in ["spawn_agent", "agent_wait", "agent_cancel"] {
+            let weak = Arc::downgrade(&agent_loop);
+            let parameters = if name == "spawn_agent" {
+                serde_json::json!({"type":"object","properties":{"task":{"type":"string"},"context":{"type":"string"}},"required":["task"],"additionalProperties":false})
+            } else {
+                serde_json::json!({"type":"object","properties":{"run_id":{"type":"string"}},"required":["run_id"],"additionalProperties":false})
+            };
+            let description = match name {
+                "spawn_agent" => {
+                    "Start an independent background child and return its run ID. Inherits a private fork of your current Bash shell; files remain shared. Supply all relevant context. Results enter your context before a later model request; use agent_wait if needed before answering."
+                }
+                "agent_wait" => {
+                    "Wait for a background child owned by this session and return its result. Suppresses duplicate automatic delivery."
+                }
+                _ => "Request cancellation of a background child owned by this session.",
+            };
+            registry
+                .register_contextual(
+                    ToolSpec {
+                        name: name.into(),
+                        description: description.into(),
+                        parameters,
+                    },
+                    Box::new(move |caller, args| {
+                        let manager = weak.upgrade();
+                        Box::pin(async move {
+                            let manager = manager.ok_or_else(|| ToolError {
+                                tool: name.into(),
+                                message: "agent loop unavailable".into(),
+                            })?;
+                            if name == "spawn_agent" {
+                                spawn_agent(manager, caller, args).await
+                            } else {
+                                background_control(manager, caller, args, name == "agent_cancel")
+                                    .await
+                            }
+                        })
+                    }),
+                )
+                .map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
+        }
         ctx.provide_key(KEY_AGENT_LOOP, agent_loop);
         Ok(())
     }

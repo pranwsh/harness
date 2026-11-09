@@ -801,3 +801,107 @@ async fn cancellation_records_results_for_all_unanswered_calls() {
         );
     }
 }
+
+#[tokio::test]
+async fn spawn_returns_handle_and_wait_returns_result_without_duplicate_delivery() {
+    struct SpawnModel;
+    impl ModelStreamerApi for SpawnModel {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            messages: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let is_child = messages
+                .iter()
+                .any(|m| m.content.starts_with("Task: background task"));
+            let reply = if is_child {
+                Message::assistant("background finding")
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("spawn"))
+            {
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "spawn".into(),
+                        name: "spawn_agent".into(),
+                        arguments: r#"{"task":"background task"}"#.into(),
+                    }],
+                )
+            } else if !messages
+                .iter()
+                .any(|m| m.call_id.as_deref() == Some("wait"))
+            {
+                let handle = messages
+                    .iter()
+                    .find(|m| m.call_id.as_deref() == Some("spawn"))
+                    .unwrap();
+                let handle: serde_json::Value = serde_json::from_str(&handle.content).unwrap();
+                assert_eq!(handle["status"], "running");
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "wait".into(),
+                        name: "agent_wait".into(),
+                        arguments: serde_json::json!({"run_id":handle["run_id"]}).to_string(),
+                    }],
+                )
+            } else {
+                Message::assistant("parent done")
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                if is_child {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let _ = tx.send(StreamEvent::Done(reply)).await;
+            });
+            rx
+        }
+    }
+    let ctx = Context::root();
+    ctx.load(
+        harness_config::ConfigPlugin::from_toml(
+            "[llm]\nbase_url='u'\nmodel='fake'\napi_key='k'\nuser_agent='a'\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ctx.load(harness_model::ModelPlugin).unwrap();
+    ctx.load(harness_agent::AgentPlugin).unwrap();
+    ctx.load(harness_session::SessionPlugin).unwrap();
+    ctx.load(harness_tools::ToolsPlugin).unwrap();
+    ctx.load(harness_system_prompt::SystemPromptPlugin::default())
+        .unwrap();
+    ctx.load(harness_agent_default_model::AgentDefaultModelPlugin)
+        .unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(SpawnModel))),
+    );
+    ctx.load(harness_agent_loop::AgentLoopPlugin).unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        drain(svc.run("parent", "spawn-parent", "go")),
+    )
+    .await
+    .unwrap();
+    assert!(
+        events.iter().any(|e| matches!(e, TurnEvent::Completed(_))),
+        "{events:?}"
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("spawn-parent");
+    let waited = history
+        .iter()
+        .find(|m| m.call_id.as_deref() == Some("wait"))
+        .unwrap();
+    assert!(waited.content.contains("background finding"));
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.content.starts_with("Background agent report"))
+    );
+}
