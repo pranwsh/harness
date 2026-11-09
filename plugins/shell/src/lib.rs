@@ -743,6 +743,34 @@ user_agent = "a"
     }
 
     #[tokio::test]
+    async fn session_cannot_poll_or_stop_another_sessions_job() {
+        let (_ctx, tools, svc) = ctx_with_shell();
+        let started = tools
+            .execute(
+                "a",
+                "owner",
+                1,
+                call("shell_start", serde_json::json!({"command":"sleep 30"})),
+            )
+            .await
+            .unwrap();
+        let id = started.split_whitespace().nth(1).unwrap();
+        for tool in ["shell_poll", "shell_stop"] {
+            let result = tools
+                .execute(
+                    "b",
+                    "other",
+                    1,
+                    call(tool, serde_json::json!({"job_id":id})),
+                )
+                .await;
+            assert!(result.is_err(), "{tool} unexpectedly allowed");
+        }
+        svc.release("owner").await;
+        svc.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn concurrent_child_shells_are_independent() {
         let svc = ShellService::new(ShellConfig::default());
         let timeout = Duration::from_secs(5);

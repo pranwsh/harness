@@ -12,7 +12,7 @@
 
 ## Phase 3: Parent delegation context and verification
 - [x] Keep delegation interactions in persistent session history and model context without compaction.
-- [ ] Verify complete tool-call/result pairs and provider-compatible message sequences.
+- [ ] Validate live-provider compatibility. Cancellation now persists a result for every unanswered tool call, with regression coverage.
 - [ ] Extend tests for failure reporting and cancellation propagation; parent/child isolation is covered.
 
 ## Phase 4: Parallel delegation
@@ -29,7 +29,7 @@
 - Per-run options are available on `AgentLoop::run_with_options`; legacy `run` keeps its defaults. Explicit policies are inherited by children.
 - `delegate_task` runs one child and `delegate_tasks` runs an explicit concurrent batch. Each child has its own session, receives supplied context, and returns a result with parent and child IDs. Nested delegation and all registered tools are available by default. All agents share the working directory; concurrent writes may conflict.
 - No child-specific hard timeout, output, tool, recursion, or concurrency restrictions are applied. Existing global iteration limits and tool approval policies remain in effect. Users can configure explicit per-run options through the API.
-- `run_cancellable` exposes cancellation to API callers; dropping a delegation future signals its children. The TUI does not yet offer cancellation. Aggregate budgets and independently managed background spawn/wait are not implemented.
+- `run_cancellable` exposes cancellation to API callers; dropping a delegation future signals its children. The TUI now cancels an active turn with Ctrl+C (Ctrl+C while idle quits). Aggregate budgets and independently managed background spawn/wait are not implemented.
 - Parent-child links are returned in the parent tool result and thus persist on successful tool completion; a standalone durable run catalog, interrupted-run recovery and UI navigation remain unimplemented.
 - No context compaction is performed. Full tool call/result pairs stay in parent history and model context.
 - Existing global execution paths do not provide OS-level isolation. Provider integration, cancellation propagation and real-workload evaluation still need additional tests.
@@ -52,3 +52,14 @@
 - Child state is inherited by the live subshell, including unexported variables, arrays, functions, aliases, options, cwd and umask. Native Bash subshell rules apply: PID-related variables change, caught traps reset, and job tables are not cloned.
 - Verified live state inheritance, independent mutations, nested forks, and existing delegation/shell tests. Files remain shared.
 - Further hardening remains for fork-handshake cancellation/failure cleanup, FIFO EOF/liveness handling, arbitrary shell options that interfere with the command protocol, and recovery of terminated forked shells. Do not describe this as bit-for-bit process cloning or production complete.
+
+## Production hardening progress
+- [x] Use nonblocking Tokio FIFO I/O; remove the output keeper after handshake so child exit produces EOF.
+- [x] Fail terminated inherited shells instead of silently replacing them with fresh Bash.
+- [x] Add fork setup cleanup guard and child PID handoff. Cancellation-race stress tests remain necessary.
+- [x] Add active-turn Ctrl+C cancellation to TUI and cancel on UI teardown.
+- [x] Preserve tool call/result pairing after turn cancellation.
+- [x] Restrict background job polling/stopping to the owning session and stop owned jobs on child release.
+- [ ] Harden all fork-setup races, reaping and PID-reuse handling; test arbitrary shell options and cancellation at every handshake stage.
+- [ ] Durable run catalog, interrupted-run recovery and independent background agent spawn/wait remain outstanding.
+- [ ] Resolve workspace test failures: latest run still fails 10 TUI view layout tests. Targeted agent-loop, shell and tool tests and harness compilation pass.
