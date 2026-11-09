@@ -46,3 +46,9 @@
 
 - Cancellation of a running shell command now marks its protocol stream dirty; the next command resets the process rather than consuming stale output. This loses that shell's state on cancellation.
 - Workspace test run currently fails 10 TUI view layout tests; investigate baseline/configuration before merge.
+
+## Live fork implementation
+- Replaced child state serialization with a native Bash subshell and private FIFO command/output channels. No new Bash executable is launched for a child.
+- Child state is inherited by the live subshell, including unexported variables, arrays, functions, aliases, options, cwd and umask. Native Bash subshell rules apply: PID-related variables change, caught traps reset, and job tables are not cloned.
+- Verified live state inheritance, independent mutations, nested forks, and existing delegation/shell tests. Files remain shared.
+- Further hardening remains for fork-handshake cancellation/failure cleanup, FIFO EOF/liveness handling, arbitrary shell options that interfere with the command protocol, and recovery of terminated forked shells. Do not describe this as bit-for-bit process cloning or production complete.

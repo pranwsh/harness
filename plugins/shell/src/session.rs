@@ -21,8 +21,8 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::env::{detach_tty, kill_process_group};
@@ -45,10 +45,50 @@ pub struct SessionOutput {
     pub err_omitted: u64,
 }
 
+enum ShellProcess {
+    Root(Child),
+    Fork {
+        pid: u32,
+        directory: std::path::PathBuf,
+    },
+}
+
+impl ShellProcess {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Root(child) => child.id(),
+            Self::Fork { pid, .. } => Some(*pid),
+        }
+    }
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Root(child) => child.start_kill(),
+            Self::Fork { pid, .. } => {
+                kill_process_group(Some(*pid));
+                Ok(())
+            }
+        }
+    }
+    fn alive(&mut self) -> bool {
+        match self {
+            Self::Root(child) => matches!(child.try_wait(), Ok(None)),
+            Self::Fork { pid, .. } => unsafe { libc::kill(*pid as i32, 0) == 0 },
+        }
+    }
+}
+impl Drop for ShellProcess {
+    fn drop(&mut self) {
+        kill_process_group(self.id());
+        if let Self::Fork { directory, .. } = self {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+}
+
 struct SessionState {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    child: ShellProcess,
+    stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    stdout: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
     seq: u64,
     in_flight: bool,
 }
@@ -70,7 +110,9 @@ impl BashSession {
         if let Some(mut state) = guard.take() {
             kill_process_group(state.child.id());
             let _ = state.child.start_kill();
-            let _ = state.child.wait().await;
+            if let ShellProcess::Root(child) = &mut state.child {
+                let _ = child.wait().await;
+            }
         }
     }
 
@@ -86,11 +128,75 @@ impl BashSession {
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         Ok(SessionState {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            child: ShellProcess::Root(child),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
             seq: 0,
             in_flight: false,
+        })
+    }
+
+    /// Fork Bash itself, without exec or serialization of its variables.
+    pub async fn fork(&self, timeout: Duration) -> Result<Self, String> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let directory = std::env::temp_dir().join(format!(
+            "harness-fork-{}-{}",
+            std::process::id(),
+            NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        let input = directory.join("in");
+        let output = directory.join("out");
+        for path in [&input, &output] {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .map_err(|e| e.to_string())?;
+            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        let open = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|e| e.to_string())
+        };
+        let writer = open(&input)?;
+        let reader = open(&output)?;
+        // Job control gives the fork an independent process group. Restore the
+        // parent's monitor setting before returning to its command protocol.
+        let script = format!(
+            r#"case $- in *m*) __harness_monitor=1;; *) __harness_monitor=0; set -m;; esac
+( if [[ $__harness_monitor == 0 ]]; then set +m; fi; unset __harness_monitor; builtin printf '%s\n' "$BASHPID"; while IFS= builtin read -r __harness_line; do builtin eval "$__harness_line"; done ) <{} >{} 2>/dev/null &
+if [[ $__harness_monitor == 0 ]]; then set +m; fi
+unset __harness_monitor"#,
+            sh_quote(&input.to_string_lossy()),
+            sh_quote(&output.to_string_lossy())
+        );
+        let out = self.run(&script, None, timeout, 65536).await?;
+        if out.timed_out || out.exit_code != Some(0) {
+            let _ = std::fs::remove_dir_all(&directory);
+            return Err("could not fork parent shell".into());
+        }
+        let mut stdout: BufReader<Box<dyn AsyncRead + Send + Unpin>> =
+            BufReader::new(Box::new(tokio::fs::File::from_std(reader)));
+        let mut pid = String::new();
+        tokio::time::timeout(timeout, stdout.read_line(&mut pid))
+            .await
+            .map_err(|_| "child shell handshake timed out".to_owned())?
+            .map_err(|e| e.to_string())?;
+        let pid = pid.trim().parse::<u32>().map_err(|e| e.to_string())?;
+        Ok(Self {
+            state: Mutex::new(Some(SessionState {
+                child: ShellProcess::Fork { pid, directory },
+                stdin: Box::new(tokio::fs::File::from_std(writer)),
+                stdout,
+                seq: 0,
+                in_flight: false,
+            })),
         })
     }
 
@@ -122,7 +228,13 @@ impl BashSession {
                 state.seq
             );
             let tmp = std::env::temp_dir().join(format!("harness-sh-{nonce}.err"));
-            let payload = build_payload(script, workdir, &tmp, &nonce);
+            let mut payload = build_payload(script, workdir, &tmp, &nonce);
+            if matches!(state.child, ShellProcess::Fork { .. }) {
+                // One line per request; Bash decodes bytes without invoking a
+                // fresh interpreter, preserving unexported state across calls.
+                let encoded: String = payload.bytes().map(|b| format!("\\x{b:02x}")).collect();
+                payload = format!("builtin eval $'{encoded}'");
+            }
             state.in_flight = true;
             match Self::attempt(state, &payload, &nonce, &tmp, timeout, cap).await {
                 Attempt::Done(out) => {
@@ -149,9 +261,9 @@ impl BashSession {
         let Some(state) = slot.as_mut() else {
             return false;
         };
-        match state.child.try_wait() {
-            Ok(None) => true,
-            _ => {
+        match state.child.alive() {
+            true => true,
+            false => {
                 *slot = None;
                 false
             }
@@ -212,7 +324,10 @@ impl BashSession {
                 // here: under load the kernel can deliver pipe EOF before
                 // the exiting process becomes waitable — a close-vs-exit
                 // race that flaked every `exit`-involving test.)
-                let code = state.child.wait().await.ok().and_then(|s| s.code());
+                let code = match &mut state.child {
+                    ShellProcess::Root(child) => child.wait().await.ok().and_then(|s| s.code()),
+                    _ => None,
+                };
                 // Reap so no zombie lingers; the slot is dropped by the
                 // caller path (respawn happens on the next run).
                 let (err, err_omit) = read_capped_tail(tmp, cap).await;
@@ -277,7 +392,7 @@ enum ReadOutcome {
 /// The marker line's pre-marker bytes belong to the command (missing
 /// trailing newline case); the exit code rides on the marker line.
 async fn read_until_marker(
-    stdout: &mut BufReader<ChildStdout>,
+    stdout: &mut BufReader<Box<dyn AsyncRead + Send + Unpin>>,
     marker: &str,
     cap: usize,
 ) -> ReadOutcome {
@@ -317,7 +432,10 @@ async fn read_until_marker(
 
 /// Best-effort drain of whatever stdout is already buffered (post-timeout).
 /// Reads with a short grace window; EOF or silence ends it.
-async fn take_partial_stdout(stdout: &mut BufReader<ChildStdout>, cap: usize) -> (Vec<u8>, u64) {
+async fn take_partial_stdout(
+    stdout: &mut BufReader<Box<dyn AsyncRead + Send + Unpin>>,
+    cap: usize,
+) -> (Vec<u8>, u64) {
     let mut ring = Ring::default();
     let mut buf = [0u8; 8192];
     loop {
@@ -397,6 +515,37 @@ mod tests {
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(sh_quote("o'clock"), "'o'\\''clock'");
+    }
+
+    #[tokio::test]
+    async fn live_fork_preserves_nonexported_arrays_aliases_and_functions() {
+        let parent = BashSession::new();
+        let timeout = Duration::from_secs(5);
+        let initialized = parent.run(r#"secret='not exported'; declare -A mapping=([key]='array value'); alias inherited_alias='printf alias-value'; inherited_fn() { printf '%s' "$secret"; }; shopt -s nullglob; umask 027"#, None, timeout, 65536).await.unwrap();
+        assert_eq!(initialized.exit_code, Some(0));
+        let child = parent.fork(timeout).await.unwrap();
+        let result = child.run(r#"printf '%s|%s|' "$secret" "${mapping[key]}"; inherited_fn; alias inherited_alias; shopt -q nullglob; printf '|%s' "$?"; umask; secret=changed"#, None, timeout, 65536).await.unwrap();
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            output.contains("not exported|array value|not exported"),
+            "{output}"
+        );
+        assert!(output.contains("alias-value"), "{output}");
+        assert!(output.contains("|00027"), "{output}");
+        let parent_result = parent
+            .run(r#"printf '%s' "$secret""#, None, timeout, 65536)
+            .await
+            .unwrap();
+        assert_eq!(parent_result.stdout, b"not exported");
+        let grandchild = child.fork(timeout).await.unwrap();
+        let result = grandchild
+            .run(r#"printf '%s' "$secret""#, None, timeout, 65536)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, b"changed");
+        grandchild.shutdown().await;
+        child.shutdown().await;
+        parent.shutdown().await;
     }
 
     #[tokio::test]

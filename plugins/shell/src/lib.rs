@@ -268,30 +268,7 @@ impl ShellScopeApi for ShellService {
         let child_id = child_session.to_owned();
         let timeout = Duration::from_millis(self.cfg.max_timeout_ms.max(1));
         Box::pin(async move {
-            // Serialization occurs inside the parent BashSession mutex, giving a
-            // consistent point-in-time snapshot relative to shell_exec calls.
-            let snapshot = parent
-                .run(
-                    r#"printf 'cd -- %q\n' "$PWD"; export -p; declare -f"#,
-                    None,
-                    timeout,
-                    4 * 1024 * 1024,
-                )
-                .await?;
-            if snapshot.timed_out || snapshot.exit_code != Some(0) || snapshot.out_omitted != 0 {
-                return Err("could not capture complete parent shell state".into());
-            }
-            let script = String::from_utf8(snapshot.stdout)
-                .map_err(|_| "shell snapshot was not UTF-8".to_owned())?;
-            let child = Arc::new(BashSession::new());
-            let initialized = child.run(&script, None, timeout, 4 * 1024 * 1024).await?;
-            if initialized.timed_out || initialized.exit_code != Some(0) {
-                child.shutdown().await;
-                return Err(format!(
-                    "could not initialize child shell: {}",
-                    String::from_utf8_lossy(&initialized.stderr)
-                ));
-            }
+            let child = Arc::new(parent.fork(timeout).await?);
             let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
             if map.contains_key(&child_id) {
                 return Err("child shell already exists".into());
