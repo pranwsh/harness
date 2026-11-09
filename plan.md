@@ -10,10 +10,10 @@
 - [ ] Capture structured terminal results; drain streams, enforce limits, and handle failures, timeouts and cancellation.
 - [ ] Track parent-child relationships and test read-only isolation.
 
-## Phase 3: Parent context compaction
-- [ ] Keep full delegation interactions in persistent session history.
-- [x] Replace completed delegation call/result pairs with clearly labelled reports in the parent model context (result bounding and structured rendering remain).
-- [ ] Test mixed calls, failures, ordering and provider-compatible messages.
+## Phase 3: Parent delegation context and verification
+- [ ] Keep delegation interactions in persistent session history and model context without compaction.
+- [ ] Verify complete tool-call/result pairs and provider-compatible message sequences.
+- [ ] Test failure reporting, ordering, and parent/child context isolation.
 
 ## Phase 4: Parallel delegation
 - [ ] Add spawn/wait, concurrency and aggregate budgets, cancellation and isolation tests.
@@ -25,6 +25,6 @@
 ## Progress notes
 
 - Per-run options are available on `AgentLoop::run_with_options`; legacy `run` keeps its defaults. Tool denials are recorded as tool results.
-- Prompt assembly compacts completed `delegate_task` call/result pairs without changing stored history. Mixed and incomplete calls have unit coverage; provider integration and result-size limits remain.
+- Context compaction has been removed. Delegation interactions will follow the normal tool-call/result history path; verify provider compatibility once delegation is implemented.
 - Coordinator and tool are not implemented. The existing tool handler API only receives argument JSON, not the caller's agent/session/turn; extend the tool contract safely before implementing parent-child linkage. Define cancellation, timeout and persistent run metadata before enabling delegation.
 - The loop-level tool allowlist is not a security boundary against independent direct use of the shared executor; delegation must use the scoped path and avoid granting child code direct executor access.
