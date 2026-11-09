@@ -127,6 +127,18 @@ impl AgentLoop {
         rx
     }
 
+    /// Start a turn with an explicit cancellation handle. Sending cancellation
+    /// drops in-flight tool futures, including child delegation futures.
+    pub fn run_cancellable(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        input: impl Into<String>,
+        options: RunOptions,
+    ) -> (mpsc::Receiver<TurnEvent>, tokio::sync::oneshot::Sender<()>) {
+        self.start_run(agent_id, session_id, input, options)
+    }
+
     fn start_run(
         &self,
         agent_id: &str,

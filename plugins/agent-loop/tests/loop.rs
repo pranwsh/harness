@@ -650,3 +650,57 @@ async fn child_inherits_parent_tool_allowlist() {
                 && entry.content.contains("denied by run tool policy"))
     );
 }
+
+#[tokio::test]
+async fn cancellation_closes_turn_and_reports_failure() {
+    struct PendingModel;
+    impl ModelStreamerApi for PendingModel {
+        fn stream(
+            self: Arc<Self>,
+            _: &str,
+            _: &[Message],
+            _: &[ToolSpec],
+        ) -> tokio::sync::mpsc::Receiver<StreamEvent> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                let _held = tx;
+                std::future::pending::<()>().await;
+            });
+            rx
+        }
+    }
+    let ctx = setup(vec![], 8);
+    // AgentLoop captured its streamer at construction, so rebuild the plugin.
+    ctx.unload("agent-loop").unwrap();
+    ctx.provide_key(
+        KEY_MODEL_STREAMER,
+        Arc::new(ModelStreamerHandle(Arc::new(PendingModel))),
+    );
+    // Existing tool registrations survive unload; construct the loop directly.
+    let svc = AgentLoop::new(
+        ctx.clone(),
+        ctx.inject_key(harness_contracts::KEY_AGENTS_API).unwrap(),
+        ctx.inject_key(harness_contracts::KEY_SESSION_STORE)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_TOOL_EXECUTOR)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_PROMPT_ASSEMBLER)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_MODEL_SELECTOR_API)
+            .unwrap(),
+        ctx.inject_key(harness_contracts::KEY_MODEL_STREAMER)
+            .unwrap(),
+    );
+    let (mut events, cancel) =
+        svc.run_cancellable("cancel-agent", "cancel-session", "test", Default::default());
+    while !matches!(events.recv().await, Some(TurnEvent::Started)) {}
+    cancel.send(()).unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), drain(events))
+        .await
+        .unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, TurnEvent::Failed(message) if message.contains("cancelled"))
+        )
+    );
+}
