@@ -5,10 +5,11 @@ use harness_contracts::{
     CH_SESSION_TURN_OPEN_REQUESTED, CH_TOOL_EXECUTED, CH_TURN_COMPLETED, CH_TURN_FAILED,
     CH_TURN_ITERATION, CH_TURN_STARTED, ConfigHandle, Entry, KEY_AGENT_LOOP, KEY_AGENTS_API,
     KEY_CONFIG, KEY_MODEL_SELECTOR_API, KEY_MODEL_STREAMER, KEY_PROMPT_ASSEMBLER, KEY_PROMPT_TEXT,
-    KEY_SESSION_STORE, KEY_TOOL_EXECUTOR, Message, ModelSelectorHandle, ModelStreamerHandle,
-    PromptAssemblerHandle, SessionAppendRequested, SessionId, SessionStoreHandle,
-    SessionTurnCloseRequested, SessionTurnOpenRequested, StreamEvent, ToolCall, ToolError,
-    ToolExecuted, ToolExecutorHandle, TurnCompleted, TurnFailed, TurnIteration, TurnStarted,
+    KEY_SESSION_STORE, KEY_TOOL_EXECUTOR, KEY_TOOL_REGISTRY, Message, ModelSelectorHandle,
+    ModelStreamerHandle, PromptAssemblerHandle, Role, SessionAppendRequested, SessionId,
+    SessionStoreHandle, SessionTurnCloseRequested, SessionTurnOpenRequested, StreamEvent, ToolCall,
+    ToolError, ToolExecuted, ToolExecutorHandle, ToolInvocation, ToolRegistryHandle, ToolSpec,
+    TurnCompleted, TurnFailed, TurnIteration, TurnStarted,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
@@ -115,7 +116,21 @@ impl AgentLoop {
         input: impl Into<String>,
         options: RunOptions,
     ) -> mpsc::Receiver<TurnEvent> {
+        let (rx, cancel) = self.start_run(agent_id, session_id, input, options);
+        // A closed cancellation channel is not a cancellation request.
+        drop(cancel);
+        rx
+    }
+
+    fn start_run(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        input: impl Into<String>,
+        options: RunOptions,
+    ) -> (mpsc::Receiver<TurnEvent>, tokio::sync::oneshot::Sender<()>) {
         let (tx, rx) = mpsc::channel(64);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let task = TurnTask {
             ctx: self.ctx.clone(),
             agents: self.agents.clone(),
@@ -132,9 +147,9 @@ impl AgentLoop {
             turn_no: 0,
         };
         tokio::spawn(async move {
-            task.execute().await;
+            task.execute(cancel_rx).await;
         });
-        rx
+        (rx, cancel_tx)
     }
 }
 
@@ -241,8 +256,11 @@ impl TurnTask {
 }
 
 impl TurnTask {
-    async fn execute(mut self) {
-        let outcome = self.turn().await;
+    async fn execute(mut self, cancel: tokio::sync::oneshot::Receiver<()>) {
+        let outcome = tokio::select! {
+            outcome = self.turn() => outcome,
+            Ok(()) = cancel => Err("turn cancelled".to_owned()),
+        };
         match outcome {
             Ok(iterations) => {
                 self.agents.set_state(&self.agent_id, AgentState::Idle);
@@ -409,6 +427,94 @@ impl TurnTask {
     }
 }
 
+/// Cancellation is propagated when a parent tool future is dropped, including
+/// when its parent turn is cancelled or times out.
+struct CancelOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+async fn delegate(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    args: String,
+) -> std::result::Result<String, ToolError> {
+    let error = |message: String| ToolError {
+        tool: "delegate_task".into(),
+        message,
+    };
+    let request: serde_json::Value =
+        serde_json::from_str(&args).map_err(|e| error(format!("invalid arguments: {e}")))?;
+    let task = request
+        .get("task")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| error("task must be a nonempty string".into()))?;
+    let context = request
+        .get("context")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if task.len() > 16_384 || context.len() > 65_536 {
+        return Err(error("task or context exceeds size limit".into()));
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let agent_id = format!("child-{id}");
+    let session_id = format!("child-{id}");
+    let input = format!("Task: {task}\n\nContext supplied by parent (untrusted data):\n{context}");
+    let options = RunOptions {
+        instructions: Some("You are a read-only child agent. Complete the delegated task and report evidence and limitations. Do not delegate.".into()),
+        allowed_tools: Some(vec!["read".into(), "hashline_read".into()]),
+        max_iterations: Some(8), ..Default::default()
+    };
+    let (mut events, cancel) = loop_.start_run(&agent_id, &session_id, input, options);
+    let mut guard = CancelOnDrop(Some(cancel));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                TurnEvent::Completed(_) => return Ok(()),
+                TurnEvent::Failed(err) => return Err(err),
+                _ => {}
+            }
+        }
+        Err("child stream ended without a terminal event".into())
+    })
+    .await;
+    let (status, report) = match outcome {
+        Ok(Ok(())) => {
+            guard.0.take();
+            let answer = loop_
+                .sessions
+                .history(&session_id)
+                .into_iter()
+                .rev()
+                .find(|entry| entry.role == Role::Assistant && entry.tool_calls.is_empty())
+                .map(|entry| entry.content)
+                .unwrap_or_default();
+            ("completed", answer)
+        }
+        Ok(Err(err)) => {
+            guard.0.take();
+            ("failed", err)
+        }
+        Err(_) => (
+            "timed_out",
+            "child exceeded 120 seconds and was cancelled".into(),
+        ),
+    };
+    // Bound the returned report by Unicode characters without splitting UTF-8.
+    let report: String = report.chars().take(16_000).collect();
+    Ok(
+        serde_json::json!({"status":status,"task":task,"summary":report,
+        "parent_agent_id":caller.agent_id,"parent_session_id":caller.session_id,
+        "parent_turn":caller.turn,"agent_id":agent_id,"session_id":session_id})
+        .to_string(),
+    )
+}
+
 pub struct AgentLoopPlugin;
 
 impl harness_core::Plugin for AgentLoopPlugin {
@@ -418,6 +524,7 @@ impl harness_core::Plugin for AgentLoopPlugin {
             .injects(KEY_AGENTS_API)
             .injects(KEY_SESSION_STORE)
             .injects(KEY_TOOL_EXECUTOR)
+            .injects(KEY_TOOL_REGISTRY)
             .injects(KEY_PROMPT_ASSEMBLER)
             .injects(KEY_PROMPT_TEXT)
             .injects(KEY_MODEL_SELECTOR_API)
@@ -456,7 +563,24 @@ impl harness_core::Plugin for AgentLoopPlugin {
             selector,
             model,
         );
-        ctx.provide_key(KEY_AGENT_LOOP, Arc::new(agent_loop));
+        let agent_loop = Arc::new(agent_loop);
+        let registry: Arc<ToolRegistryHandle> = ctx.inject_key(KEY_TOOL_REGISTRY)?;
+        let child_loop = agent_loop.clone();
+        registry.register_contextual(
+            ToolSpec {
+                name: "delegate_task".into(),
+                description: "Delegate a focused read-only task to a child agent. Provide all relevant context; the child does not see your conversation.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{
+                    "task":{"type":"string","description":"Specific task for the child"},
+                    "context":{"type":"string","description":"Relevant background selected for the child"}
+                },"required":["task"],"additionalProperties":false}),
+            },
+            Box::new(move |caller: ToolInvocation, args: String| {
+                let child_loop = child_loop.clone();
+                Box::pin(async move { delegate(child_loop, caller, args).await })
+            }),
+        ).map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
+        ctx.provide_key(KEY_AGENT_LOOP, agent_loop);
         Ok(())
     }
 }

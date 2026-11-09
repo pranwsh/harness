@@ -477,3 +477,99 @@ async fn run_iteration_limit_cannot_exceed_global_limit() {
             .any(|event| matches!(event, TurnEvent::Failed(e) if e.contains("max iterations (1)")))
     );
 }
+
+#[tokio::test]
+async fn delegation_creates_separate_child_session_and_preserves_parent_tool_pair() {
+    let delegate = ToolCall {
+        id: "delegate-1".into(),
+        name: "delegate_task".into(),
+        arguments: r#"{"task":"inspect the repo","context":"only this context"}"#.into(),
+    };
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls("", vec![delegate]),
+            Message::assistant("child finding"),
+            Message::assistant("parent answer"),
+        ],
+        8,
+    );
+    let loop_svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(loop_svc.run("parent", "parent-session", "private parent request")).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Completed(_)))
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let parent = sessions.history("parent-session");
+    let result = parent
+        .iter()
+        .find(|entry| entry.call_id.as_deref() == Some("delegate-1"))
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(report["status"], "completed");
+    assert_eq!(report["summary"], "child finding");
+    assert_eq!(report["parent_session_id"], "parent-session");
+    assert!(
+        parent
+            .iter()
+            .any(|entry| entry.tool_calls.iter().any(|call| call.id == "delegate-1"))
+    );
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert!(
+        child
+            .iter()
+            .any(|entry| entry.content.contains("only this context"))
+    );
+    assert!(
+        !child
+            .iter()
+            .any(|entry| entry.content.contains("private parent request"))
+    );
+    assert!(!parent.iter().any(|entry| entry.content == "child finding"));
+}
+
+#[tokio::test]
+async fn child_cannot_recursively_delegate() {
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "outer".into(),
+                    name: "delegate_task".into(),
+                    arguments: r#"{"task":"inspect"}"#.into(),
+                }],
+            ),
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "inner".into(),
+                    name: "delegate_task".into(),
+                    arguments: r#"{"task":"nested"}"#.into(),
+                }],
+            ),
+            Message::assistant("child completed"),
+            Message::assistant("parent completed"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "parent-session", "hello")).await;
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::ToolResult(_, Ok(report)) => Some(report),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert!(
+        child
+            .iter()
+            .any(|entry| entry.call_id.as_deref() == Some("inner")
+                && entry.content.contains("denied by run tool policy"))
+    );
+}

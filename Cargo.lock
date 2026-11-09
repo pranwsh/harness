@@ -776,6 +776,7 @@ dependencies = [
  "harness-tools",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
