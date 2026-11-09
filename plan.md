@@ -3,20 +3,22 @@
 ## Phase 1: Per-run context and policy
 - [x] Add per-run prompt, model and iteration configuration without changing existing defaults.
 - [x] Filter advertised tools and enforce the same allowlist on execution.
-- [ ] Test isolation and compatibility with single-agent runs.
+- [x] Test isolation and compatibility with single-agent runs.
 
 ## Phase 2: One child at a time
 - [x] Add a delegation tool with separate child sessions and explicit context (currently coordinated in agent-loop).
 - [ ] Capture structured terminal results; drain streams, enforce limits, and handle failures, timeouts and cancellation.
-- [ ] Track parent-child relationships and test read-only isolation.
+- [ ] Track parent-child relationships durably, including interrupted runs.
 
 ## Phase 3: Parent delegation context and verification
 - [x] Keep delegation interactions in persistent session history and model context without compaction.
 - [ ] Verify complete tool-call/result pairs and provider-compatible message sequences.
-- [ ] Test failure reporting, ordering, and parent/child context isolation.
+- [ ] Extend tests for failure reporting and cancellation propagation; parent/child isolation is covered.
 
 ## Phase 4: Parallel delegation
-- [ ] Add spawn/wait, concurrency and aggregate budgets, cancellation and isolation tests.
+- [x] Add explicit parallel batch delegation and isolation tests.
+- [ ] Add independently managed spawn/wait, persistent run tracking, and cancellation UI.
+- [ ] Decide whether optional configurable concurrency and aggregate budgets are desirable (no hard subagent limits by default).
 
 ## Phase 5: Evaluate and expand
 - [ ] Evaluate quality, latency and cost against single-agent runs.
@@ -24,8 +26,10 @@
 
 ## Progress notes
 
-- Per-run options are available on `AgentLoop::run_with_options`; legacy `run` keeps its defaults. Tool denials are recorded as tool results.
-- Context compaction has been removed. Delegation interactions will follow the normal tool-call/result history path; verify provider compatibility once delegation is implemented.
-- Synchronous `delegate_task` is implemented with caller-aware handlers, fresh child sessions, read-only tool names, a 120-second timeout, and bounded output. Parent-child IDs are recorded in the parent tool result; standalone durable run metadata and UI are not implemented. Parent turn cancellation is not exposed publicly; dropped delegation futures signal child cancellation. Timeout and cancellation require further end-to-end tests.
-- Parallel delegation, aggregate budgets, restart recovery and real-provider validation remain unimplemented.
-- The loop-level tool allowlist is not a security boundary against independent direct use of the shared executor; delegation must use the scoped path and avoid granting child code direct executor access.
+- Per-run options are available on `AgentLoop::run_with_options`; legacy `run` keeps its defaults. Explicit policies are inherited by children.
+- `delegate_task` runs one child and `delegate_tasks` runs an explicit concurrent batch. Each child has its own session, receives supplied context, and returns a result with parent and child IDs. Nested delegation and all registered tools are available by default. All agents share the working directory; concurrent writes may conflict.
+- No child-specific hard timeout, output, tool, recursion, or concurrency restrictions are applied. Existing global iteration limits and tool approval policies remain in effect. Users can configure explicit per-run options through the API.
+- `run_cancellable` exposes cancellation to API callers; dropping a delegation future signals its children. The TUI does not yet offer cancellation. Aggregate budgets and independently managed background spawn/wait are not implemented.
+- Parent-child links are returned in the parent tool result and thus persist on successful tool completion; a standalone durable run catalog, interrupted-run recovery and UI navigation remain unimplemented.
+- No context compaction is performed. Full tool call/result pairs stay in parent history and model context.
+- Existing global execution paths do not provide OS-level isolation. Provider integration, cancellation propagation and real-workload evaluation still need additional tests.
