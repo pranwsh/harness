@@ -530,6 +530,50 @@ async fn delegate(
     )
 }
 
+/// Explicit batch delegation. Futures are joined within the parent tool future,
+/// so dropping that future signals cancellation to every in-flight child.
+async fn delegate_parallel(
+    loop_: Arc<AgentLoop>,
+    caller: ToolInvocation,
+    args: String,
+) -> std::result::Result<String, ToolError> {
+    let error = |message: String| ToolError {
+        tool: "delegate_tasks".into(),
+        message,
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&args).map_err(|e| error(format!("invalid arguments: {e}")))?;
+    let tasks = value
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| error("tasks must be a nonempty array".into()))?;
+    // Validate the complete batch before starting any child.
+    if tasks.iter().any(|task| {
+        task.get("task")
+            .and_then(|v| v.as_str())
+            .is_none_or(|v| v.trim().is_empty())
+    }) {
+        return Err(error("each task must have a nonempty task string".into()));
+    }
+    let results = futures::future::join_all(
+        tasks
+            .iter()
+            .map(|task| delegate(loop_.clone(), caller.clone(), task.to_string())),
+    )
+    .await;
+    let results: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|result| match result {
+            Ok(json) => serde_json::from_str(&json).unwrap_or_else(
+                |_| serde_json::json!({"status":"failed", "summary":"invalid child result"}),
+            ),
+            Err(error) => serde_json::json!({"status":"failed", "summary":error.message}),
+        })
+        .collect();
+    Ok(serde_json::json!({"results":results}).to_string())
+}
+
 pub struct AgentLoopPlugin;
 
 impl harness_core::Plugin for AgentLoopPlugin {
@@ -593,6 +637,22 @@ impl harness_core::Plugin for AgentLoopPlugin {
             Box::new(move |caller: ToolInvocation, args: String| {
                 let child_loop = child_loop.clone();
                 Box::pin(async move { delegate(child_loop, caller, args).await })
+            }),
+        ).map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
+        let parallel_loop = agent_loop.clone();
+        registry.register_contextual(
+            ToolSpec {
+                name: "delegate_tasks".into(),
+                description: "Run independent child tasks concurrently. Children share the working directory and can modify the same files; choose non-conflicting tasks. Each child receives only its task and supplied context.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{
+                    "tasks":{"type":"array","items":{"type":"object","properties":{
+                        "task":{"type":"string"}, "context":{"type":"string"}
+                    },"required":["task"],"additionalProperties":false}}
+                },"required":["tasks"],"additionalProperties":false}),
+            },
+            Box::new(move |caller: ToolInvocation, args: String| {
+                let parallel_loop = parallel_loop.clone();
+                Box::pin(async move { delegate_parallel(parallel_loop, caller, args).await })
             }),
         ).map_err(|e| harness_core::Error::PluginPanicked("agent-loop".into(), e))?;
         ctx.provide_key(KEY_AGENT_LOOP, agent_loop);

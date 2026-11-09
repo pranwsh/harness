@@ -12,6 +12,7 @@ harness-core = { path = "../../core" }
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 harness-agent = { path = "../agent" }

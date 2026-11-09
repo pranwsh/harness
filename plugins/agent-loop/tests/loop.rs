@@ -566,3 +566,87 @@ async fn child_can_use_registered_tools() {
                 && entry.content.contains("echo:"))
     );
 }
+
+#[tokio::test]
+async fn parallel_delegation_returns_separate_sessions_in_task_order() {
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "batch".into(),
+                    name: "delegate_tasks".into(),
+                    arguments: r#"{"tasks":[{"task":"first"},{"task":"second"}]}"#.into(),
+                }],
+            ),
+            Message::assistant("answer one"),
+            Message::assistant("answer two"),
+            Message::assistant("parent done"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "parent-session", "hello")).await;
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult(call, Ok(result)) if call.id == "batch" => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["task"], "first");
+    assert_eq!(results[1]["task"], "second");
+    assert_ne!(results[0]["session_id"], results[1]["session_id"]);
+    assert!(results.iter().all(|result| result["status"] == "completed"));
+}
+
+#[tokio::test]
+async fn child_inherits_parent_tool_allowlist() {
+    use harness_agent_loop::RunOptions;
+    let ctx = setup(
+        vec![
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "outer".into(),
+                    name: "delegate_task".into(),
+                    arguments: r#"{"task":"inspect"}"#.into(),
+                }],
+            ),
+            Message::assistant_with_calls("", vec![fake_tool_call("denied")]),
+            Message::assistant("child done"),
+            Message::assistant("parent done"),
+        ],
+        8,
+    );
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run_with_options(
+        "parent",
+        "parent-session",
+        "hello",
+        RunOptions {
+            allowed_tools: Some(vec!["delegate_task".into()]),
+            ..Default::default()
+        },
+    ))
+    .await;
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult(_, Ok(report)) => Some(report),
+            _ => None,
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(report).unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    assert!(
+        sessions
+            .history(report["session_id"].as_str().unwrap())
+            .iter()
+            .any(|entry| entry.call_id.as_deref() == Some("denied")
+                && entry.content.contains("denied by run tool policy"))
+    );
+}

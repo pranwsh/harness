@@ -765,6 +765,7 @@ dependencies = [
 name = "harness-agent-loop"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "harness-agent",
  "harness-agent-default-model",
  "harness-config",
