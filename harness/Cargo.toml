@@ -17,10 +17,12 @@ harness-file-tools = { path = "../plugins/file-tools" }
 harness-system-prompt = { path = "../plugins/system-prompt" }
 harness-agent-default-model = { path = "../plugins/agent-default-model" }
 harness-agent-loop = { path = "../plugins/agent-loop" }
+harness-sudo-policy = { path = "../plugins/sudo-policy" }
 harness-shell = { path = "../plugins/shell" }
 harness-mcp = { path = "../plugins/mcp" }
 harness-tui-markdown = { path = "../plugins/tui-markdown" }
 harness-tui-input = { path = "../plugins/tui-input" }
+harness-tui-sudo = { path = "../plugins/tui-sudo" }
 harness-tui-popup = { path = "../plugins/tui-popup" }
 harness-tui-model = { path = "../plugins/tui-model" }
 harness-tui-commands = { path = "../plugins/tui-commands" }

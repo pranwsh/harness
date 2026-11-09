@@ -20,6 +20,8 @@ use harness_core::{Context, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivePopup {
     pub title: String,
+    /// Optional informational text displayed above the choices.
+    pub info: Option<String>,
     pub items: Vec<String>,
     /// Cursor row the arrow keys move.
     pub selected: usize,
@@ -35,6 +37,7 @@ pub struct ActivePopup {
 struct Inner {
     open: bool,
     title: String,
+    info: Option<String>,
     items: Vec<String>,
     selected: usize,
     current: Option<String>,
@@ -68,10 +71,27 @@ impl Popup {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.open = true;
         state.title = title.into();
+        state.info = None;
         state.items = items;
         state.selected = selected.min(state.items.len().saturating_sub(1));
         state.current = current;
         state.dim = dim;
+    }
+
+    /// Update the title without replacing the selection or info.
+    pub fn set_title(&self, title: impl Into<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.open {
+            state.title = title.into();
+        }
+    }
+
+    /// Update the optional informational section of an open popup.
+    pub fn set_info(&self, info: Option<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.open {
+            state.info = info;
+        }
     }
 
     /// Closes the popup and clears its contents.
@@ -92,6 +112,7 @@ impl Popup {
         }
         Some(ActivePopup {
             title: state.title.clone(),
+            info: state.info.clone(),
             items: state.items.clone(),
             selected: state.selected.min(state.items.len().saturating_sub(1)),
             current: state.current.clone(),
@@ -207,10 +228,7 @@ mod tests {
             Some("a".into()),
             vec![false, true],
         );
-        assert_eq!(
-            p.snapshot().expect("open").dim,
-            vec![false, true]
-        );
+        assert_eq!(p.snapshot().expect("open").dim, vec![false, true]);
         p.refresh_items(
             vec!["a".into(), "b".into(), "c".into()],
             Some("a".into()),

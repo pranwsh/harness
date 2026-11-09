@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use crate::{AgentState, BranchNode, Entry, Message, SessionSummary, ToolCall, ToolError, ToolSpec};
+use crate::{
+    AgentState, BranchNode, Entry, Message, SessionSummary, ToolCall, ToolError, ToolSpec,
+};
 
 /// Boxed future for object-safe async service methods.
 pub type BoxFuture<T> = futures::future::BoxFuture<'static, T>;
@@ -270,7 +272,6 @@ impl std::ops::Deref for ModelSelectorHandle {
     }
 }
 
-
 // ---- skills ------------------------------------------------------------------
 
 /// Read + registration surface for Agent Skills (progressive disclosure).
@@ -336,3 +337,36 @@ impl std::ops::Deref for ConfigHandle {
         &*self.0
     }
 }
+
+/// Policy for explicit sudo requests. This is not an OS security boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SudoMode {
+    #[default]
+    Block,
+    Ask,
+    AllowForSession,
+}
+
+/// Trusted frontends may change session policy; tool calls must not have access.
+pub trait SudoPolicyApi: Send + Sync + 'static {
+    fn mode(&self, session_id: &str) -> SudoMode;
+    fn set_mode(&self, session_id: &str, mode: SudoMode);
+    fn reset(&self, session_id: &str);
+}
+
+pub struct SudoPolicyHandle(pub Arc<dyn SudoPolicyApi>);
+
+/// A pending, immutable foreground approval request shown to a trusted user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SudoApprovalRequest {
+    pub id: u64,
+    pub session_id: String,
+    pub details: String,
+}
+
+pub trait SudoApprovalApi: Send + Sync + 'static {
+    fn pending(&self, session_id: &str) -> Option<SudoApprovalRequest>;
+    fn respond(&self, session_id: &str, id: u64, allow: bool);
+    fn cancel_session(&self, session_id: &str);
+}
+pub struct SudoApprovalHandle(pub Arc<dyn SudoApprovalApi>);

@@ -129,7 +129,7 @@ pub const CH_SESSION_APPEND_REQUESTED: &str = "session.append_requested";
 pub const CH_TOOL_REGISTERED: &str = "tool.registered";
 /// `ToolExecuted` — a tool call finished (result carries Ok/Err).
 pub const CH_TOOL_EXECUTED: &str = "tool.executed";
-/// `ToolApproval` — waterfall gate before a tool runs. Handlers may rewrite
+/// `ToolApproval` — waterfall gate before a tool runs. Handlers may inspect
 /// `call` or set `denied` to veto. No handlers = allow as-is.
 pub const CH_TOOL_APPROVAL: &str = "tool.approval";
 
@@ -158,3 +158,10 @@ pub const CH_TURN_ITERATION: &str = "turn.iteration";
 pub const CH_TURN_COMPLETED: &str = "turn.completed";
 /// `TurnFailed` — a loop turn aborted with an error.
 pub const CH_TURN_FAILED: &str = "turn.failed";
+
+/// Session-scoped sudo approval policy, provided by `sudo-policy`.
+pub const KEY_SUDO_POLICY: &str = "policy.sudo";
+/// UI-facing pending sudo confirmations.
+pub const KEY_SUDO_APPROVAL: &str = "policy.sudo_approval";
+/// Sudo mode and confirmation UI provider.
+pub const KEY_SUDO_POPUP: &str = "ui.sudo_popup";

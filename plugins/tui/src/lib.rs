@@ -18,19 +18,20 @@ use std::sync::Arc;
 
 use harness_contracts::{
     KEY_AGENT_LOOP, KEY_BRANCH_POPUP, KEY_COMMAND_POPUP, KEY_INPUT, KEY_MARKDOWN_RENDERER,
-    KEY_MODEL_POPUP, KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_TUI,
-    SessionStoreHandle, SessionTreeHandle,
+    KEY_MODEL_POPUP, KEY_SESSION_POPUP, KEY_SESSION_STORE, KEY_SESSION_TREE, KEY_SUDO_POPUP,
+    KEY_TUI, SessionStoreHandle, SessionTreeHandle,
 };
 use harness_core::{Context, Result};
 use tokio::sync::mpsc;
 
 use harness_agent_loop::AgentLoop;
+use harness_tui_branch::BranchPopup;
 use harness_tui_commands::CommandPopup;
 use harness_tui_input::Input;
 use harness_tui_model::ModelPopup;
-use harness_tui_branch::BranchPopup;
 use harness_tui_sessions::SessionPopup;
 use harness_tui_state::render::RendererHandle;
+use harness_tui_sudo::SudoPopup;
 
 pub mod runtime;
 pub mod view;
@@ -50,6 +51,7 @@ pub struct Tui {
     command_popup: Arc<CommandPopup>,
     session_popup: Arc<SessionPopup>,
     branch_popup: Arc<BranchPopup>,
+    sudo_popup: Arc<SudoPopup>,
     done: mpsc::Sender<()>,
 }
 
@@ -67,6 +69,7 @@ impl Tui {
         command_popup: Arc<CommandPopup>,
         session_popup: Arc<SessionPopup>,
         branch_popup: Arc<BranchPopup>,
+        sudo_popup: Arc<SudoPopup>,
         done: mpsc::Sender<()>,
     ) -> Self {
         Tui {
@@ -81,6 +84,7 @@ impl Tui {
             command_popup,
             session_popup,
             branch_popup,
+            sudo_popup,
             done,
         }
     }
@@ -100,6 +104,7 @@ impl Tui {
             self.command_popup.clone(),
             self.session_popup.clone(),
             self.branch_popup.clone(),
+            self.sudo_popup.clone(),
         )
         .await;
         let _ = self.done.send(()).await;
@@ -133,6 +138,7 @@ impl harness_core::Plugin for TuiPlugin {
             .injects(KEY_SESSION_POPUP)
             .injects(KEY_SESSION_TREE)
             .injects(KEY_BRANCH_POPUP)
+            .injects(KEY_SUDO_POPUP)
     }
 
     fn build(&self, ctx: Context) -> Result<()> {
@@ -144,6 +150,7 @@ impl harness_core::Plugin for TuiPlugin {
         let command_popup: Arc<CommandPopup> = ctx.inject_key(KEY_COMMAND_POPUP)?;
         let session_popup: Arc<SessionPopup> = ctx.inject_key(KEY_SESSION_POPUP)?;
         let branch_popup: Arc<BranchPopup> = ctx.inject_key(KEY_BRANCH_POPUP)?;
+        let sudo_popup: Arc<SudoPopup> = ctx.inject_key(KEY_SUDO_POPUP)?;
         let tree: Arc<SessionTreeHandle> = ctx.inject_key(KEY_SESSION_TREE)?;
         ctx.provide_key(
             KEY_TUI,
@@ -159,6 +166,7 @@ impl harness_core::Plugin for TuiPlugin {
                 command_popup,
                 session_popup,
                 branch_popup,
+                sudo_popup,
                 self.done.clone(),
             )),
         );

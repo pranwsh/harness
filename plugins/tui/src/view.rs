@@ -311,7 +311,8 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
     if input_area.width == 0 || chat_area.height == 0 {
         return;
     }
-    let want = popup.items.len().max(1) as u16 + 2;
+    let info_rows = u16::from(popup.info.is_some());
+    let want = popup.items.len().max(1) as u16 + 2 + info_rows;
     let height = want
         .min(MAX_POPUP_HEIGHT)
         .min(chat_area.height.max(1))
@@ -349,15 +350,23 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
             ListItem::new(Line::styled(format!("{marker}{item}"), style))
         })
         .collect();
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BOX_BORDER_TYPE)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" {} ", popup.title))
+        .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let list_area = if let Some(info) = &popup.info {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        f.render_widget(Paragraph::new(info.as_str()), rows[0]);
+        rows[1]
+    } else {
+        inner
+    };
     let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_type(BOX_BORDER_TYPE)
-                .border_style(Style::new().fg(Color::Cyan))
-                .title(format!(" {} ", popup.title))
-                .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        )
         .highlight_style(
             Style::new()
                 .fg(Color::Black)
@@ -366,12 +375,11 @@ fn draw_popup(f: &mut Frame, chat_area: Rect, input_area: Rect, popup: &ActivePo
         )
         .highlight_symbol("▸ ")
         .highlight_spacing(ratatui::widgets::HighlightSpacing::Never);
-    f.render_widget(Clear, area);
     let mut state = ratatui::widgets::ListState::default();
     if !popup.items.is_empty() {
         state.select(Some(selected));
     }
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
 /// Lays out one chat item for a chat area of `area_width` columns.
@@ -879,10 +887,32 @@ mod tests {
     }
 
     #[test]
+    fn popup_info_is_drawn_above_choices() {
+        let mut app = App::new();
+        let popup = harness_tui_popup::ActivePopup {
+            title: " approval ".into(),
+            info: Some("command details".into()),
+            items: vec!["No".into(), "Yes".into()],
+            selected: 0,
+            current: None,
+            dim: vec![],
+        };
+        let rows = render_popup(&mut app, &plain(), Some(&popup), 50, 15);
+        let info = rows
+            .iter()
+            .position(|r| r.contains("command details"))
+            .unwrap();
+        let no = rows.iter().position(|r| r.contains("No")).unwrap();
+        let yes = rows.iter().position(|r| r.contains("Yes")).unwrap();
+        assert!(info < no && no < yes, "{rows:?}");
+    }
+
+    #[test]
     fn model_popup_floats_above_input_with_border() {
         let mut app = App::new();
         let popup = harness_tui_popup::ActivePopup {
             title: " model ".into(),
+            info: None,
             items: vec!["aaa".into(), "bbb".into()],
             selected: 1,
             current: Some("aaa".into()),
