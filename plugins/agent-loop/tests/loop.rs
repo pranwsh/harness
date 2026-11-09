@@ -704,3 +704,49 @@ async fn cancellation_closes_turn_and_reports_failure() {
         )
     );
 }
+
+#[tokio::test]
+async fn delegated_child_inherits_real_shell_state_without_mutating_parent() {
+    let ctx = setup(vec![
+        Message::assistant_with_calls("", vec![ToolCall { id: "set".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"cd /tmp; export PARENT_SHELL_TEST=original"}).to_string() }]),
+        Message::assistant_with_calls("", vec![ToolCall { id: "child".into(), name: "delegate_task".into(), arguments: serde_json::json!({"task":"check shell"}).to_string() }]),
+        Message::assistant_with_calls("", vec![ToolCall { id: "child-shell".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s:%s' \"$PWD\" \"$PARENT_SHELL_TEST\"; cd /; export PARENT_SHELL_TEST=changed"}).to_string() }]),
+        Message::assistant("child finished"),
+        Message::assistant_with_calls("", vec![ToolCall { id: "parent-shell".into(), name: "shell_exec".into(), arguments: serde_json::json!({"command":"printf '%s:%s' \"$PWD\" \"$PARENT_SHELL_TEST\""}).to_string() }]),
+        Message::assistant("done"),
+    ], 8);
+    ctx.load(harness_shell::ShellPlugin).unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let events = drain(svc.run("parent", "shell-parent", "start")).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Completed(_))),
+        "{events:?}"
+    );
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let parent = sessions.history("shell-parent");
+    let child_report = parent
+        .iter()
+        .find(|e| e.call_id.as_deref() == Some("child"))
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&child_report.content).unwrap();
+    assert_eq!(report["status"], "completed", "{report}");
+    let child = sessions.history(report["session_id"].as_str().unwrap());
+    assert_eq!(
+        child
+            .iter()
+            .find(|e| e.call_id.as_deref() == Some("child-shell"))
+            .unwrap()
+            .content,
+        "/tmp:original"
+    );
+    assert_eq!(
+        parent
+            .iter()
+            .find(|e| e.call_id.as_deref() == Some("parent-shell"))
+            .unwrap()
+            .content,
+        "/tmp:original"
+    );
+}

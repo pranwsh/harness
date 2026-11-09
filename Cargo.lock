@@ -773,6 +773,7 @@ dependencies = [
  "harness-core",
  "harness-model",
  "harness-session",
+ "harness-shell",
  "harness-system-prompt",
  "harness-tools",
  "serde_json",

@@ -22,3 +22,4 @@ harness-model = { path = "../model" }
 harness-session = { path = "../session" }
 harness-system-prompt = { path = "../system-prompt" }
 harness-tools = { path = "../tools" }
+harness-shell = { path = "../shell" }
