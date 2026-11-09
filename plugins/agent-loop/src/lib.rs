@@ -175,6 +175,7 @@ impl AgentLoop {
             options,
             tx,
             turn_no: 0,
+            pending_calls: Vec::new(),
         };
         tokio::spawn(async move {
             task.execute(cancel_rx).await;
@@ -201,6 +202,7 @@ struct TurnTask {
     options: RunOptions,
     tx: mpsc::Sender<TurnEvent>,
     turn_no: u64,
+    pending_calls: Vec<ToolCall>,
 }
 
 impl TurnTask {
@@ -313,6 +315,22 @@ impl TurnTask {
                 );
             }
             Err(err) => {
+                // Cancellation may drop a tool future after its assistant call
+                // was persisted. Close every unanswered call before another
+                // model request can use this session.
+                for call in std::mem::take(&mut self.pending_calls) {
+                    let already_recorded = self
+                        .sessions
+                        .history(&self.session_id)
+                        .iter()
+                        .any(|entry| entry.call_id.as_deref() == Some(&call.id));
+                    if !already_recorded {
+                        let _ = self.request_append(Entry::tool(
+                            call.id,
+                            format!("tool interrupted: {err}"),
+                        ));
+                    }
+                }
                 self.agents.set_state(&self.agent_id, AgentState::Failed);
                 if self.turn_no != 0 {
                     self.request_close_turn();
@@ -415,6 +433,7 @@ impl TurnTask {
             // 3. Record the assistant message (deltas already displayed)
             // via the session plugin. Fail-closed on missing listener.
             self.request_append(Entry::from_message(&reply))?;
+            self.pending_calls = reply.tool_calls.clone();
 
             // 4. No tool calls → done. Otherwise execute each call; the
             //    session plugin's sync listener has already appended the
@@ -455,6 +474,7 @@ impl TurnTask {
                         .execute(&self.agent_id, &self.session_id, self.turn_no, call.clone())
                         .await
                 };
+                self.pending_calls.retain(|pending| pending.id != call.id);
                 let _ = self.tx.send(TurnEvent::ToolResult(call, result)).await;
             }
         }

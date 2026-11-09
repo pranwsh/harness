@@ -750,3 +750,54 @@ async fn delegated_child_inherits_real_shell_state_without_mutating_parent() {
         "/tmp:original"
     );
 }
+
+#[tokio::test]
+async fn cancellation_records_results_for_all_unanswered_calls() {
+    let ctx = setup(
+        vec![Message::assistant_with_calls(
+            "",
+            vec![
+                ToolCall {
+                    id: "blocking".into(),
+                    name: "blocking_tool".into(),
+                    arguments: "{}".into(),
+                },
+                fake_tool_call("not-started"),
+            ],
+        )],
+        8,
+    );
+    let tools: Arc<Tools> = ctx.inject_key(KEY_TOOLS).unwrap();
+    tools
+        .register(
+            ToolSpec {
+                name: "blocking_tool".into(),
+                description: "blocks".into(),
+                parameters: json!({"type":"object"}),
+            },
+            |_| Box::pin(std::future::pending()),
+        )
+        .unwrap();
+    let svc: Arc<AgentLoop> = ctx.inject_key(KEY_AGENT_LOOP).unwrap();
+    let (mut events, cancel) = svc.run_cancellable("a", "cancel-tools", "test", Default::default());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !matches!(events.recv().await, Some(TurnEvent::ToolStarted(_))) {}
+    })
+    .await
+    .unwrap();
+    cancel.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), drain(events))
+        .await
+        .unwrap();
+    let sessions: Arc<SessionStoreHandle> = ctx.inject_key(KEY_SESSION_STORE).unwrap();
+    let history = sessions.history("cancel-tools");
+    for id in ["blocking", "not-started"] {
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.call_id.as_deref() == Some(id))
+                .count(),
+            1
+        );
+    }
+}
